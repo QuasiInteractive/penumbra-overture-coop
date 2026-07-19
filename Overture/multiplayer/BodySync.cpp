@@ -37,6 +37,9 @@ cBodySync::cBodySync()
 	  , mlStatStreamed(0)
 	  , mlStatApplied(0)
 	  , mlStatBytesOut(0)
+	  , mlBatchSeqOut(0)
+	  , mlBatchSeqIn(0)
+	  , mbBatchSeqInKnown(false)
 	  , mlMapGen(0)
 	  , mlRemoteMapGen(0)
 	  , mbRemoteMapGenKnown(false)
@@ -89,6 +92,7 @@ bool cBodySync::Update(cWorld3D *apWorld)
 		mbCensusDone = false;
 		mbCensusPairChecked = false;
 		mbCensusMatched = false;
+		mbBatchSeqInKnown = false;
 		++mlMapGen; /* stale-map packets identify themselves by this */
 	}
 
@@ -332,12 +336,14 @@ void cBodySync::BuildStateBatches(unsigned char *apMoving, size_t *apMovingLen,
 	if (lMoving > 0)
 	{
 		hdr.mCount = (uint8_t)lMoving;
+		hdr.mSeq = ++mlBatchSeqOut;
 		memcpy(apMoving, &hdr, sizeof(hdr));
 		*apMovingLen = sizeof(hdr) + (size_t)lMoving * sizeof(cNetObjectState);
 	}
 	if (lSleep > 0)
 	{
 		hdr.mCount = (uint8_t)lSleep;
+		hdr.mSeq = ++mlBatchSeqOut;
 		memcpy(apSleep, &hdr, sizeof(hdr));
 		*apSleepLen = sizeof(hdr) + (size_t)lSleep * sizeof(cNetObjectState);
 	}
@@ -394,6 +400,7 @@ size_t cBodySync::BuildSnapshotChunk(unsigned char *apBuf, uint32_t *apCursor)
 	hdr.mType = eNetPacketType_ObjectState;
 	hdr.mCount = (uint8_t)lCount;
 	hdr.mMapGen = mlMapGen;
+	hdr.mSeq = ++mlBatchSeqOut;
 	memcpy(apBuf, &hdr, sizeof(hdr));
 	mlStatBytesOut += (int)(sizeof(hdr) + (size_t)lCount * sizeof(cNetObjectState));
 	return sizeof(hdr) + (size_t)lCount * sizeof(cNetObjectState);
@@ -417,6 +424,28 @@ void cBodySync::ApplyStateBatch(const void *apData, size_t alLen)
 	const size_t lWhole = (alLen - sizeof(cNetObjectStateBatch)) / sizeof(cNetObjectState);
 	if (lCount > lWhole)
 		lCount = lWhole; /* truncated/corrupt length: apply only whole entries */
+
+	/* v7 reorder guard. Only PURE-MOVING batches (unreliable channel) are
+	   droppable — the next tick replaces them anyway. Anything carrying a
+	   rest pose, and the reliable snapshot chunks, is always applied. */
+	{
+		bool bPureMoving = true;
+		for (size_t i = 0; i < lCount && bPureMoving; ++i)
+		{
+			cNetObjectState st;
+			memcpy(&st, pRaw + sizeof(cNetObjectStateBatch) + i * sizeof(cNetObjectState), sizeof(st));
+			if (st.mFlags & kNetObjectFlag_Sleeping)
+				bPureMoving = false;
+		}
+		if (bPureMoving && mbBatchSeqInKnown &&
+			(int16_t)(pHdr->mSeq - mlBatchSeqIn) <= 0)
+			return; /* stale reordered batch: applying it pops bodies backward */
+		if (!mbBatchSeqInKnown || (int16_t)(pHdr->mSeq - mlBatchSeqIn) > 0)
+		{
+			mlBatchSeqIn = pHdr->mSeq;
+			mbBatchSeqInKnown = true;
+		}
+	}
 
 	RebuildIndexIfNeeded();
 	if (m_mapBodies.empty())

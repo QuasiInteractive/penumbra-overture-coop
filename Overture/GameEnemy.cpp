@@ -18,6 +18,8 @@
  */
 #include "StdAfx.h"
 #include "GameEnemy.h"
+#include "multiplayer/NetworkManager.h"
+#include <vector>
 
 #include "GameEnemy_Dog.h"
 #include "GameEnemy_Spider.h"
@@ -265,6 +267,16 @@ iGameEnemy::iGameEnemy(cInit *apInit,const tString& asName,TiXmlElement *apGameE
 	mvLastPlayerPos = cVector3f(0,0,0);
 	mbCanSeePlayer = false;
 	mfCanSeePlayerCount = 0;
+
+	/* multiplayer (Phase 6) */
+	mbNetPuppet = false;
+	mbNetHasTarget = false;
+	mfNetTargetYaw = 0;
+	mlNetAnimOutHash = 0;
+	mbNetAnimOutLoop = true;
+	mlFocusPlayerId = 1;
+	mbFocusIsGhost = false;
+	mbNetMultiTarget = false;
 	mlPlayerInLOSCount = 0;
 	mlMaxPlayerInLOSCount = 3;
 
@@ -725,7 +737,18 @@ void iGameEnemy::OnPostSceneDraw()
 void iGameEnemy::Update(float afTimeStep)
 {
 	if(mbActive==false) return;
-	
+
+	/* Phase 6: a guest's enemy is a PUPPET — the host's AI owns it. Pose
+	   mapping keeps running (skeleton/ragdoll), the commanded clip animates
+	   through the engine as usual; senses, mover, and the whole state
+	   machine are the host's business. */
+	if(mbNetPuppet)
+	{
+		UpdateEnemyPose(afTimeStep);
+		UpdateNetPuppet(afTimeStep);
+		return;
+	}
+
 	START_TIMING_EX(GetName().c_str(),enemy);
 
 	if(mpMeshEntity->GetSkeletonPhysicsActive() && mpCharBody->IsActive()==false &&
@@ -965,7 +988,11 @@ void iGameEnemy::PlayAnim(	const tString &asName, bool abLoop, float afFadeTime,
 		pNewAnim->SetWeight(1.0f);
 	}
 	pNewAnim->SetLoop(abLoop);
-	
+
+	/* Phase 6: remember the commanded clip so the host can replicate it */
+	mlNetAnimOutHash = NetHashName(asName.c_str());
+	mbNetAnimOutLoop = abLoop;
+
 	/////////////////////////////////////////
 	//Check if this animation should start at the same place as the previous
 	if(abSyncWithPrevFrame && mpCurrentAnimation)
@@ -1242,24 +1269,27 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 	
 
 	//Do not check for player at pre update.
-	if(mpInit->mpMapHandler->IsPreUpdating() ||
-		mpInit->mpPlayer->IsDead() ||
-		mbUsesTriggers == false ||
-		mfHealth <= 0) 
+	//(Phase 6: a dead LOCAL player no longer blinds the enemy — remote
+	// ghosts are still fair game; the candidate loop below skips the dead.)
+	//Defensive: scripted creatures can carry unusual body setups — never
+	//dereference a chain that is not fully there.
+	if(mpMover==NULL || mpMover->GetCharBody()==NULL ||
+		mpMover->GetCharBody()->GetBody()==NULL)
 	{
 		mbCanSeePlayer = false;
 		return;
 	}
 
-	/*if(mfCanSeePlayerCount>0)
+	if(mpInit->mpMapHandler->IsPreUpdating() ||
+		mbUsesTriggers == false ||
+		mfHealth <= 0)
 	{
-		mfCanSeePlayerCount -= afTimeStep;
-		if(mfCanSeePlayerCount<=0) mbCanSeePlayer = false;
-	}*/
+		mbCanSeePlayer = false;
+		return;
+	}
 
 	if(mfCalcPlayerHiddenPosCount >0)
 		mfCalcPlayerHiddenPosCount -= afTimeStep;
-
 
 	//Check if it is time to check for player.
 	if(mfCheckForPlayerCount < mfCheckForPlayerRate)
@@ -1270,71 +1300,135 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 	
 	mfCheckForPlayerCount =0;
 
-	iCharacterBody *pPlayerBody = mpInit->mpPlayer->GetCharacterBody();
+	////////////////////////////////////////////////////////////////////
+	// Phase 6: consider EVERY player — the local one plus each connected
+	// ghost. The NEAREST candidate that passes distance+sight becomes the
+	// FOCUS, and the original LOS-counter flow runs on that candidate, so
+	// every hunt/chase state naturally follows whoever the enemy saw.
+	struct cSeeCand { cVector3f vPos; cVector3f vFeet; cVector3f vSize; uint8_t lId; bool bGhost; };
+	cSeeCand vCands[8];
+	int lCands = 0;
 
-	float fDist = cMath::Vector3Dist(mpMover->GetCharBody()->GetPosition(),pPlayerBody->GetPosition());
-	float fMinLength = mpMover->GetCharBody()->GetBody()->GetBV()->GetRadius() + 
-						pPlayerBody->GetBody()->GetBV()->GetRadius();
-
-	//Lower some stuff if player is hidden
-	float fStartFOV = mfFOV;
-	float fStartMaxSeeDist = mfMaxSeeDist;
-	if(mbCanSeePlayer==false && fDist >1.3f) //1.3 = really close, remove all handicap.
+	if(mpInit->mpPlayer->IsDead()==false)
 	{
-		if(mpInit->mDifficulty == eGameDifficulty_Easy){
-			mfFOV *= 0.6f;
-			mfMaxSeeDist *= 0.6f;
-		}
-
-		if(mpInit->mpPlayer->GetHidden()->IsHidden())
+		iCharacterBody *pPlayerBody = mpInit->mpPlayer->GetCharacterBody();
+		vCands[lCands].vPos  = pPlayerBody->GetPosition();
+		vCands[lCands].vFeet = pPlayerBody->GetFeetPosition();
+		vCands[lCands].vSize = pPlayerBody->GetSize();
+		vCands[lCands].lId = 1;
+		vCands[lCands].bGhost = false;
+		++lCands;
+	}
+	if(mbNetMultiTarget && mpInit->mpNetworkManager)
+	{
+		std::vector<std::pair<uint8_t, cVector3f> > vGhosts;
+		mpInit->mpNetworkManager->GetGhostCamPositions(vGhosts);
+		for(size_t g=0; g<vGhosts.size() && lCands<8; ++g)
 		{
-			mfFOV *= 0.36f;
-			mfMaxSeeDist *= 0.25f;
-		}
-		else if(mpInit->mpPlayer->GetHidden()->InShadows())
-		{
-			if(mpInit->mpPlayer->GetMoveState() == ePlayerMoveState_Crouch)
-			{
-				mfFOV *= 0.6f;
-				mfMaxSeeDist *= 0.65f;
-			}
-			else
-			{
-				mfFOV *= 0.8f;
-				mfMaxSeeDist *= 0.85f;
-			}
+			vCands[lCands].vPos  = vGhosts[g].second - cVector3f(0, 0.75f, 0);
+			vCands[lCands].vFeet = vGhosts[g].second - cVector3f(0, 1.5f, 0);
+			vCands[lCands].vSize = cVector3f(0.7f, 1.7f, 0.7f);
+			vCands[lCands].lId = vGhosts[g].first;
+			vCands[lCands].bGhost = true;
+			++lCands;
 		}
 	}
+	if(lCands == 0)
+	{
+		mbCanSeePlayer = false;
+		return;
+	}
 
-	gfCurrentViewDist = fDist;
+	float fStartFOV = mfFOV;
+	float fStartMaxSeeDist = mfMaxSeeDist;
+	const float fEnemyRadius = mpMover->GetCharBody()->GetBody()->GetBV()->GetRadius();
+
+	int lBest = -1;
+	float fBestDist = 999999.0f;
+	for(int i=0; i<lCands; ++i)
+	{
+		mfFOV = fStartFOV;
+		mfMaxSeeDist = fStartMaxSeeDist;
+
+		float fDist = cMath::Vector3Dist(mpMover->GetCharBody()->GetPosition(), vCands[i].vPos);
+		float fMinLength = fEnemyRadius + 0.35f;
+
+		//Lower some stuff if the LOCAL player is hidden (their stealth system;
+		//ghost stealth state is unknown to the host, so ghosts get plain checks)
+		if(vCands[i].bGhost==false && mbCanSeePlayer==false && fDist >1.3f)
+		{
+			if(mpInit->mDifficulty == eGameDifficulty_Easy){
+				mfFOV *= 0.6f;
+				mfMaxSeeDist *= 0.6f;
+			}
+
+			if(mpInit->mpPlayer->GetHidden()->IsHidden())
+			{
+				mfFOV *= 0.36f;
+				mfMaxSeeDist *= 0.25f;
+			}
+			else if(mpInit->mpPlayer->GetHidden()->InShadows())
+			{
+				if(mpInit->mpPlayer->GetMoveState() == ePlayerMoveState_Crouch)
+				{
+					mfFOV *= 0.6f;
+					mfMaxSeeDist *= 0.65f;
+				}
+				else
+				{
+					mfFOV *= 0.8f;
+					mfMaxSeeDist *= 0.85f;
+				}
+			}
+		}
+
+		const bool bSeen =
+			(fDist <= mfMaxSeeDist && LineOfSight(vCands[i].vPos, vCands[i].vSize)) ||
+			fDist <= fMinLength;
+		if(bSeen && fDist < fBestDist)
+		{
+			fBestDist = fDist;
+			lBest = i;
+		}
+	}
+	mfFOV = fStartFOV;
+	mfMaxSeeDist = fStartMaxSeeDist;
+
+	gfCurrentViewDist = (lBest>=0) ? fBestDist : 999999.0f;
 	gfCurrentMaxViewDist = mfMaxSeeDist;
 
-	if( (fDist <= mfMaxSeeDist && LineOfSight(pPlayerBody->GetPosition(), pPlayerBody->GetSize())) || 
-		fDist <=  fMinLength)
+	if(lBest >= 0)
 	{
 		//Increase LOS counter,
 		mlPlayerInLOSCount++;
 
-		//Player must have been in LOS mlMaxPlayerInLOSCount times before it is considered seen.
+		//Target must be in LOS mlMaxPlayerInLOSCount times to count as seen.
 		if(mlPlayerInLOSCount>= mlMaxPlayerInLOSCount)
 		{
 			mlPlayerInLOSCount = mlMaxPlayerInLOSCount;
 
 			float fChance=0;
-
-			if(fDist > mfMaxSeeDist) 
+			if(fBestDist > mfMaxSeeDist)
 				fChance =0;
-			else 
-				fChance = 1 - (fDist / mfMaxSeeDist);
+			else
+				fChance = 1 - (fBestDist / mfMaxSeeDist);
+
+			//Adopt the seen candidate as the FOCUS — nearest player wins,
+			//re-evaluated every sight tick, so aggro hands over naturally.
+			mlFocusPlayerId = vCands[lBest].lId;
+			mbFocusIsGhost = vCands[lBest].bGhost;
+			if(mbFocusIsGhost)
+				mvFocusCamPos = vCands[lBest].vPos + cVector3f(0, 0.75f, 0);
 
 			if(mbCanSeePlayer==false)
 			{
-				mvStates[mlCurrentState]->OnSeePlayer(pPlayerBody->GetPosition(),fChance);
-				mpInit->mpPlayer->GetHidden()->UnHide();
+				mvStates[mlCurrentState]->OnSeePlayer(vCands[lBest].vPos,fChance);
+				if(vCands[lBest].bGhost==false)
+					mpInit->mpPlayer->GetHidden()->UnHide();
 			}
 
-			mvLastPlayerPos = pPlayerBody->GetFeetPosition();
-			
+			mvLastPlayerPos = vCands[lBest].vFeet;
+
 			mbCanSeePlayer = true;
 			mfCanSeePlayerCount = 1.0f/ 3.0f;
 			mfCalcPlayerHiddenPosCount = 1.5f;
@@ -1342,22 +1436,18 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 	}
 	else
 	{
-        //Reset LOS counter,
+		//Reset LOS counter,
 		mlPlayerInLOSCount--;
 		if(mlPlayerInLOSCount<0)mlPlayerInLOSCount=0;
 
-		//this is so that the enemy get a little better last pos 
-		//and thus improving path finding.
+		//keep a decent last pos for path finding
 		if(mfCalcPlayerHiddenPosCount >0)
 		{
-			mvLastPlayerPos = pPlayerBody->GetFeetPosition();
+			mvLastPlayerPos = GetFocusFeetPos();
 		}
 
 		mbCanSeePlayer = false;
 	}
-
-	mfFOV = fStartFOV;
-	mfMaxSeeDist = fStartMaxSeeDist;
 
 }
 
@@ -1512,6 +1602,88 @@ static const cVector2f gvPosAdds[] = {cVector2f(0,0),
 										cVector2f(0,1),
 										cVector2f(0,-1)
 };	
+
+//-----------------------------------------------------------------------
+// Phase 6 — shared enemies: focus accessors + guest puppet motion.
+//-----------------------------------------------------------------------
+
+cVector3f iGameEnemy::GetFocusFeetPos()
+{
+	if(mbFocusIsGhost)
+		return mvFocusCamPos - cVector3f(0, 1.5f, 0);
+	return mpInit->mpPlayer->GetCharacterBody()->GetFeetPosition();
+}
+
+cVector3f iGameEnemy::GetFocusPos()
+{
+	if(mbFocusIsGhost)
+		return mvFocusCamPos - cVector3f(0, 0.75f, 0);
+	return mpInit->mpPlayer->GetCharacterBody()->GetPosition();
+}
+
+float iGameEnemy::GetFocusHealth()
+{
+	if(mbFocusIsGhost)
+		return 100.0f; /* remote health is not mirrored (yet): assume alive */
+	return mpInit->mpPlayer->GetHealth();
+}
+
+float iGameEnemy::FocusDist2D()
+{
+	cVector3f vA = mpMover->GetCharBody()->GetPosition(); vA.y = 0;
+	cVector3f vB = GetFocusPos(); vB.y = 0;
+	return cMath::Vector3Dist(vA, vB);
+}
+
+float iGameEnemy::FocusDist()
+{
+	return cMath::Vector3Dist(mpMover->GetCharBody()->GetPosition(), GetFocusPos());
+}
+
+bool iGameEnemy::FocusDirectPath()
+{
+	if(mbFocusIsGhost)
+		return LineOfSight(GetFocusPos(), cVector3f(0.7f, 1.7f, 0.7f));
+	return mpMover->FreeDirectPathToChar(mpInit->mpPlayer->GetCharacterBody());
+}
+
+void iGameEnemy::FocusAttackDamage(float afMinDamage, float afMaxDamage)
+{
+	if(mbFocusIsGhost==false) return; /* local player is hit by the SHAPE attack */
+	if(mpInit->mpNetworkManager)
+		mpInit->mpNetworkManager->SendPlayerDamage(mlFocusPlayerId,
+			cMath::RandRectf(afMinDamage, afMaxDamage));
+}
+
+void iGameEnemy::NetSetTarget(const cVector3f &avFeetPos, float afYaw)
+{
+	mvNetTargetPos = avFeetPos;
+	mfNetTargetYaw = afYaw;
+	mbNetHasTarget = true;
+}
+
+void iGameEnemy::UpdateNetPuppet(float afTimeStep)
+{
+	if(mbNetHasTarget==false || mpCharBody==NULL) return;
+
+	const cVector3f vCur = mpCharBody->GetFeetPosition();
+	const cVector3f vD = mvNetTargetPos - vCur;
+	const float fDistSq = vD.x*vD.x + vD.y*vD.y + vD.z*vD.z;
+	const float k = 1.0f - exp(-afTimeStep * 12.0f);
+
+	if(fDistSq > 9.0f)
+		mpCharBody->SetFeetPosition(mvNetTargetPos); /* teleport-sized: snap */
+	else
+		mpCharBody->SetFeetPosition(vCur + vD * k);
+
+	float fYaw = mpCharBody->GetYaw();
+	float fDiff = mfNetTargetYaw - fYaw;
+	while(fDiff > kPif)  fDiff -= 2.0f*kPif;
+	while(fDiff < -kPif) fDiff += 2.0f*kPif;
+	mpCharBody->SetYaw(fYaw + fDiff * k);
+}
+
+//-----------------------------------------------------------------------
 
 bool iGameEnemy::LineOfSight(const cVector3f &avPos, const cVector3f &avSize)
 {

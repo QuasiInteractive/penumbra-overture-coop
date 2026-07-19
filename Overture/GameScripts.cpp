@@ -18,6 +18,7 @@
  */
 #include "StdAfx.h"
 #include "GameScripts.h"
+#include "multiplayer/NetworkManager.h"
 
 #include "Init.h"
 #include "MapHandler.h"
@@ -773,16 +774,31 @@ SCRIPT_DEFINE_FUNC_1(void,RemoveCombineCallback,string)
 
 //-----------------------------------------------------------------------
 
+/* Penumbra co-op: true while applying a REPLICATED script event, so the
+   hooks below do not echo it back onto the wire. */
+bool gbNetScriptApplying = false;
+
 static bool __stdcall HasItem(std::string asName)
 {
 	//if(cString::ToLowerCase(asName)=="notebook") return gpInit->mpInventory->GetNoteBookActive();
 
-	return gpInit->mpInventory->GetItem(asName) != NULL;
+	if(gpInit->mpInventory->GetItem(asName) != NULL) return true;
+
+	/* co-op: the PARTY has it if any member does — a torch in your friend's
+	   backpack still counts for the door gate */
+	if(gpInit->mpNetworkManager && gpInit->mpNetworkManager->PartyHasItem(asName))
+		return true;
+
+	return false;
 }
 SCRIPT_DEFINE_FUNC_1(bool,HasItem,string)
 
 static void __stdcall RemoveItem(std::string asName)
 {
+	/* co-op: a consumed item (used key etc.) leaves the PARTY inventory too */
+	if(!gbNetScriptApplying && gpInit->mpNetworkManager)
+		gpInit->mpNetworkManager->NetOnScriptEvent(8, asName.c_str(), 0);
+
 	cInventoryItem *pItem = gpInit->mpInventory->GetItem(asName);
 	if(pItem)
 	{
@@ -855,6 +871,9 @@ SCRIPT_DEFINE_FUNC_4(void, ReplaceEntity, string, string, string, string)
 
 static void __stdcall SetGameEntityActive(std::string asName, bool abX)
 {
+	if(!gbNetScriptApplying && gpInit->mpNetworkManager)
+		gpInit->mpNetworkManager->NetOnScriptEvent(6, asName.c_str(), abX ? 1 : 0);
+
 	GAME_ENTITY_BEGIN(asName)
 
 	pEntity->SetActive(abX);
@@ -1266,6 +1285,9 @@ SCRIPT_DEFINE_FUNC_1(void,ShowEnemyPlayer,string)
 
 static void __stdcall SetDoorLocked(std::string asDoor, bool abLocked)
 {
+	if(!gbNetScriptApplying && gpInit->mpNetworkManager)
+		gpInit->mpNetworkManager->NetOnScriptEvent(7, asDoor.c_str(), abLocked ? 1 : 0);
+
 	iGameEntity *pEntity = gpInit->mpMapHandler->GetGameEntity(asDoor);
 	if(pEntity==NULL || pEntity->GetType() != eGameEntityType_SwingDoor)
 	{
@@ -1901,3 +1923,28 @@ void cGameScripts::Init()
 }
 
 //-----------------------------------------------------------------------
+
+
+//-----------------------------------------------------------------------
+// Penumbra co-op (protocol v9): apply a replicated script mutation.
+//-----------------------------------------------------------------------
+
+void NetApplyScriptEvent(int alOp, const hpl::tString &asName, int alVal)
+{
+	if(gpInit==NULL || gpInit->mpGame==NULL) return;
+
+	gbNetScriptApplying = true;
+	cScene *pScene = gpInit->mpGame->GetScene();
+	switch(alOp)
+	{
+	case 0: pScene->CreateLocalVar(asName)->mlVal = alVal; break;
+	case 1: pScene->CreateLocalVar(asName)->mlVal += alVal; break;
+	case 2: pScene->CreateGlobalVar(asName)->mlVal = alVal; break;
+	case 3: pScene->CreateGlobalVar(asName)->mlVal += alVal; break;
+	case 6: SetGameEntityActive(std::string(asName.c_str()), alVal != 0); break;
+	case 7: SetDoorLocked(std::string(asName.c_str()), alVal != 0); break;
+	case 8: RemoveItem(std::string(asName.c_str())); break;
+	default: break;
+	}
+	gbNetScriptApplying = false;
+}

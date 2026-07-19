@@ -10,24 +10,34 @@ handovers — you can even hand your friend the pickaxe.
 into your game's `redist` folder and the Multiplayer entry appears in the main
 menu. You need to own Penumbra: Overture (Steam).
 
-## Features (v0.6)
+## Features (v0.10)
 
 - See each other as animated characters (walk/run/crouch/jump, flashlights)
 - One-click joining: connect, auto-launch into the host's map, spawn at their side
 - Host lobby with live friend counter, "Launch new game" or "Load a save" —
   everyone launches together
-- Host-authoritative shared physics: crates, barrels, doors, drawers; grab
-  things out of each other's hands, throw things to each other
-- Tuned for high ping (guest-side smoothing + held-object prediction)
-- One-of-each items and drag-out-of-inventory loot dropping
+- Host-authoritative shared physics at 30 Hz: crates, barrels, doors, drawers;
+  grab things out of each other's hands, throw things to each other
+- **Shared enemies**: the host runs the one true AI, everyone sees the same
+  wolves — and they hunt whoever is closest, host or guest. Guest hits land
+  for real; deaths replicate.
+- **Script & puzzle sync**: script variables, door locks, entity triggers and
+  item consumption replicate — gated doors open for the whole party
+- **Party inventory**: multi-item gates (torch + glowstick...) pass when the
+  party *collectively* holds the items, however the pickups were split
+- Breakable objects (pickaxed doors, boards) break for everyone
+- One-of-each items and drag-out-of-inventory loot sharing
 - Party level transitions: one player takes an exit, everyone follows
+- Hardened for real internet: version-gated handshake, out-of-order packet
+  rejection, animation smoothing at jitter
 - Borderless fullscreen at native resolution
 
-### Not yet synced (roadmap)
+### Known limits (roadmap)
 
-- Enemy AI (each player currently has private enemies) — next big milestone:
-  host-authoritative shared AI with nearest-target selection
-- Script/puzzle state mirroring
+- Spider/worm set-pieces stay single-target on the host (deliberate — their
+  scripted sequences assume vanilla senses); they still position-sync
+- Enemies cannot *hear* guests yet, only see them
+- Notebook/journal entries are per-player by design
 
 ## Repository layout
 

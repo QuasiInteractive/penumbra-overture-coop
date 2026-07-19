@@ -265,6 +265,10 @@ cGhostPlayer::cGhostPlayer(cWorld3D *apWorld, uint8_t alPlayerID, const tString 
 	mfSmoothedVelX = 0.0f;
 	mfSmoothedVelZ = 0.0f;
 	mlMoveSector = eGhostMoveSector_Forward;
+	mbHasStatePos = false;
+	msPendingAnim = "";
+	mlPendingCount = 0;
+	mlLastJumpMs = 0;
 	mlLastAnimTraceMs = 0;
 
 	if (!mpWorld)
@@ -467,8 +471,14 @@ void cGhostPlayer::UpdateAnimationFromMovement(const cVector3f &avPos, float afY
 	   The wire says Jump for the whole airborne stretch; only the first packet
 	   of a stretch (re)starts the clip. PlayName rewinds to frame 0, so a
 	   spammed jump restarts the clip cleanly instead of sticking at its end. */
-	const bool bJumpRise = (abJump && mbPrevJumpState == false);
+	bool bJumpRise = (abJump && mbPrevJumpState == false);
 	mbPrevJumpState = abJump;
+	/* v7: a rising edge within 350 ms of the last one is stance-byte flicker
+	   (a real hop takes longer than that to land) — ignore it. */
+	if (bJumpRise && (lNow - mlLastJumpMs) < 350)
+		bJumpRise = false;
+	if (bJumpRise)
+		mlLastJumpMs = lNow;
 
 	/* --- stance transitions: play-once on the crouch flag's edges ---------- */
 	const bool bCrouchEdge = (mbHasPrevCrouchState && abCrouch != mbPrevCrouchState);
@@ -686,8 +696,29 @@ void cGhostPlayer::UpdateAnimationFromMovement(const cVector3f &avPos, float afY
 		/* Same state: never PlayName (it rewinds to frame 0) — but keep the
 		   speed tracking, walk_back rescales with the measured speed. */
 		pClip->SetSpeed(fClipSpeed);
+		msPendingAnim = sTarget; /* current choice re-confirmed */
+		mlPendingCount = 0;
 		return;
 	}
+
+	/* v7 anim thrash gate: at internet jitter the measured speed/direction
+	   still wobbles even after smoothing, and every wobble used to flip the
+	   clip (run<->strafe<->walk several times a second in the first live
+	   session). A locomotion change must now survive TWO consecutive
+	   measurement windows (~0.24 s) before it plays. Deliberate exceptions
+	   stay instant: starting to move from idle (responsiveness), and the
+	   very first clip. Jump/stance edges are handled above and never reach
+	   this gate. */
+	if (sTarget != msPendingAnim)
+	{
+		msPendingAnim = sTarget;
+		mlPendingCount = 1;
+	}
+	else
+		++mlPendingCount;
+	const bool bLeavingIdle = bWasIdle && bMoving;
+	if (mlPendingCount < 2 && bLeavingIdle == false && msCurrentAnim.empty() == false)
+		return;
 
 	/* Same clip, different speed (idle<->walk): only change the speed. A
 	   PlayName here would rewind to frame 0 on every transition. */
@@ -707,6 +738,8 @@ void cGhostPlayer::UpdateAnimationFromMovement(const cVector3f &avPos, float afY
 void cGhostPlayer::ApplyState(const cNetPlayerState &aState)
 {
 	const cVector3f vPos(aState.mfPosX, aState.mfPosY, aState.mfPosZ);
+	mvLastStatePos = vPos;
+	mbHasStatePos = true;
 
 	const bool bCrouch = (aState.mMoveState == (uint8_t)eNetMoveState_Crouch);
 	const bool bJump = (aState.mMoveState == (uint8_t)eNetMoveState_Jump);

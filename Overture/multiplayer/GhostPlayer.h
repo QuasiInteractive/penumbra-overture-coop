@@ -19,6 +19,15 @@ public:
 	uint8_t GetPlayerID() const { return mlPlayerID; }
 	void ApplyState(const cNetPlayerState &aState);
 
+	/** Latest received CAMERA position (false = no state yet) — the enemy
+	    senses use this as the ghost's whereabouts. */
+	bool GetLastStatePos(hpl::cVector3f *apOut) const
+	{
+		if (!mbHasStatePos) return false;
+		*apOut = mvLastStatePos;
+		return true;
+	}
+
 	/** The world that owned this ghost's entities is gone (map change/unload):
 	    drop every pointer WITHOUT destroying through them — the dead cWorld3D
 	    already tore the entities down. Call before hplDelete on a world switch. */
@@ -70,6 +79,11 @@ private:
 	float mfSmoothedVelX;  /* smoothed planar wire velocity — the direction */
 	float mfSmoothedVelZ;  /* source for locomotion sector selection */
 	int mlMoveSector;      /* eGhostMoveSector — current sector, hysteresis state */
+	hpl::cVector3f mvLastStatePos; /* latest received camera position */
+	bool mbHasStatePos;
+	hpl::tString msPendingAnim; /* locomotion candidate awaiting confirmation */
+	int mlPendingCount;         /* consecutive windows the candidate survived */
+	unsigned long mlLastJumpMs; /* debounce vs stance-byte flicker/reorder */
 	unsigned long mlLastAnimTraceMs; /* activeAnims diagnosis trace throttle */
 };
 //-----------------------------------------------------------------------

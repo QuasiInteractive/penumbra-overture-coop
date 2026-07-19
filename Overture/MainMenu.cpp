@@ -2685,7 +2685,17 @@ void cMainMenu::Update(float afTimeStep)
 			cNetworkManager *nm = mpInit->mpNetworkManager;
 			const tWString kConnected = _W("Connected - you will enter the game when the host launches.");
 			const tWString kConnecting = _W("Connecting... (waiting for handshake)");
-			if (nm->IsClientSynced())
+			if (!nm->GetJoinFailReason().empty())
+			{
+				/* a refused join beats every other status on this screen */
+				const tWString sFail = cString::To16Char(nm->GetJoinFailReason());
+				if (gpMulJoinFoot->msText != sFail)
+				{
+					gpMulJoinFoot->msText = sFail;
+					gpMulJoinFoot->UpdateSize();
+				}
+			}
+			else if (nm->IsClientSynced())
 			{
 				if (gpMulJoinFoot->msText != kConnected)
 				{

@@ -90,6 +90,32 @@ public:
 	/** Host lobby UI: guests currently on the socket. */
 	int GetConnectedGuestCount() const;
 
+	/** Join screen UI: why the last join attempt died ("" = no failure).
+	    Cleared by the next JoinGame call. */
+	const hpl::tString &GetJoinFailReason() const { return msJoinFailReason; }
+
+	//---------------- Phase 6: shared enemies ----------------
+	/** Guest with a live session: local enemies become host-driven puppets. */
+	bool IsEnemyPuppetMode() const;
+	/** Host AI: every connected ghost's latest camera position. */
+	void GetGhostCamPositions(std::vector<std::pair<uint8_t, hpl::cVector3f> > &avOut);
+	/** Host: an enemy's attack landed on that guest's position. */
+	void SendPlayerDamage(uint8_t alPlayerId, float afDamage);
+	/** Guest: my weapon hit a puppet enemy — the host applies it for real. */
+	void NetOnEnemyDamaged(const hpl::tString &asName, float afDamage, int alStrength);
+
+	//---------------- v9: shared script state ----------------
+	/** Script HasItem(): true when ANY party member holds the item. */
+	bool PartyHasItem(const hpl::tString &asName) const;
+	/** A local script mutated shared state (var write, entity active, door
+	    lock, item consumed) — replicate it. No-op while APPLYING a remote
+	    event, and offline. */
+	void NetOnScriptEvent(int alOp, const hpl::tString &asName, int alVal);
+
+	/** v10: a weapon damaged a breakable object — replicate the hit so the
+	    object (explosives door!) breaks in every world. */
+	void NetOnEntityDamaged(const hpl::tString &asName, float afDamage, int alStrength);
+
 	/** v6 loot sharing. Called by cInventoryItem::Drop after it spawned the
 	    entity locally: every other machine materializes the same item. */
 	void NetOnItemDropped(const hpl::tString &asName, const hpl::tString &asFile,
@@ -113,6 +139,15 @@ private:
 	bool mbClientConnected;
 	bool mbHadJoinPacket;
 	bool mbSpawnedAtHost; /**< once per connection: walked to the host's side */
+	bool mbGotVersionAck; /**< host proved it speaks OUR protocol version */
+	uint16_t mlStateSeqOut; /**< our PlayerState counter (v7 reorder guard) */
+	uint16_t mlEnemySeqOut;  /**< host: enemy batch counter */
+	uint16_t mlEnemySeqIn;   /**< guest: newest enemy batch applied */
+	bool mbEnemySeqInKnown;
+	void EmitEnemyStates();
+	void ApplyEnemyBatch(const void *apData, size_t alLen);
+	std::map<uint8_t, uint16_t> m_mapGhostSeq; /**< per-author newest seq seen */
+	hpl::tString msJoinFailReason;
 
 	/* v5 shared world */
 	bool mbApplyingRemoteMapChange; /**< suppresses NetOnLocalMapChange */
@@ -125,6 +160,9 @@ private:
 	    census differs from our virgin map */
 	std::set<uint32_t> m_setTakenItems; /**< qualified hashes, whole session —
 	    revisited maps re-hide items a friend pocketed while we were elsewhere */
+	std::set<hpl::tString> m_setPartyItems; /**< v9: inventory names OTHER
+	    members hold — script HasItem() consults this so split pickups can
+	    still satisfy multi-item gates */
 	uint32_t QualifiedItemHash(const hpl::tString &asEntityName) const;
 	void ApplyTakenItems();       /**< deactivate current-map matches */
 	void ApplyRemoteDrop(const cNetItemDrop &aDrop);
