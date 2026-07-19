@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "penumbra-overture-mp",
+  "version": "0.1.0",
+  "description": "GPL Penumbra: Overture + optional Phase 1 ENet scaffolding",
+  "dependencies": [
+    "enet",
+    "libogg",
+    "libvorbis",
+    "openal-soft",
+    "sdl1"
+  ]
+}

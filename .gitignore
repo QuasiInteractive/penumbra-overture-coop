@@ -1,0 +1,10 @@
+build/
+build_win32/
+*.log
+*.zip
+.vs/
+Release/
+Debug/
+*.obj
+*.pdb
+*.ilk
