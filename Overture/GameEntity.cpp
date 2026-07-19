@@ -17,6 +17,8 @@
  * along with Penumbra Overture.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "GameEntity.h"
+#include "GameEnemy.h"
+#include "multiplayer/NetworkManager.h"
 
 #include "Init.h"
 #include "Player.h"
@@ -395,11 +397,28 @@ void iGameEntity::Damage(float afDamage, int alStrength)
 	{
 		if(mType == eGameEntityType_Enemy)
 		{
+			/* Phase 6: on a guest a live enemy is a host-owned puppet — the
+			   hit travels to the host (RAW; the host applies its own scaling)
+			   and the health comes back in the enemy stream. */
+			iGameEnemy *pNetEnemy = static_cast<iGameEnemy*>(this);
+			if(pNetEnemy->IsNetPuppet() && mpInit->mpNetworkManager)
+			{
+				mpInit->mpNetworkManager->NetOnEnemyDamaged(msName, afDamage, alStrength);
+				return;
+			}
+
 			//if(mpInit->mDifficulty== eGameDifficulty_Easy) afDamage *= 2.0f;
 			if(mpInit->mDifficulty== eGameDifficulty_Hard) afDamage /= 2.0f;
 			if(mpInit->mbHasHaptics) afDamage *= 2.0f;
 		}
 		
+		/* v10: a hit on a BREAKABLE object replicates, so pickaxed doors and
+		   boards break for the whole party. Enemies use their own channel
+		   (handled above); replication-applied hits are suppressed by the
+		   gbNetScriptApplying flag checked inside NetOnEntityDamaged. */
+		if(mType != eGameEntityType_Enemy && mpInit->mpNetworkManager)
+			mpInit->mpNetworkManager->NetOnEntityDamaged(msName, afDamage, alStrength);
+
 		int lDiff = mlToughness - alStrength;
         
 		if(alStrength>=0)

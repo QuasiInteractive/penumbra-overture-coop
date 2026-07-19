@@ -25,7 +25,7 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
         + cNetBodyCensus. Both machines must rebuild.
     v4: rung 4 — map-generation byte in cNetObjectStateBatch + cNetBodyCensus
         (packets from the previous map can no longer touch the new one). */
-static const uint16_t kNetProtocolVersion = 6;
+static const uint16_t kNetProtocolVersion = 10;
 
 /** Well-known discovery port = default game port (7777) + 1.
  *
@@ -73,7 +73,51 @@ enum eNetPacketType : uint8_t
 	                                   out re-enters the world on EVERY machine
 	                                   (reactivate the deactivated twin, or
 	                                   spawn it fresh) */
+	eNetPacketType_VersionAck = 17, /* host -> guest, FIRST reliable packet: the
+	                                   host really speaks this protocol. A guest
+	                                   that gets a PlayerJoin with no ack first
+	                                   knows the host is an OLD build. */
+	/* Phase 6 — SHARED ENEMIES. The host runs the only real AI; guests puppet
+	   their local enemy entities from EnemyState batches. */
+	eNetPacketType_EnemyState = 18,  /* host -> guests, unreliable ch1, batched */
+	eNetPacketType_EnemyEvent = 19,  /* host -> guests, reliable: death etc. */
+	eNetPacketType_EnemyDamage = 20, /* guest -> host, reliable: my hit landed */
+	eNetPacketType_PlayerDamage = 21,/* host -> ONE guest, reliable: an enemy's
+	                                    attack landed on YOUR position */
+	eNetPacketType_ScriptEvent = 22, /* reliable, any direction (host relays):
+	                                    a script mutated shared state — var
+	                                    writes, entity active, door locks,
+	                                    item consumption. The party's worlds
+	                                    stay in agreement. */
+	eNetPacketType_EntityDamage = 23,/* reliable, any direction (host relays):
+	                                    a weapon damaged a BREAKABLE object —
+	                                    every world applies the same hit, so a
+	                                    pickaxed door is broken for the whole
+	                                    party (was: broken for one player,
+	                                    intact wall for the other). */
 };
+
+/** eNetPacketType_ScriptEvent ops. */
+enum eNetScriptOp : uint8_t
+{
+	eNetScriptOp_LocalVarSet = 0,
+	eNetScriptOp_LocalVarAdd = 1,
+	eNetScriptOp_GlobalVarSet = 2,
+	eNetScriptOp_GlobalVarAdd = 3,
+	eNetScriptOp_EntityActive = 6, /* mlVal = 0/1 */
+	eNetScriptOp_DoorLocked = 7,   /* mlVal = 0/1 */
+	eNetScriptOp_RemoveItem = 8,   /* an item was CONSUMED (key used etc.) */
+};
+
+/** ENet connect data: sent inside the connection handshake itself, so a host
+    can refuse an incompatible exe BEFORE any game packet flows. Old builds
+    send 0 and get refused with kNetDisconnectBadVersion as the reason. This
+    exists because direct-IP joins used to skip the version check entirely —
+    a v3 host + v6 guest would connect and HALF-work (ghosts fine, physics
+    garbage, no item sync), which reads as "the mod is broken" instead of
+    "grab the same zip". */
+static const uint32_t kNetConnectData = kNetProtocolMagic ^ (uint32_t)kNetProtocolVersion;
+static const uint32_t kNetDisconnectBadVersion = 0xBADF00D5u;
 
 /** Wire encoding of cNetPlayerState::mMoveState. The values are FROZEN for v2
     compatibility: they equal the engine's ePlayerMoveState order (GameTypes.h),
@@ -95,6 +139,11 @@ struct cNetPlayerState
 {
 	uint8_t mType; /**< eNetPacketType_PlayerState */
 	uint8_t mPlayerID;
+	uint16_t mSeq; /**< per-author counter (wraps). UNSEQUENCED delivery means
+	    real internet paths REORDER these — applying a stale position after a
+	    newer one snaps the ghost backward and flips its measured movement
+	    direction 180 deg (the "impossible backpedal at 4.6 m/s" in the first
+	    live-session log). Receivers drop anything not newer. */
 	float mfPosX, mfPosY, mfPosZ;
 	float mfPitch, mfYaw; /**< radians, FPS view (roll omitted on wire) */
 	uint8_t mbFlashlightOn;
@@ -131,6 +180,17 @@ struct cNetItemPickup
 {
 	uint8_t mType; /**< eNetPacketType_ItemPickup */
 	uint32_t mlQualHash;
+	char msItemName[32]; /**< v9: plain entity/inventory name — feeds the
+	    PARTY inventory, so script HasItem() checks pass when ANY member
+	    holds the item (a split torch+glowstick could otherwise deadlock
+	    the boat-cabin door for everyone). */
+};
+
+/** Host -> guest immediately on connect (reliable ch0, BEFORE PlayerJoin). */
+struct cNetVersionAck
+{
+	uint8_t mType; /**< eNetPacketType_VersionAck */
+	uint16_t mlVersion;
 };
 
 /** An item left somebody's inventory back into the world. Entity name + file
@@ -213,6 +273,10 @@ struct cNetObjectStateBatch
 	uint8_t mType;   /**< eNetPacketType_ObjectState */
 	uint8_t mCount;  /**< cNetObjectState entries that follow */
 	uint8_t mMapGen; /**< host map generation (wraps; equality only) */
+	uint16_t mSeq;   /**< host batch counter (wraps): guards PURE-MOVING batches
+	    against unsequenced-channel reordering (a stale batch pops every body
+	    in it backward for a frame). Batches carrying rest poses and snapshot
+	    chunks travel reliably and are always applied. */
 };
 
 /** Host -> guest once per map load (reliable): what the host's physics world
@@ -279,20 +343,96 @@ struct cNetBodyGrabDeny
 	uint8_t mType;
 	uint32_t mlNameHash;
 };
+
+/** One shared enemy's pose+vitals. Identity = FNV-1a of the ENTITY name
+    (same scheme as bodies). Anim = FNV-1a of the clip name the host is
+    playing; the guest reverse-maps it against its own mesh's clip list. */
+struct cNetEnemyState
+{
+	uint32_t mlNameHash;
+	float mfPosX, mfPosY, mfPosZ; /**< character body FEET position */
+	float mfYaw;
+	float mfHealth;
+	uint32_t mlAnimHash; /**< 0 = none commanded yet */
+	uint8_t mFlags;      /**< bit0 = anim loops, bit1 = entity active */
+};
+
+struct cNetEnemyBatch
+{
+	uint8_t mType;   /**< eNetPacketType_EnemyState */
+	uint8_t mCount;
+	uint8_t mMapGen;
+	uint16_t mSeq;   /**< reorder guard, same int16-diff scheme as bodies */
+};
+
+struct cNetEnemyEvent
+{
+	uint8_t mType;  /**< eNetPacketType_EnemyEvent */
+	uint32_t mlNameHash;
+	uint8_t mEvent; /**< 0 = died (guest runs its LOCAL death for the ragdoll) */
+};
+
+struct cNetEnemyDamage
+{
+	uint8_t mType; /**< eNetPacketType_EnemyDamage */
+	uint32_t mlNameHash;
+	float mfDamage; /**< RAW damage — the host applies its own scaling */
+	int8_t mlStrength;
+};
+
+struct cNetPlayerDamage
+{
+	uint8_t mType; /**< eNetPacketType_PlayerDamage */
+	uint8_t mPlayerID; /**< the guest whose player takes it */
+	float mfDamage;
+};
+
+/** A weapon hit a breakable non-enemy entity. Identity = qualified
+    map:name hash (same scheme as item pickups). Both sims apply the same
+    damage; same health + same hits = the object breaks everywhere. */
+struct cNetEntityDamage
+{
+	uint8_t mType; /**< eNetPacketType_EntityDamage */
+	uint32_t mlQualHash;
+	float mfDamage;
+	int8_t mlStrength;
+};
+
+/** A script mutated shared state on one machine; everyone else applies the
+    same mutation directly (never back through the script hooks — the
+    gbNetScriptApplying flag suppresses re-broadcast). */
+struct cNetScriptEvent
+{
+	uint8_t mType; /**< eNetPacketType_ScriptEvent */
+	uint8_t mOp;   /**< eNetScriptOp */
+	char msName[48];
+	int32_t mlVal;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(cNetPlayerJoin) == 2, "");
 static_assert(sizeof(cNetPlayerLeave) == 2, "");
-static_assert(sizeof(cNetPlayerState) == 24, "");
+static_assert(sizeof(cNetPlayerState) == 26, ""); /* v7: +mSeq */
 static_assert(sizeof(cNetDiscoveryPing) == 7, "");
 static_assert(sizeof(cNetDiscoveryPong) == 75, "");
 static_assert(sizeof(cNetObjectState) == 33, "");
-static_assert(sizeof(cNetObjectStateBatch) == 3, "");
+static_assert(sizeof(cNetObjectStateBatch) == 5, ""); /* v7: +mSeq */
 static_assert(sizeof(cNetBodyCensus) == 8, "");
 static_assert(sizeof(cNetBodyGrabBegin) == 22, "");
 static_assert(sizeof(cNetBodyGrabTarget) == 17, "");
 static_assert(sizeof(cNetBodyGrabEnd) == 17, "");
 static_assert(sizeof(cNetBodyPush) == 30, "");
 static_assert(sizeof(cNetBodyGrabDeny) == 5, "");
+static_assert(sizeof(cNetMapChange) == 129, "");
+static_assert(sizeof(cNetItemPickup) == 37, ""); /* v9: +msItemName */
+static_assert(sizeof(cNetItemDrop) == 137, "");
+static_assert(sizeof(cNetVersionAck) == 3, "");
+static_assert(sizeof(cNetEnemyBatch) == 5, "");
+static_assert(sizeof(cNetEnemyState) == 29, "");
+static_assert(sizeof(cNetEnemyEvent) == 6, "");
+static_assert(sizeof(cNetEnemyDamage) == 10, "");
+static_assert(sizeof(cNetPlayerDamage) == 6, "");
+static_assert(sizeof(cNetScriptEvent) == 54, "");
+static_assert(sizeof(cNetEntityDamage) == 10, "");
 
 #endif /* NETWORK_PACKETS_H */

@@ -43,7 +43,7 @@ iGameEnemyState_Dog_Base::iGameEnemyState_Dog_Base(int alId, cInit *apInit, iGam
 void iGameEnemyState_Dog_Base::OnSeePlayer(const cVector3f &avPosition, float afChance)
 {
 	//return;
-	if(mpPlayer->GetHealth() <=0) return;
+	if(mpEnemy->GetFocusHealth() <=0) return;
 
 	if(afChance >= mpEnemyDog->mfIdleMinSeeChance)
 	{
@@ -60,7 +60,7 @@ void iGameEnemyState_Dog_Base::OnSeePlayer(const cVector3f &avPosition, float af
 		}*/
 
 		float fDist = cMath::Vector3Dist(mpMover->GetCharBody()->GetFeetPosition(),
-										mpPlayer->GetCharacterBody()->GetFeetPosition());
+										avPosition);
 		if(fDist >= mpEnemyDog->mfAttentionMinDist)
 		{
 			mpEnemy->ChangeState(STATE_ATTENTION);
@@ -383,7 +383,7 @@ void cGameEnemyState_Dog_Attention::OnEnterState(iGameEnemyState *apPrevState)
 	mpEnemy->SetFOV(mpEnemyDog->mfIdleFOV);
 
 	mpMover->Stop();
-	mpMover->TurnToPos(mpPlayer->GetCharacterBody()->GetFeetPosition());
+	mpMover->TurnToPos(mpEnemy->GetFocusFeetPos());
 
 	mpEnemy->PlaySound(mpEnemyDog->msAttentionSound);	
 	mfTime = mpEnemyDog->mfAttentionTime;
@@ -405,7 +405,7 @@ void cGameEnemyState_Dog_Attention::OnLeaveState(iGameEnemyState *apNextState)
 
 void cGameEnemyState_Dog_Attention::OnUpdate(float afTimeStep)
 {
-	mpMover->TurnToPos(mpPlayer->GetCharacterBody()->GetFeetPosition());
+	mpMover->TurnToPos(mpEnemy->GetFocusFeetPos());
 	mfTime -= afTimeStep;
 
 	if(mfTime <=0)
@@ -509,7 +509,7 @@ bool cGameEnemyState_Dog_Eat::OnHearNoise(const cVector3f &avPosition, float afV
 void cGameEnemyState_Dog_Eat::OnSeePlayer(const cVector3f &avPosition, float afChance)
 {
 	//return;
-	if(mpPlayer->GetHealth() <=0) return;
+	if(mpEnemy->GetFocusHealth() <=0) return;
 
 	if(afChance >= mpEnemyDog->mfEatMinSeeChance)
 	{
@@ -813,7 +813,7 @@ void cGameEnemyState_Dog_Hunt::OnLeaveState(iGameEnemyState *apNextState)
 
 void cGameEnemyState_Dog_Hunt::OnUpdate(float afTimeStep)
 {
-	if(mpPlayer->GetHealth() <=0){
+	if(mpEnemy->GetFocusHealth() <=0){
 		mpEnemy->ChangeState(STATE_IDLE);
 		return;
 	}
@@ -847,7 +847,7 @@ void cGameEnemyState_Dog_Hunt::OnUpdate(float afTimeStep)
 		//Log("%s: Checking free path\n",mpEnemy->GetName().c_str());
 		
 		//Check if there is a free path to the player
-		if(mbLostPlayer == false && mpMover->FreeDirectPathToChar(mpPlayer->GetCharacterBody()))
+		if(mbLostPlayer == false && mpEnemy->FocusDirectPath())
 		{
 			mbFreePlayerPath = true;
 			mpMover->Stop();
@@ -872,7 +872,7 @@ void cGameEnemyState_Dog_Hunt::OnUpdate(float afTimeStep)
 			{
 				bool bFoundAnotherWay = false;
 				/*float fHeight = mpMover->GetCharBody()->GetPosition().y -
-								mpPlayer->GetCharacterBody()->GetPosition().y;
+								mpEnemy->GetFocusPos().y;
 				if(cMath::Abs(fHeight) > mpMover->GetNodeContainer()->GetMaxHeight())
 				{
 					cVector3f vPos = mpEnemy->GetLastPlayerPos();
@@ -906,13 +906,13 @@ void cGameEnemyState_Dog_Hunt::OnUpdate(float afTimeStep)
 	if(mbFreePlayerPath || (mbFoundNoPath && mpMover->IsMoving()==false))
 	{
 		//Go towards player
-		mpMover->MoveDirectToPos(mpPlayer->GetCharacterBody()->GetFeetPosition(),afTimeStep);
+		mpMover->MoveDirectToPos(mpEnemy->GetFocusFeetPos(),afTimeStep);
 		
         //Check if he should attack.
-		if(mpMover->DistanceToChar2D(mpPlayer->GetCharacterBody()) < mpEnemyDog->mfAttackDistance)
+		if(mpEnemy->FocusDist2D() < mpEnemyDog->mfAttackDistance)
 		{
 			float fHeight = mpMover->GetCharBody()->GetPosition().y -
-							mpPlayer->GetCharacterBody()->GetPosition().y;
+							mpEnemy->GetFocusPos().y;
 			
 			//Player is above
 			if(fHeight < 0)
@@ -1011,7 +1011,7 @@ void cGameEnemyState_Dog_Hunt::OnDraw()
 											mpMover->GetCharBody()->GetLastPosition());
 	fRealSpeed = fRealSpeed / (1.0f/60.0f);
 
-	float fDist = mpMover->DistanceToChar2D(mpPlayer->GetCharacterBody());
+	float fDist = mpEnemy->FocusDist2D();
 
 	mpInit->mpDefaultFont->Draw(cVector3f(0,110,100),14,cColor(1,1,1,1),eFontAlign_Left,
 		_W("LostPlayerCount: %f FreePath: %d NoPath: %d MaxStuck: %d Dist: %f / %f"),
@@ -1046,7 +1046,7 @@ void cGameEnemyState_Dog_Attack::OnEnterState(iGameEnemyState *apPrevState)
 	
 	///////////////
 	//Animation
-	float fHeight = mpPlayer->GetCharacterBody()->GetPosition().y -
+	float fHeight = mpEnemy->GetFocusPos().y -
 					mpMover->GetCharBody()->GetPosition().y;
 	
 	//Player is above
@@ -1089,11 +1089,11 @@ void cGameEnemyState_Dog_Attack::OnUpdate(float afTimeStep)
 	{
 		if(mfJumpTimer <=0)
 		{
-			mpMover->MoveDirectToPos(mpPlayer->GetCharacterBody()->GetFeetPosition(),afTimeStep);
+			mpMover->MoveDirectToPos(mpEnemy->GetFocusFeetPos(),afTimeStep);
 		}
 		else
 		{
-			mpMover->TurnToPos(mpPlayer->GetCharacterBody()->GetFeetPosition());
+			mpMover->TurnToPos(mpEnemy->GetFocusFeetPos());
 			mfJumpTimer-= afTimeStep;
 		}
 	}
@@ -1102,7 +1102,7 @@ void cGameEnemyState_Dog_Attack::OnUpdate(float afTimeStep)
 
 	//////////////////////////////////////
 	//Get the 2D distance to the player
-	cVector3f vStart = mpPlayer->GetCharacterBody()->GetPosition();
+	cVector3f vStart = mpEnemy->GetFocusPos();
 	vStart.y =0;
 	cVector3f vEnd = mpMover->GetCharBody()->GetPosition();
 	vEnd.y = 0;
@@ -1143,6 +1143,11 @@ void cGameEnemyState_Dog_Attack::OnUpdate(float afTimeStep)
 				mpEnemyDog->PlaySound(mpEnemyDog->msAttackHitSound);
 			}
 			mpInit->mpPlayer->mbDamageFromPos = false;
+
+			/* Phase 6: ghost targets have no physics body for the shape
+			   attack to bite — their damage travels by packet instead */
+			mpEnemy->FocusAttackDamage(mpEnemyDog->mfAttackMinDamage,
+										mpEnemyDog->mfAttackMaxDamage);
 			mbAttacked = true;
 		}
 	}
@@ -1157,9 +1162,9 @@ void cGameEnemyState_Dog_Attack::OnUpdate(float afTimeStep)
 
 void cGameEnemyState_Dog_Attack::OnAnimationOver(const tString &asName)
 {
-	if(mpPlayer->GetHealth() <=0)
+	if(mpEnemy->GetFocusHealth() <=0)
 	{
-		float fDist = mpMover->DistanceToChar2D(mpInit->mpPlayer->GetCharacterBody());
+		float fDist = mpEnemy->FocusDist2D();
 		if(fDist < 2.3f)
 		{
 			mpEnemy->SetTempFloat(60.0f);
@@ -1322,7 +1327,7 @@ void cGameEnemyState_Dog_Flee::OnUpdate(float afTimeStep)
 				mpEnemy->ChangeState(STATE_HUNT);
 		}
 		mpMover->GetCharBody()->Move(eCharDir_Forward,-1.0f,afTimeStep);
-		mpMover->TurnToPos(mpInit->mpPlayer->GetCharacterBody()->GetFeetPosition());
+		mpMover->TurnToPos(mpEnemy->GetFocusFeetPos());
 	}
 	else
 	{
@@ -1333,7 +1338,7 @@ void cGameEnemyState_Dog_Flee::OnUpdate(float afTimeStep)
 			if(	mpEnemy->CheckForTeamMate(mpEnemyDog->mfCallBackupRange*1.5f,false) && 
 				mpEnemy->CheckForTeamMate(8,true)==false)
 			{
-				float fPlayerDist = mpMover->DistanceToChar(mpInit->mpPlayer->GetCharacterBody());
+				float fPlayerDist = mpEnemy->FocusDist();
 				//Log("Dist: %f\n",fPlayerDist);
 				if(fPlayerDist > 8)
 				{
@@ -1858,6 +1863,7 @@ void cGameEnemyState_Dog_Dead::OnUpdate(float afTimeStep)
 
 cGameEnemy_Dog::cGameEnemy_Dog(cInit *apInit,const tString& asName,TiXmlElement *apGameElem) : iGameEnemy(apInit,asName,apGameElem)
 {
+	mbNetMultiTarget = true; /* dog states use the focus accessors — safe to hunt ghosts */
 	LoadBaseProperties(apGameElem);
 	
 	//////////////////////////////

@@ -1373,6 +1373,13 @@ namespace hpl {
 	/////// LOCAL VARS //////////////////////////////////////////////////////
 	/////////////////////////////////////////////////////////////////////////
 
+	/* Penumbra co-op: the game registers a listener here to replicate script
+	   variable WRITES to the other machines (NULL in single player). Ops:
+	   0 = local set, 1 = local add, 2 = global set, 3 = global add. Fired
+	   only for real changes so timer loops rewriting the same value do not
+	   spam the wire. */
+	void (*gpScriptVarNetCallback)(int alOp, const char* asName, int alVal) = NULL;
+
 	static void __stdcall CreateLocalVar(std::string asName, int alVal)
 	{
 		if(gpScene->GetLocalVar(asName)==NULL)
@@ -1386,6 +1393,8 @@ namespace hpl {
 	static void __stdcall SetLocalVar(std::string asName, int alVal)
 	{
 		cScriptVar* pVar = gpScene->CreateLocalVar(asName);
+		if(gpScriptVarNetCallback && pVar->mlVal != alVal)
+			gpScriptVarNetCallback(0, asName.c_str(), alVal);
 		pVar->mlVal = alVal;
 	}
 	SCRIPT_DEFINE_FUNC_2(void, SetLocalVar, string, int)
@@ -1393,6 +1402,8 @@ namespace hpl {
 	static void __stdcall AddLocalVar(std::string asName, int alVal)
 	{
 		cScriptVar* pVar = gpScene->CreateLocalVar(asName);
+		if(gpScriptVarNetCallback && alVal != 0)
+			gpScriptVarNetCallback(1, asName.c_str(), alVal);
 		pVar->mlVal += alVal;
 	}
 	SCRIPT_DEFINE_FUNC_2(void, AddLocalVar, string, int)
@@ -1427,6 +1438,8 @@ namespace hpl {
 	static void __stdcall SetGlobalVar(std::string asName, int alVal)
 	{
 		cScriptVar* pVar = gpScene->CreateGlobalVar(asName);
+		if(gpScriptVarNetCallback && pVar->mlVal != alVal)
+			gpScriptVarNetCallback(2, asName.c_str(), alVal);
 		pVar->mlVal = alVal;
 	}
 	SCRIPT_DEFINE_FUNC_2(void, SetGlobalVar, string, int)
@@ -1435,6 +1448,8 @@ namespace hpl {
 	static void __stdcall AddGlobalVar(std::string asName, int alVal)
 	{
 		cScriptVar* pVar = gpScene->CreateGlobalVar(asName);
+		if(gpScriptVarNetCallback && alVal != 0)
+			gpScriptVarNetCallback(3, asName.c_str(), alVal);
 		pVar->mlVal += alVal;
 	}
 	SCRIPT_DEFINE_FUNC_2(void, AddGlobalVar, string, int)

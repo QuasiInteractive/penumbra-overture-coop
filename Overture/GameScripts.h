@@ -32,4 +32,10 @@ public:
 	static void Init();
 };
 
+
+/** Penumbra co-op (protocol v9): apply a replicated script mutation coming
+    off the wire. Implemented in GameScripts.cpp so it can reuse the exact
+    script-function bodies with re-broadcast suppressed. */
+void NetApplyScriptEvent(int alOp, const hpl::tString &asName, int alVal);
+
 #endif // GAME_SCRIPTS_H

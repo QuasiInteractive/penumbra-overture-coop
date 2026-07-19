@@ -178,6 +178,9 @@ private:
 
 	/** Map generation: bumped on every world change; the HOST's value rides
 	    the census + state batches so a guest can drop stale-map packets. */
+	uint16_t mlBatchSeqOut;   /**< host: stamped on every state batch */
+	uint16_t mlBatchSeqIn;    /**< guest: newest batch seq applied */
+	bool mbBatchSeqInKnown;
 	uint8_t mlMapGen;
 	uint8_t mlRemoteMapGen; /**< guest: host generation we verified against */
 	bool mbRemoteMapGenKnown;

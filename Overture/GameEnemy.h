@@ -357,6 +357,33 @@ protected:
 	
 	bool LineOfSight(const cVector3f &avPos, const cVector3f &avSize);
 
+public:
+	//------------- multiplayer (Phase 6): shared enemies -------------
+	/** Guest: this enemy is a PUPPET — the host's AI drives it; the local
+	    senses/mover/state machine are bypassed in Update(). */
+	void SetNetPuppet(bool abX){ mbNetPuppet = abX; }
+	bool IsNetPuppet(){ return mbNetPuppet; }
+	void NetSetTarget(const cVector3f &avFeetPos, float afYaw);
+	void UpdateNetPuppet(float afTimeStep);
+	uint32_t GetNetAnimHash(){ return mlNetAnimOutHash; }
+	bool GetNetAnimLoop(){ return mbNetAnimOutLoop; }
+
+	/** Host senses: which player this enemy is focused on (1 = the local
+	    player, 2+ = a remote ghost). Chosen in UpdateCheckForPlayer as the
+	    NEAREST candidate that passed the sight check — so it hunts whoever
+	    is actually closest, host or guest. */
+	uint8_t GetFocusPlayerId(){ return mlFocusPlayerId; }
+	cVector3f GetFocusFeetPos();
+	cVector3f GetFocusPos();
+	float GetFocusHealth();
+	float FocusDist2D();
+	float FocusDist();
+	bool FocusDirectPath();
+	/** The bite landed on a GHOST (the physical shape attack cannot touch a
+	    mesh-only ghost): route the damage to that player over the wire. */
+	void FocusAttackDamage(float afMinDamage, float afMaxDamage);
+protected:
+
 	bool mbSetFeetAtGroundOnStart;
 	bool mbAttachMeshToBody;
 	bool mbRemoveAttackerOnDisable;
@@ -383,6 +410,21 @@ protected:
 	cAINodeContainer* mpNodeContainerGround;
 
 	cLineOfSightRayCallback mRayCallback;
+
+	/* multiplayer (Phase 6) */
+	bool mbNetPuppet;
+	cVector3f mvNetTargetPos;
+	float mfNetTargetYaw;
+	bool mbNetHasTarget;
+	uint32_t mlNetAnimOutHash; /* clip the AI last commanded (FNV of name) */
+	bool mbNetAnimOutLoop;
+	uint8_t mlFocusPlayerId;
+	bool mbFocusIsGhost;
+	bool mbNetMultiTarget; /* only enemy types whose states were CONVERTED to
+	    the focus accessors may hunt ghosts (dogs). Scripted set-pieces
+	    (worm, spider) keep vanilla single-player senses — a mid-cinematic
+	    ghost aggro breaks their scripted assumptions. */
+	cVector3f mvFocusCamPos;   /* ghost focus: its last seen camera position */
 
 	std::vector<iGameEnemyState*> mvStates;
 	int mlCurrentState;
