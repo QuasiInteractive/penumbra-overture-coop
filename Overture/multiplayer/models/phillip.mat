@@ -1,0 +1,6 @@
+<Material>
+	<Main Type="Diffuse" DepthTest="True" UseAlpha="False" />
+	<TextureUnits>
+		<Diffuse File="phillip.tga" Mipmaps="True" Type="2D" Wrap="Repeat" />
+	</TextureUnits>
+</Material>

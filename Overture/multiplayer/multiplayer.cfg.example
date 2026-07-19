@@ -1,0 +1,32 @@
+# Copy to multiplayer.cfg next to penumbra.exe / working dir.
+# host=1        — auto-listen UDP (uses port=)
+# join=HOST:PRT — auto-connect once a map is loaded
+# port=7777    — default listen / F10 localhost join port
+#
+# Remote-player body mesh — put .dae files in:
+#   multiplayer/models/greenlandman.dae
+#   multiplayer/models/phillip.dae
+# PlayerID 1 (host) uses the first mesh, ID 2 the second — same order everywhere.
+#
+# ghost_body_y is offset from synced camera Y (eyes) to mesh origin — tune until feet touch the floor.
+
+host=0
+# server_name=  — shown in the LAN server browser (spaces OK, 31 chars max)
+# max_players=  — advertised in discovery pongs (2..31, default 4)
+server_name=Penumbra Server
+max_players=4
+port=7777
+# join=127.0.0.1:7777
+# Host (id 1) appears as greenlandman.dae to others; client (id 2) survivor2 — more peers rotate.
+ghost_models=greenlandman.dae,phillip.dae
+# Alternative: single mesh — ghost_model=foo.dae
+ghost_body_y=-1.72
+# ghost_body_y_crouch= — same offset while the remote player crouches (their camera
+# drops ~0.7 m but their feet don't). Unset = ghost_body_y + 0.7. Tune by eye.
+# ghost_body_y_crouch=-1.02
+
+# Per-mesh ghost grounding (CSV, indexed like ghost_models — different rigs
+# ground at different heights). Overrides ghost_body_y/_crouch per mesh.
+# More negative = mesh lower.
+# ghost_body_ys=-1.45,-1.48
+# ghost_body_ys_crouch=-1.10,-1.13
