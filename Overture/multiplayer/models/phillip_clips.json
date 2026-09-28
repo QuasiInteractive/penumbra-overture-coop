@@ -214,35 +214,35 @@
    "validated": true
   },
   "run": {
-   "source": "run_jog.bvh",
+   "source": "run_sprint.bvh",
    "bvh_frames": [
-    137,
-    159
+    68,
+    86
    ],
    "reverse": false,
    "stretch": 1.0,
    "pingpong": false,
-   "frame_count": 23,
+   "frame_count": 19,
    "fps": 30.0,
-   "length_s": 0.73333,
+   "length_s": 0.6,
    "loop": true,
-   "gait_speed_bvh_cms": 214.45,
-   "gait_speed_mps": 1.9178,
+   "gait_speed_bvh_cms": 466.3,
+   "gait_speed_mps": 4.17,
    "hips_height_m": {
-    "min": 0.9353,
-    "max": 1.0253,
-    "mean": 0.9828,
-    "first": 1.024,
-    "last": 1.024
+    "min": 0.8674,
+    "max": 0.9283,
+    "mean": 0.9004,
+    "first": 0.8915,
+    "last": 0.8915
    },
    "hips_height_bvh_cm": {
-    "first": 105.46,
-    "last": 104.74
+    "first": 92.93,
+    "last": 96.44
    },
    "root_motion": {
     "xz_drift_removed_cm": [
-     13.78,
-     156.66
+     10.15,
+     279.59
     ],
     "yaw_removed_deg": 0.0,
     "y_clamped_to_stand": false,
@@ -252,63 +252,63 @@
     "enabled": true,
     "target_floor_m": 0.0176,
     "hips_shift_m": {
-     "min": -0.0029,
-     "max": 0.0072
+     "min": -0.0141,
+     "max": 0.0019
     }
    },
-   "foot_min_y_m": 0.0104,
-   "foot_min_joint": "RightToe_End",
-   "bvh_foot_min_y_cm": -0.81,
+   "foot_min_y_m": 0.0205,
+   "foot_min_joint": "LeftToe_End",
+   "bvh_foot_min_y_cm": 0.33,
    "seam": {
-    "pos_rms_m": 0.0485,
-    "hips_pos_m": 0.0054,
-    "rot_max_deg": 21.6737
+    "pos_rms_m": 0.0721,
+    "hips_pos_m": 0.0417,
+    "rot_max_deg": 23.4291
    },
    "hip_sway": 0.6,
    "hip_sway_deviation": {
     "roll": {
      "before": [
-      -4.38,
-      3.41
+      -5.93,
+      8.99
      ],
      "after": [
-      -2.63,
-      2.05
+      -3.56,
+      5.39
      ]
     },
     "yaw": {
      "before": [
-      -1.83,
-      3.37
+      -4.02,
+      3.18
      ],
      "after": [
-      -1.1,
-      2.02
+      -2.41,
+      1.91
      ]
     },
     "pitch": {
      "before": [
-      -7.32,
-      -1.02
+      -4.21,
+      8.69
      ],
      "after": [
-      -7.32,
-      -1.02
+      -4.21,
+      8.69
      ]
     },
     "lateral": {
      "before": [
-      -1.05,
-      1.22
+      -1.08,
+      1.18
      ],
      "after": [
-      -0.63,
-      0.73
+      -0.65,
+      0.71
      ]
     }
    },
-   "hip_sway_leg_fix_deg": 1.36,
-   "notes": "fast half of run_jog (~2.15 m/s BVH); first half is a 1.05 m/s jog",
+   "hip_sway_leg_fix_deg": 4.85,
+   "notes": "steady sprint stride (4.7 m/s BVH, frames 55-105 are the flat-speed part; 0-45 start, 110+ stop). run_jog 137-159 was rejected: elbows locked at 44-65 deg, hands at the chest, no arm swing. run_sprint pumps the arms (elbow 48-149 deg).",
    "file": "phillip_run.dae",
    "validated": true
   },

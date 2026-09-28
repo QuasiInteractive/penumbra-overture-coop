@@ -230,8 +230,11 @@ SLOTS = [
                   notes="only pack idle without body yaw drift; seam 0.13 cm")),
     ("walk", dict(bvh="walk_forward", frames=(79, 113), loop=True, hip_sway=0.45,
                   notes="one gait cycle (T=35); use (37,106) for two cycles")),
-    ("run", dict(bvh="run_jog", frames=(137, 159), loop=True, hip_sway=0.6,
-                 notes="fast half of run_jog (~2.15 m/s BVH); first half is a 1.05 m/s jog")),
+    ("run", dict(bvh="run_sprint", frames=(68, 86), loop=True, hip_sway=0.6,
+                 notes="steady sprint stride (4.7 m/s BVH, frames 55-105 are the "
+                       "flat-speed part; 0-45 start, 110+ stop). run_jog 137-159 was "
+                       "rejected: elbows locked at 44-65 deg, hands at the chest, no "
+                       "arm swing. run_sprint pumps the arms (elbow 48-149 deg).")),
     ("walk_back", dict(bvh="walk_backward", frames=(99, 138), loop=True, hip_sway=0.5)),
     ("strafe_walk_l", dict(bvh="walk_strafe_left", frames=(78, 179), loop=True, hip_sway=0.5,
                            notes="two cycles: the speed pulses inside one cycle")),

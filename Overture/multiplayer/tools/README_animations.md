@@ -60,7 +60,7 @@ locomotion clip at `measured_speed / gait`.
 |---|---|---|---|---|---|---|---|---|
 | idle | idle_neutral | [125,217) | 93 | yes | 1 | 0 | 0 | only pack idle without body yaw drift |
 | walk | walk_forward | [79,113) | 35 | yes | 0.45 | 1.28 | 1.45 | one gait cycle (T = 35 f) |
-| run | run_jog | [137,159) | 23 | yes | 0.6 | 1.92 | 2.18 | fast half of run_jog; first half is a 1.05 m/s jog |
+| run | run_sprint | [68,86) | 19 | yes | 0.6 | see sidecar | see sidecar | steady sprint stride with pumping arms; run_jog 137-159 had elbows locked at 44-65 deg (hands at the chest) |
 | walk_back | walk_backward | [99,138) | 40 | yes | 0.5 | 0.72 | 0.81 | |
 | strafe_walk_l | walk_strafe_left | [78,179) | 102 | yes | 0.5 | 0.54 | 0.61 | two cycles (speed pulses inside one) |
 | strafe_walk_r | walk_strafe_right | [116,153) | 38 | yes | 0.5 | 0.77 | 0.88 | |
