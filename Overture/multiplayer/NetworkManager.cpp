@@ -168,18 +168,28 @@ cGhostPlayer *cNetworkManager::CreateGhost(uint8_t alId, size_t alMeshIdx)
 	   -1.45 — anything below -0.9 m can only be one of those, so convert it
 	   (camera - eye height = feet) instead of sinking the mesh. */
 	float fStandOffset = (mfGhostMeshBodyYOffset > 9000.0f) ? 0.0f : mfGhostMeshBodyYOffset;
-	float fCrouchOffset = (mfGhostMeshBodyYOffsetCrouch > 9000.0f) ? fStandOffset : mfGhostMeshBodyYOffsetCrouch;
+	bool bCrouchGiven = (mfGhostMeshBodyYOffsetCrouch <= 9000.0f);
+	float fCrouchOffset = bCrouchGiven ? mfGhostMeshBodyYOffsetCrouch : 0.0f;
 	if (mvGhostMeshPaths.empty() == false && mvGhostBodyYList.empty() == false)
 	{
 		const size_t lMeshIdx = alMeshIdx % mvGhostMeshPaths.size();
 		fStandOffset = mvGhostBodyYList[lMeshIdx % mvGhostBodyYList.size()];
-		fCrouchOffset = fStandOffset;
-		if (mvGhostBodyYCrouchList.empty() == false)
+		bCrouchGiven = (mvGhostBodyYCrouchList.empty() == false);
+		if (bCrouchGiven)
 			fCrouchOffset = mvGhostBodyYCrouchList[lMeshIdx % mvGhostBodyYCrouchList.size()];
 	}
+	/* Convert each GIVEN value with its own eye height first; an unset
+	   crouch value then inherits the CONVERTED stand offset (copying the raw
+	   camera-relative stand value and converting it with the crouch eye
+	   height sank the crouched ghost ~0.35 m). */
 	bool bLegacy = false;
 	if (fStandOffset < -0.9f) { fStandOffset += fEyeStand; bLegacy = true; }
-	if (fCrouchOffset < -0.9f) { fCrouchOffset += fEyeCrouch; bLegacy = true; }
+	if (bCrouchGiven)
+	{
+		if (fCrouchOffset < -0.9f) { fCrouchOffset += fEyeCrouch; bLegacy = true; }
+	}
+	else
+		fCrouchOffset = fStandOffset;
 	if (bLegacy)
 		Log(" multiplayer: ghost_body_y* look camera-relative (pre-v11); v11 offsets are from the FEET — using %.2f/%.2f, set 0 or remove the keys\n",
 			fStandOffset, fCrouchOffset);

@@ -707,6 +707,12 @@ void cGhostPlayer::ApplyState(const cNetPlayerState &aState)
 	   the running minimum is the jitter-free mapping; a 2 s window lets it
 	   creep back up when the sender's clock runs slow; a second or more of
 	   disagreement (sender paused on a loading screen) is a fresh start. */
+	/* Wall time, not summed logic dt: after a RECEIVER hitch (autosave,
+	   alt-tab) the first catch-up logic step drains every queued packet
+	   while a dt-clock is still stale, which would drop the running-min
+	   offset by the hitch length and leave the ghost extrapolating ahead of
+	   its data for the whole 2 s window. */
+	mfLocalClock = (double)GetApplicationTime() / 1000.0;
 	const double fOff = mfLocalClock - s.mfTSend;
 	if (mbClockKnown == false)
 	{
@@ -851,7 +857,7 @@ void cGhostPlayer::Update(float afTimeStep)
 {
 	if (afTimeStep < 0.0f)
 		afTimeStep = 0.0f;
-	mfLocalClock += (double)afTimeStep;
+	mfLocalClock = (double)GetApplicationTime() / 1000.0; /* wall clock, see ApplyState */
 	/* smoothing/EMA step: a hitch must not become a 1-second lerp */
 	const float fDt = (afTimeStep > 0.1f) ? 0.1f : afTimeStep;
 
@@ -1096,9 +1102,10 @@ void cGhostPlayer::ApplyClipSpeeds()
 				if (fSpeed < kClipSpeedMin) fSpeed = kClipSpeedMin;
 				else if (fSpeed > kClipSpeedMax) fSpeed = kClipSpeedMax;
 			}
-			else if (sName == msCurrentClip && IsIdleTarget(msCurrentTarget) &&
-				msCurrentTarget != sName)
-				fSpeed = 0.0f; /* no idle clip: walk frozen at its first frame */
+			else if (sName == "walk" &&
+				mpBodyEntity->GetAnimationStateFromName("idle") == NULL)
+				fSpeed = 0.0f; /* no idle clip: the walk stand-in stays frozen,
+				                  also while it fades out toward another clip */
 		}
 		pS->SetSpeed(fSpeed);
 	}
