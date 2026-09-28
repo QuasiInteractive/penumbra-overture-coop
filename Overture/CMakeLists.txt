@@ -74,6 +74,17 @@ add_subdirectory("${HPL_ROOT}" "${CMAKE_BINARY_DIR}/thirdparty/hpl")
 # sources must still find OALWrapper/OAL_Funcs.h.
 if(TARGET HPL)
 	target_include_directories(HPL PRIVATE "${OAL_ROOT}/include")
+	# OALWrapper's headers (OAL_Effect_Reverb.h: AL_EFFECT_EAXREVERB) need the
+	# EFX defines of the OpenAL the wrapper was built against (vcpkg openal-soft).
+	# The engine's own include list puts the old dependencies/include AL headers
+	# first, so prepend the same OpenAL include dir OALWrapper found.
+	find_package(OpenAL QUIET)
+	if(TARGET OpenAL::OpenAL)
+		target_include_directories(HPL BEFORE PRIVATE
+			"$<TARGET_PROPERTY:OpenAL::OpenAL,INTERFACE_INCLUDE_DIRECTORIES>")
+	elseif(OPENAL_INCLUDE_DIR)
+		target_include_directories(HPL BEFORE PRIVATE "${OPENAL_INCLUDE_DIR}")
+	endif()
 endif()
 
 message(STATUS "PENUMBRA_DEPS_USED=${_deps_root}")
