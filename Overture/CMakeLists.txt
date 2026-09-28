@@ -85,6 +85,12 @@ if(TARGET HPL)
 		set(_penumb_al_inc "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
 	endif()
 	if(_penumb_al_inc)
+		# FindOpenAL reports the .../include/AL folder itself; <AL/efx.h> needs
+		# its parent on the path.
+		get_filename_component(_penumb_al_leaf "${_penumb_al_inc}" NAME)
+		if(_penumb_al_leaf STREQUAL "AL")
+			get_filename_component(_penumb_al_inc "${_penumb_al_inc}" DIRECTORY)
+		endif()
 		message(STATUS "HPL OpenAL headers: ${_penumb_al_inc}")
 		target_include_directories(HPL BEFORE PRIVATE "${_penumb_al_inc}")
 	endif()
