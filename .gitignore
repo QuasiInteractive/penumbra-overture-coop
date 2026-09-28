@@ -8,3 +8,4 @@ Debug/
 *.obj
 *.pdb
 *.ilk
+__pycache__/
