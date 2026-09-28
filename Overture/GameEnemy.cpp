@@ -39,6 +39,12 @@
 
 #include "GlobalInit.h"
 
+/* Phase 6: a ghost is a camera position on the wire, no body. Standing, the
+   camera sits ~1.5 m above the feet (the spawn-at-host maths uses the same
+   eye height); crouched, ~0.4 m lower. Used for the ghost's feet/centre. */
+static const float kNetGhostEyeStand  = 1.5f;
+static const float kNetGhostEyeCrouch = 1.1f;
+
 tString gvStateName[STATE_NUM] = {
 	"IDLE",
 		"HUNT",
@@ -277,6 +283,9 @@ iGameEnemy::iGameEnemy(cInit *apInit,const tString& asName,TiXmlElement *apGameE
 	mlFocusPlayerId = 1;
 	mbFocusIsGhost = false;
 	mbNetMultiTarget = false;
+	mvFocusCamPos = cVector3f(0,0,0);
+	mlFocusChallengerId = 0;
+	mlFocusChallengerTicks = 0;
 	mlPlayerInLOSCount = 0;
 	mlMaxPlayerInLOSCount = 3;
 
@@ -911,6 +920,10 @@ iGameEnemyState *iGameEnemy::GetState(int alId)
 
 bool iGameEnemy::HandleTrigger(cGameTrigger *apTrigger)
 {
+	/* Phase 6: a guest's puppet has no senses — the guest's own footsteps
+	   must not poke the host-driven state machine (spurious barks/music). */
+	if(mbNetPuppet) return false;
+
 	switch(apTrigger->GetType())
 	{
 	case eGameTriggerType_Sound: return HandleSoundTrigger(apTrigger);
@@ -1096,6 +1109,8 @@ void iGameEnemy::OnDamage(float afX)
 
 void iGameEnemy::OnFlashlight(const cVector3f &avPos)
 {
+	if(mbNetPuppet) return; /* Phase 6: the host's AI owns a puppet's senses */
+
 	mvStates[mlCurrentState]->OnFlashlight(avPos);
 }
 
@@ -1137,7 +1152,10 @@ void iGameEnemy::OnSetActive(bool abX)
 
 bool iGameEnemy::CanSeePlayer()
 {
-	if(mpInit->mpMapHandler->IsPreUpdating() || mpInit->mpPlayer->IsDead()) return false;
+	if(mpInit->mpMapHandler->IsPreUpdating()) return false;
+	/* A dead LOCAL player blinds the enemy only while it is the focus —
+	   a ghost focus stays visible after the host dies (Phase 6). */
+	if(mbFocusIsGhost==false && mpInit->mpPlayer->IsDead()) return false;
 
 	return mbCanSeePlayer;
 }
@@ -1305,7 +1323,11 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 	// ghost. The NEAREST candidate that passes distance+sight becomes the
 	// FOCUS, and the original LOS-counter flow runs on that candidate, so
 	// every hunt/chase state naturally follows whoever the enemy saw.
-	struct cSeeCand { cVector3f vPos; cVector3f vFeet; cVector3f vSize; uint8_t lId; bool bGhost; };
+	struct cSeeCand {
+		cVector3f vPos; cVector3f vFeet; cVector3f vCam; cVector3f vSize;
+		uint8_t lId; bool bGhost; bool bCrouch;
+		float fDist; bool bSeen;
+	};
 	cSeeCand vCands[8];
 	int lCands = 0;
 
@@ -1314,9 +1336,11 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 		iCharacterBody *pPlayerBody = mpInit->mpPlayer->GetCharacterBody();
 		vCands[lCands].vPos  = pPlayerBody->GetPosition();
 		vCands[lCands].vFeet = pPlayerBody->GetFeetPosition();
+		vCands[lCands].vCam  = vCands[lCands].vPos; /* unused for the local player */
 		vCands[lCands].vSize = pPlayerBody->GetSize();
 		vCands[lCands].lId = 1;
 		vCands[lCands].bGhost = false;
+		vCands[lCands].bCrouch = false;
 		++lCands;
 	}
 	if(mbNetMultiTarget && mpInit->mpNetworkManager)
@@ -1325,19 +1349,52 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 		mpInit->mpNetworkManager->GetGhostCamPositions(vGhosts);
 		for(size_t g=0; g<vGhosts.size() && lCands<8; ++g)
 		{
-			vCands[lCands].vPos  = vGhosts[g].second - cVector3f(0, 0.75f, 0);
-			vCands[lCands].vFeet = vGhosts[g].second - cVector3f(0, 1.5f, 0);
-			vCands[lCands].vSize = cVector3f(0.7f, 1.7f, 0.7f);
+			uint8_t lMove = (uint8_t)eNetMoveState_Run;
+			mpInit->mpNetworkManager->GetGhostSense(vGhosts[g].first, NULL, &lMove);
+			const bool bCrouch = (lMove == (uint8_t)eNetMoveState_Crouch);
+			const float fEye = bCrouch ? kNetGhostEyeCrouch : kNetGhostEyeStand;
+
+			vCands[lCands].vCam  = vGhosts[g].second;
+			vCands[lCands].vPos  = vGhosts[g].second - cVector3f(0, fEye*0.5f, 0);
+			vCands[lCands].vFeet = vGhosts[g].second - cVector3f(0, fEye, 0);
+			vCands[lCands].vSize = cVector3f(0.7f, fEye + 0.2f, 0.7f);
 			vCands[lCands].lId = vGhosts[g].first;
 			vCands[lCands].bGhost = true;
+			vCands[lCands].bCrouch = bCrouch;
 			++lCands;
 		}
 	}
 	if(lCands == 0)
 	{
+		mlFocusChallengerId = 0;
+		mlFocusChallengerTicks = 0;
 		mbCanSeePlayer = false;
 		return;
 	}
+
+	//Where the CURRENT focus sits in the list (-1: dead local player or a
+	//ghost that left — then whoever is seen next takes over outright).
+	int lFocusIdx = -1;
+	for(int i=0; i<lCands; ++i)
+	{
+		if(vCands[i].lId == mlFocusPlayerId && vCands[i].bGhost == mbFocusIsGhost)
+		{
+			lFocusIdx = i;
+			break;
+		}
+	}
+
+	//Hand-over sense (online with several players only): an ENGAGED enemy
+	//keeps turning toward its focus, so a nearer player beside or behind it
+	//never enters the sight cone and could never take over. Within a short
+	//range it therefore notices players by rays alone (touch/proximity), no
+	//cone. Never active with a single candidate — single-player is untouched.
+	const bool bEngaged = (lCands > 1) &&
+		(	mbCanSeePlayer ||
+			mlCurrentState == STATE_HUNT || mlCurrentState == STATE_ATTACK ||
+			mlCurrentState == STATE_FLEE || mlCurrentState == STATE_ATTENTION ||
+			mlCurrentState == STATE_CALLBACKUP);
+	const float fHandOverDist = 4.0f;
 
 	float fStartFOV = mfFOV;
 	float fStartMaxSeeDist = mfMaxSeeDist;
@@ -1353,8 +1410,7 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 		float fDist = cMath::Vector3Dist(mpMover->GetCharBody()->GetPosition(), vCands[i].vPos);
 		float fMinLength = fEnemyRadius + 0.35f;
 
-		//Lower some stuff if the LOCAL player is hidden (their stealth system;
-		//ghost stealth state is unknown to the host, so ghosts get plain checks)
+		//Lower some stuff if the LOCAL player is hidden (their stealth system)
 		if(vCands[i].bGhost==false && mbCanSeePlayer==false && fDist >1.3f)
 		{
 			if(mpInit->mDifficulty == eGameDifficulty_Easy){
@@ -1381,10 +1437,36 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 				}
 			}
 		}
+		//A ghost's shadow state is unknown to the host: its wire stance
+		//stands in for it (crouching guests get the crouch+shadows factors),
+		//and the host's difficulty applies to everyone it hunts.
+		else if(vCands[i].bGhost && mbCanSeePlayer==false && fDist >1.3f)
+		{
+			if(mpInit->mDifficulty == eGameDifficulty_Easy){
+				mfFOV *= 0.6f;
+				mfMaxSeeDist *= 0.6f;
+			}
+			if(vCands[i].bCrouch)
+			{
+				mfFOV *= 0.6f;
+				mfMaxSeeDist *= 0.65f;
+			}
+		}
 
-		const bool bSeen =
+		bool bSeen =
 			(fDist <= mfMaxSeeDist && LineOfSight(vCands[i].vPos, vCands[i].vSize)) ||
 			fDist <= fMinLength;
+		if(bSeen==false && bEngaged && fDist <= fHandOverDist)
+		{
+			//proximity sense: the same obstacle rays, no cone
+			const float fFOV = mfFOV;
+			mfFOV = k2Pif;
+			bSeen = LineOfSight(vCands[i].vPos, vCands[i].vSize);
+			mfFOV = fFOV;
+		}
+		vCands[i].fDist = fDist;
+		vCands[i].bSeen = bSeen;
+
 		if(bSeen && fDist < fBestDist)
 		{
 			fBestDist = fDist;
@@ -1407,27 +1489,75 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 		{
 			mlPlayerInLOSCount = mlMaxPlayerInLOSCount;
 
+			////////////////////////////////////////////////////////////
+			// Choose the FOCUS. The nearest seen player wins outright when
+			// there is no focus in view (first sighting, focus lost, dead,
+			// disconnected). While the focus is still in view it is STICKY:
+			// a nearer player takes over only when meaningfully closer
+			// (> 1.5 m or > 25 % nearer) for two consecutive sight ticks —
+			// no flip-flop when two players stand side by side — or at once
+			// when it is in the jaws while the focus is out of reach. States
+			// that commit an animation (attack, door, knockdown) finish it
+			// first; the pending hand-over lands on the next tick after.
+			// With one candidate (single-player) this is the old behaviour.
+			int lTarget = lBest;
+			if(lFocusIdx >= 0 && vCands[lFocusIdx].bSeen && lFocusIdx != lBest)
+			{
+				const float fFocusDist = vCands[lFocusIdx].fDist;
+				const bool bMeaningful =	(fBestDist < fFocusDist - 1.5f) ||
+											(fBestDist < fFocusDist * 0.75f);
+				const bool bInJaws =	fBestDist <= mfMinAttackDist &&
+										fFocusDist > mfMinAttackDist * 2.0f;
+				const bool bCommitted =	mlCurrentState == STATE_ATTACK ||
+										mlCurrentState == STATE_BREAKDOOR ||
+										mlCurrentState == STATE_KNOCKDOWN;
+
+				if(bMeaningful)
+				{
+					if(mlFocusChallengerId == vCands[lBest].lId)
+						mlFocusChallengerTicks++;
+					else
+					{
+						mlFocusChallengerId = vCands[lBest].lId;
+						mlFocusChallengerTicks = 1;
+					}
+				}
+				else
+				{
+					mlFocusChallengerId = 0;
+					mlFocusChallengerTicks = 0;
+				}
+
+				const bool bSwitch = (bInJaws || mlFocusChallengerTicks >= 2) && bCommitted==false;
+				if(bSwitch==false) lTarget = lFocusIdx;
+			}
+			if(lTarget == lBest)
+			{
+				//nearest is (now) the focus: nobody is challenging it
+				mlFocusChallengerId = 0;
+				mlFocusChallengerTicks = 0;
+			}
+
+			const float fTargetDist = vCands[lTarget].fDist;
 			float fChance=0;
-			if(fBestDist > mfMaxSeeDist)
+			if(fTargetDist > mfMaxSeeDist)
 				fChance =0;
 			else
-				fChance = 1 - (fBestDist / mfMaxSeeDist);
+				fChance = 1 - (fTargetDist / mfMaxSeeDist);
 
-			//Adopt the seen candidate as the FOCUS — nearest player wins,
-			//re-evaluated every sight tick, so aggro hands over naturally.
-			mlFocusPlayerId = vCands[lBest].lId;
-			mbFocusIsGhost = vCands[lBest].bGhost;
+			mlFocusPlayerId = vCands[lTarget].lId;
+			mbFocusIsGhost = vCands[lTarget].bGhost;
 			if(mbFocusIsGhost)
-				mvFocusCamPos = vCands[lBest].vPos + cVector3f(0, 0.75f, 0);
+				mvFocusCamPos = vCands[lTarget].vCam;
 
 			if(mbCanSeePlayer==false)
 			{
-				mvStates[mlCurrentState]->OnSeePlayer(vCands[lBest].vPos,fChance);
-				if(vCands[lBest].bGhost==false)
+				mvStates[mlCurrentState]->OnSeePlayer(vCands[lTarget].vPos,fChance);
+				if(vCands[lTarget].bGhost==false)
 					mpInit->mpPlayer->GetHidden()->UnHide();
 			}
 
-			mvLastPlayerPos = vCands[lBest].vFeet;
+			mvLastPlayerPos = vCands[lTarget].vFeet;
 
 			mbCanSeePlayer = true;
 			mfCanSeePlayerCount = 1.0f/ 3.0f;
@@ -1440,7 +1570,11 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 		mlPlayerInLOSCount--;
 		if(mlPlayerInLOSCount<0)mlPlayerInLOSCount=0;
 
+		mlFocusChallengerId = 0;
+		mlFocusChallengerTicks = 0;
+
 		//keep a decent last pos for path finding
+		//(a ghost focus reads LIVE here, exactly like the local body does)
 		if(mfCalcPlayerHiddenPosCount >0)
 		{
 			mvLastPlayerPos = GetFocusFeetPos();
@@ -1607,25 +1741,98 @@ static const cVector2f gvPosAdds[] = {cVector2f(0,0),
 // Phase 6 — shared enemies: focus accessors + guest puppet motion.
 //-----------------------------------------------------------------------
 
+bool iGameEnemy::NetReadGhostCam(uint8_t alId, cVector3f *apOut)
+{
+	if(mpInit->mpNetworkManager==NULL) return false;
+	return mpInit->mpNetworkManager->GetGhostSense(alId, apOut, NULL);
+}
+
+float iGameEnemy::NetGhostEyeHeight(uint8_t alId)
+{
+	uint8_t lMove = (uint8_t)eNetMoveState_Run;
+	if(mpInit->mpNetworkManager)
+		mpInit->mpNetworkManager->GetGhostSense(alId, NULL, &lMove);
+	return (lMove == (uint8_t)eNetMoveState_Crouch) ? kNetGhostEyeCrouch : kNetGhostEyeStand;
+}
+
+cVector3f iGameEnemy::GetFocusCamPos()
+{
+	if(mbFocusIsGhost)
+	{
+		/* LIVE: the latest wire position every call — the old cached value
+		   only moved on a successful sight tick (<= every 0.55 s), so Hunt
+		   and Attack steered at where a running guest WAS. Once the ghost is
+		   gone the last known position stands in (the AI then reads it as a
+		   corpse, see GetFocusHealth). */
+		cVector3f vCam;
+		if(NetReadGhostCam(mlFocusPlayerId, &vCam))
+			mvFocusCamPos = vCam;
+		return mvFocusCamPos;
+	}
+	return mpInit->mpPlayer->GetCamera()->GetPosition();
+}
+
 cVector3f iGameEnemy::GetFocusFeetPos()
 {
 	if(mbFocusIsGhost)
-		return mvFocusCamPos - cVector3f(0, 1.5f, 0);
+		return GetFocusCamPos() - cVector3f(0, NetGhostEyeHeight(mlFocusPlayerId), 0);
 	return mpInit->mpPlayer->GetCharacterBody()->GetFeetPosition();
 }
 
 cVector3f iGameEnemy::GetFocusPos()
 {
 	if(mbFocusIsGhost)
-		return mvFocusCamPos - cVector3f(0, 0.75f, 0);
+		return GetFocusCamPos() - cVector3f(0, NetGhostEyeHeight(mlFocusPlayerId) * 0.5f, 0);
 	return mpInit->mpPlayer->GetCharacterBody()->GetPosition();
 }
 
 float iGameEnemy::GetFocusHealth()
 {
 	if(mbFocusIsGhost)
-		return 100.0f; /* remote health is not mirrored (yet): assume alive */
+	{
+		/* Disconnected (or not hosting any more): the AI treats it like a
+		   corpse — Hunt idles, a bite in progress ends in Eat/Flee — and the
+		   next sight tick hands the focus to whoever is actually there. */
+		cVector3f vCam;
+		if(NetReadGhostCam(mlFocusPlayerId, &vCam)==false) return 0.0f;
+
+		/* TODO(net): a guest's REAL health is not on the wire — cNetPlayerState
+		   carries pos/yaw/flashlight/move state only and is frozen while the
+		   ghost stream is being reworked. Until a health byte is mirrored
+		   (protocol bump: fill from mpPlayer->GetHealth() in the local
+		   snapshot, keep per ghost, return it here and skip dead ghosts in
+		   UpdateCheckForPlayer), a DEAD guest still reads as alive: the dog
+		   keeps re-biting a corpse whose cPlayer::Damage drops the packets
+		   instead of eating it / going idle. */
+		return 100.0f;
+	}
 	return mpInit->mpPlayer->GetHealth();
+}
+
+void iGameEnemy::NetCopyFocusFrom(iGameEnemy *apOther)
+{
+	if(apOther==NULL || apOther==this) return;
+	mlFocusPlayerId = apOther->mlFocusPlayerId;
+	mbFocusIsGhost = apOther->mbFocusIsGhost;
+	mvFocusCamPos = apOther->mvFocusCamPos;
+	mlFocusChallengerId = 0;
+	mlFocusChallengerTicks = 0;
+}
+
+void iGameEnemy::NetFocusLocalPlayer()
+{
+	mlFocusPlayerId = 1;
+	mbFocusIsGhost = false;
+	mlFocusChallengerId = 0;
+	mlFocusChallengerTicks = 0;
+}
+
+bool iGameEnemy::NetRayClear(const cVector3f &avFrom, const cVector3f &avTo)
+{
+	iPhysicsWorld *pPhysicsWorld = mpInit->mpGame->GetScene()->GetWorld3D()->GetPhysicsWorld();
+	mRayCallback.Reset();
+	pPhysicsWorld->CastRay(&mRayCallback, avFrom, avTo, false, false, false);
+	return mRayCallback.Intersected()==false;
 }
 
 float iGameEnemy::FocusDist2D()
@@ -1643,16 +1850,59 @@ float iGameEnemy::FocusDist()
 bool iGameEnemy::FocusDirectPath()
 {
 	if(mbFocusIsGhost)
-		return LineOfSight(GetFocusPos(), cVector3f(0.7f, 1.7f, 0.7f));
+	{
+		/* Mirrors cCharacterMove::FreeDirectPathToChar for a body-less ghost:
+		   same floor (|dy| <= 0.8 m) and an unobstructed line — by the sight
+		   rays but WITHOUT the sight cone: "is the way clear" must not depend
+		   on where the enemy happens to be looking (it made a dog that had
+		   not turned to its ghost fall back to A* every path tick). */
+		const cVector3f vFeet = GetFocusFeetPos();
+		const float fHeight = cMath::Abs(mpMover->GetCharBody()->GetFeetPosition().y - vFeet.y);
+		if(fHeight > 0.8f) return false;
+
+		const float fFOV = mfFOV;
+		mfFOV = k2Pif;
+		const bool bFree = LineOfSight(GetFocusPos(), cVector3f(0.7f, 1.7f, 0.7f));
+		mfFOV = fFOV;
+		return bFree;
+	}
 	return mpMover->FreeDirectPathToChar(mpInit->mpPlayer->GetCharacterBody());
 }
 
-void iGameEnemy::FocusAttackDamage(float afMinDamage, float afMaxDamage)
+void iGameEnemy::FocusAttackDamage(float afMinDamage, float afMaxDamage,
+									iCollideShape *apShape, const cMatrixf &a_mtxOffset)
 {
 	if(mbFocusIsGhost==false) return; /* local player is hit by the SHAPE attack */
-	if(mpInit->mpNetworkManager)
-		mpInit->mpNetworkManager->SendPlayerDamage(mlFocusPlayerId,
-			cMath::RandRectf(afMinDamage, afMaxDamage));
+	if(mpInit->mpNetworkManager==NULL) return;
+
+	cVector3f vCam;
+	if(NetReadGhostCam(mlFocusPlayerId, &vCam)==false) return; /* gone: nothing to bite */
+
+	/* 1) Is the ghost inside the attack box? The old rule was a bare 2D
+	      range test on a stale position: bites from behind, from 3 m, over
+	      railings. Now the ghost (a 0.7 x eye+0.2 x 0.7 box around its
+	      body centre) is tested against the SAME box + offset matrix the
+	      shape attack used — that box already sits in front of the attacker
+	      and turns with it, so facing and height come with it. */
+	const float fEye = NetGhostEyeHeight(mlFocusPlayerId);
+	const cVector3f vCenter = vCam - cVector3f(0, fEye * 0.5f, 0);
+	const cVector3f vGhostHalf(0.35f, (fEye + 0.2f) * 0.5f, 0.35f);
+	const cVector3f vBoxHalf = apShape ? apShape->GetSize() * 0.5f : cVector3f(0.5f, 0.5f, 0.5f);
+	const cVector3f vLocal = cMath::MatrixMul(cMath::MatrixInverse(a_mtxOffset), vCenter);
+	if(	cMath::Abs(vLocal.x) > vBoxHalf.x + vGhostHalf.x ||
+		cMath::Abs(vLocal.y) > vBoxHalf.y + vGhostHalf.y ||
+		cMath::Abs(vLocal.z) > vBoxHalf.z + vGhostHalf.z)
+	{
+		return;
+	}
+
+	/* 2) A clear line from the attacker to the ghost — the ray
+	      cAttackHandler::CreateShapeAttack requires before it hurts the
+	      local body (no bites through doors and grates). */
+	if(NetRayClear(mpMover->GetCharBody()->GetPosition(), vCenter)==false) return;
+
+	mpInit->mpNetworkManager->SendPlayerDamage(mlFocusPlayerId,
+		cMath::RandRectf(afMinDamage, afMaxDamage));
 }
 
 void iGameEnemy::NetSetTarget(const cVector3f &avFeetPos, float afYaw)

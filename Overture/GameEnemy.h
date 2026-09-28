@@ -373,16 +373,38 @@ public:
 	    NEAREST candidate that passed the sight check — so it hunts whoever
 	    is actually closest, host or guest. */
 	uint8_t GetFocusPlayerId(){ return mlFocusPlayerId; }
+	bool IsFocusGhost(){ return mbFocusIsGhost; }
+	/** For a ghost focus these read the ghost's LATEST wire position on
+	    every call (live between sight ticks, like the local body is), and
+	    fall back to the last known position once the ghost is gone. */
 	cVector3f GetFocusFeetPos();
 	cVector3f GetFocusPos();
+	cVector3f GetFocusCamPos();
+	/** 0 for a disconnected ghost (the AI treats it as a corpse). NOTE: a
+	    guest's real health is not on the wire yet — see the TODO in the impl. */
 	float GetFocusHealth();
 	float FocusDist2D();
 	float FocusDist();
 	bool FocusDirectPath();
 	/** The bite landed on a GHOST (the physical shape attack cannot touch a
-	    mesh-only ghost): route the damage to that player over the wire. */
-	void FocusAttackDamage(float afMinDamage, float afMaxDamage);
+	    mesh-only ghost): route the damage to that player over the wire —
+	    but only if the ghost actually is inside the attack box (same shape +
+	    offset matrix the shape attack used) and the ray to it is clear, the
+	    test cAttackHandler::CreateShapeAttack applies to the local body. */
+	void FocusAttackDamage(float afMinDamage, float afMaxDamage,
+							iCollideShape *apShape, const cMatrixf &a_mtxOffset);
+	/** Backup call: the callee hunts the SAME player as the caller. */
+	void NetCopyFocusFrom(iGameEnemy *apOther);
+	/** Local-player stimuli (ShowPlayer, script ShowEnemyPlayer): the focus
+	    is the local player. No-op offline (the focus never leaves id 1). */
+	void NetFocusLocalPlayer();
 protected:
+	/** Host: live wire camera of a ghost id; false = not connected/hosting. */
+	bool NetReadGhostCam(uint8_t alId, cVector3f *apOut);
+	/** Eye height of a ghost above its feet: crouched guests carry a lower camera. */
+	float NetGhostEyeHeight(uint8_t alId);
+	/** One obstacle ray (characters/grabbed/transparent pass through). */
+	bool NetRayClear(const cVector3f &avFrom, const cVector3f &avTo);
 
 	bool mbSetFeetAtGroundOnStart;
 	bool mbAttachMeshToBody;
@@ -424,7 +446,12 @@ protected:
 	    the focus accessors may hunt ghosts (dogs). Scripted set-pieces
 	    (worm, spider) keep vanilla single-player senses — a mid-cinematic
 	    ghost aggro breaks their scripted assumptions. */
-	cVector3f mvFocusCamPos;   /* ghost focus: its last seen camera position */
+	cVector3f mvFocusCamPos;   /* ghost focus: its last KNOWN camera position
+	    (refreshed by every live accessor read; the fallback once it is gone) */
+	/* nearest-player hysteresis: a candidate that has been MEANINGFULLY
+	   closer than the current focus for this many consecutive sight ticks */
+	uint8_t mlFocusChallengerId;
+	int mlFocusChallengerTicks;
 
 	std::vector<iGameEnemyState*> mvStates;
 	int mlCurrentState;

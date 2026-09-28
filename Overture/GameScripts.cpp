@@ -1274,6 +1274,9 @@ static void __stdcall ShowEnemyPlayer(std::string asEnemy)
 	}
 	iGameEnemy *pEnemy = static_cast<iGameEnemy*>(pEntity);
 
+	/* Phase 6: scripted set-pieces open on the LOCAL player (no-op offline);
+	   a nearer guest can still take over through the normal sight ticks. */
+	pEnemy->NetFocusLocalPlayer();
 
 	pEnemy->SetLastPlayerPos(	gpInit->mpPlayer->GetCharacterBody()->GetFeetPosition() + 
 								cVector3f(0,0.1f,0));
