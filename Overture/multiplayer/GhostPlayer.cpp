@@ -372,6 +372,8 @@ cGhostPlayer::cGhostPlayer(cWorld3D *apWorld, uint8_t alPlayerID, const tString 
 	mlLastSeq = 0;
 	mbHaveSeq = false;
 	mlSeqUnwrapped = 0;
+	mlLastHealth = 100;
+	mbLastDead = false;
 
 	mfLocalClock = 0.0;
 	mfClockOffset = 0.0;
@@ -524,6 +526,22 @@ bool cGhostPlayer::GetLastStatePos(cVector3f *apOut) const
 	const cGhostSample &s = mvSamples[mlSampleHead];
 	const bool bCrouch = (s.mFlags & eNetPlayerFlag_Crouch) != 0;
 	*apOut = s.mvPos + cVector3f(0, bCrouch ? mfEyeHeightCrouch : mfEyeHeightStand, 0);
+	return true;
+}
+
+bool cGhostPlayer::GetLastFeetPos(cVector3f *apOut) const
+{
+	if (apOut == NULL || mlSampleCount <= 0)
+		return false;
+	*apOut = mvSamples[mlSampleHead].mvPos;
+	return true;
+}
+
+bool cGhostPlayer::GetRenderFeetPos(cVector3f *apOut) const
+{
+	if (apOut == NULL || mbRenderValid == false)
+		return false;
+	*apOut = mvRenderPos;
 	return true;
 }
 
@@ -691,6 +709,9 @@ void cGhostPlayer::ApplyState(const cNetPlayerState &aState)
 		mlSeqUnwrapped = 0;
 	}
 	mlLastSeq = aState.mSeq;
+	/* v12: vitals ride on the newest state (no interpolation) */
+	mlLastHealth = (aState.mHealth > 100) ? (uint8_t)100 : aState.mHealth;
+	mbLastDead = (aState.mFlags & eNetPlayerFlag_Dead) != 0;
 
 	cGhostSample s;
 	s.mfTSend = (double)mlSeqUnwrapped * (double)kNetSendPeriodSeconds;

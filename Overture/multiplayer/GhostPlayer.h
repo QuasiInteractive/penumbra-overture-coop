@@ -95,6 +95,18 @@ public:
 	    yet) — the enemy senses use this as the ghost's whereabouts. */
 	bool GetLastStatePos(hpl::cVector3f *apOut) const;
 
+	/** v12 party health. Latest received FEET position (raw wire sample,
+	    no interpolation; false = no state yet) — the co-op respawn walks
+	    the dead player next to this. */
+	bool GetLastFeetPos(hpl::cVector3f *apOut) const;
+	/** Where the ghost mesh is DRAWN this frame (interpolated feet; false
+	    before the first Update resolved a pose) — the world-anchored
+	    health bar hangs above this so it tracks the visible body. */
+	bool GetRenderFeetPos(hpl::cVector3f *apOut) const;
+	/** Sender's health from the newest state, 0 when it flagged Dead
+	    (100 until the first state arrives). */
+	float GetLastHealth() const { return mbLastDead ? 0.0f : (float)mlLastHealth; }
+
 	/** The world that owned this ghost's entities is gone (map change/unload):
 	    drop every pointer WITHOUT destroying through them — the dead cWorld3D
 	    already tore the entities down. Call before hplDelete on a world switch. */
@@ -180,6 +192,8 @@ private:
 	uint16_t mlLastSeq;
 	bool mbHaveSeq;
 	int64_t mlSeqUnwrapped;
+	uint8_t mlLastHealth;     /* v12: newest state's mHealth */
+	bool mbLastDead;          /* v12: newest state had eNetPlayerFlag_Dead */
 
 	/* sender clock -> local clock mapping */
 	double mfLocalClock;      /* sum of Update dts */

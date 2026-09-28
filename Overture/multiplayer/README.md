@@ -27,7 +27,8 @@ writes, entity activation, door locks, item pickups/drops/consumption and
 breakable damage are replicated as reliable events; map changes move the
 whole party). Player state, bodies and enemies stream at **30 Hz**
 (`kNetSendPeriodSeconds`); every wire layout change bumps
-`kNetProtocolVersion`, and the connect handshake refuses mismatched builds.
+`kNetProtocolVersion` (currently **12**), and the connect handshake refuses
+mismatched builds.
 
 Remote players are drawn as **ghosts** (`cGhostPlayer`): each `cNetPlayerState`
 carries the sender's feet position, view pitch/yaw, body-local planar
@@ -44,11 +45,53 @@ normalizes). Locomotion clips play at `real speed / gait speed` (clamped
 0.6..1.8) so the feet do not slide; gaits come from the built-in table,
 the model's `<name>_clips.json`, then `ghost_gait_*` in `multiplayer.cfg`.
 
+### Party health (protocol v12)
+
+`cNetPlayerState` carries the sender's health (`mHealth`, 0-100) and an
+`eNetPlayerFlag_Dead` bit (`cPlayer::IsDead()`), filled in
+`BuildLocalSnapshot`. Every receiver — host and guests, relay is a plain
+copy — keeps the newest value per remote id (`cNetworkManager::
+GetGhostHealth`, `GetPartyStatus`); the map is keyed by id, not by ghost
+entity, so it survives our own map change and is erased when the peer
+leaves. Consumers:
+
+- **Enemy AI (host)** — `iGameEnemy::GetFocusHealth()` returns the mirrored
+  value (0 = dead or gone), `UpdateCheckForPlayer` never offers a dead ghost
+  as a sight candidate, and the host-side ghost footstep triggers
+  (`TriggerHandler.cpp`) stop for a dead guest. A dog that just killed a
+  guest eats/idles instead of re-biting a corpse.
+- **HUD** — `cPlayer::DrawPartyHud()` (called from `cPlayer::OnDraw`, after
+  the health filter) projects a point 2 m above each ghost's rendered feet
+  and draws a 60x6 bar (red..green) + `P<id>` (`P<id> dead`), hidden behind
+  the camera or beyond 25 m, fading from 15 m; not drawn over the inventory,
+  notebook, panel or death menu.
+- **Inventory** — `cInventory::DrawParty()` lists every connected player
+  with health and a bar in the free column right of the slot grid.
+
+### Co-op death rule (`coop_respawn=1`, default)
+
+`cPlayerDeath::Update` decides ONCE, at the frame the vanilla sequence
+would open `cDeathMenu`: if the session is live (hosting with a connected
+guest, or a synced client), `coop_respawn` is on and at least one OTHER
+member's mirrored health is > 0, the death menu is skipped. The usual fade
+plays; after 3 s the player gets 40 health, is teleported to the nearest
+living member's last wire feet position (+5 cm, the spawn-at-host offset),
+stands up, is un-hidden and the death state is reset (hpl.log:
+"respawned next to player N"). Re-evaluated every frame from the 3 s mark:
+if everybody else died or left meanwhile the vanilla death menu opens; if a
+living member has no position yet (between maps) it waits up to 15 s, then
+gives up to the death menu. Offline the code path is the original two
+lines — single-player is unchanged.
+
 ## Game glue (outside this folder — edit carefully)
 
 | Location | What |
 |----------|------|
 | `../Init.cpp` / `Init.h` | Owns `mpNetworkManager`; `Startup()` after input exists; `Update()` each frame; config port load/save. |
+| `../Player.cpp` / `Player.h` | `DrawPartyHud()` — world-anchored party health bars in `OnDraw`. |
+| `../PlayerHelper.cpp` / `.h` | `cPlayerDeath` co-op respawn branch (`CoopRespawnApplies`, `UpdateCoopRespawn`). |
+| `../Inventory.cpp` / `.h` | `DrawParty()` — inventory party health list. |
+| `../GameEnemy.cpp`, `../TriggerHandler.cpp` | Host senses read `GetGhostHealth` (focus health, sight candidates, ghost footsteps). |
 | `../MainMenu.cpp` / `MainMenu.h` | Multiplayer menu states, host/join UI, IP typing widget (`#ifdef PENUMBRA_MULTIPLAYER`). |
 | `../CMakeLists.txt` | Globs `multiplayer/*.cpp`, links ENet, defines `PENUMBRA_MULTIPLAYER`. |
 | `../vcpkg.json` | Declares `enet` (+ SDL/OpenAL audio deps). |
@@ -59,7 +102,7 @@ the model's `<name>_clips.json`, then `ghost_gait_*` in `multiplayer.cfg`.
 - **F10** — join `127.0.0.1:<port>`.
 - **F9** — LAN/Hamachi discovery scan (~1.5s window; results logged, feed the server browser).
 - **Menu** — Multiplayer → Host / Join.
-- **`multiplayer.cfg`** — `host=1`, `join=HOST:PORT`, `port=`, `server_name=`, `max_players=`, `ghost_models=a.dae,b.dae`, `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`. See `multiplayer.cfg.example`.
+- **`multiplayer.cfg`** — `host=1`, `join=HOST:PORT`, `port=`, `server_name=`, `max_players=`, `ghost_models=a.dae,b.dae`, `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`. See `multiplayer.cfg.example`.
 
 ### Ghost preview (offline animation check)
 

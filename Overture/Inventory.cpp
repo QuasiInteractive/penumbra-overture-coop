@@ -67,6 +67,18 @@ cInventory::cInventory(cInit *apInit)  : iUpdateable("Inventory")
 
 	mpMessageBackground = mpDrawer->CreateGfxObject("effect_black.bmp","diffalpha2d");
 
+	//v12 party health bar image (solid white, tinted per draw)
+	mpGfxPartyBar = NULL;
+	{
+		iBitmap2D *pBmp = mpInit->mpGame->GetGraphics()->GetLowLevel()->CreateBitmap2D(cVector2l(4,4),32);
+		if(pBmp)
+		{
+			pBmp->FillRect(cRect2l(0,0,4,4),cColor(1,1,1,1));
+			mpGfxPartyBar = mpDrawer->CreateGfxObject(pBmp,"diffalpha2d");
+			hplDelete(pBmp);
+		}
+	}
+
 	///////////////////////////////////
 	//Init normal slots
 	cInventorySlot *pSlot = NULL;
@@ -132,6 +144,7 @@ cInventory::cInventory(cInit *apInit)  : iUpdateable("Inventory")
 cInventory::~cInventory(void)
 {
 	hplDelete( mpContext );
+	if(mpGfxPartyBar) mpDrawer->DestroyGfxObject(mpGfxPartyBar);
 
 	ClearCallbacks();
 	
@@ -1099,6 +1112,10 @@ void cInventory::OnDraw()
 	}
 
 	//////////////////////////////
+	//v12: party health (no-op offline)
+	DrawParty();
+
+	//////////////////////////////
 	//Draw Selected item
 	if(mpCurrentItem)
 	{
@@ -1146,6 +1163,58 @@ void cInventory::OnDraw()
 							msItemDesc.c_str());
 		mpFont->DrawWordWrap(cVector3f(80+1,480+1,9),640,16,17,cColor(0,0,0,fTextAlpha),eFontAlign_Left,
 							msItemDesc.c_str());
+	}
+}
+
+//-----------------------------------------------------------------------
+
+/* v12 party health: right of the slot grid (x 680.., from the grid's top
+   at y 89), "Party" then "P<id>  <hp>" + a 100x8 bar per connected player,
+   coloured like cInventoryHealth (red..green), "dead" in red. */
+void cInventory::DrawParty()
+{
+	cNetworkManager *pNet = mpInit->mpNetworkManager;
+	if(pNet==NULL || mpGfxPartyBar==NULL || mpFont==NULL) return;
+
+	std::vector<cNetPartyMember> vParty;
+	pNet->GetPartyStatus(vParty);
+	if(vParty.empty()) return;
+
+	const float fX = 682.0f;
+	float fY = 89.0f;
+	const float fZ = 12.0f;
+	const float kBarW = 100.0f, kBarH = 8.0f;
+
+	mpFont->Draw(cVector3f(fX, fY, fZ),cVector2f(15,15),cColor(1,1,1,mfAlpha),eFontAlign_Left,_W("Party"));
+	mpFont->Draw(cVector3f(fX+1, fY+1, fZ-1),cVector2f(15,15),cColor(0,0,0,mfAlpha),eFontAlign_Left,_W("Party"));
+	fY += 20;
+
+	for(size_t i=0; i<vParty.size() && fY < 360; ++i)
+	{
+		const cNetPartyMember &m = vParty[i];
+		const float fHealth = (m.mfHealth < 0) ? 0.0f : ((m.mfHealth > 100) ? 100.0f : m.mfHealth);
+		const float fPercent = fHealth / 100.0f;
+
+		if(fHealth > 0)
+		{
+			mpFont->Draw(cVector3f(fX, fY, fZ),cVector2f(13,13),cColor(1,1,1,mfAlpha),eFontAlign_Left,
+							_W("P%d  %.0f"),(int)m.mlId, fHealth);
+		}
+		else
+		{
+			mpFont->Draw(cVector3f(fX, fY, fZ),cVector2f(13,13),cColor(1,0.3f,0.3f,mfAlpha),eFontAlign_Left,
+							_W("P%d  dead"),(int)m.mlId);
+		}
+		fY += 15;
+
+		mpDrawer->DrawGfxObject(mpGfxPartyBar,cVector3f(fX-1, fY-1, fZ),cVector2f(kBarW+2, kBarH+2),
+								cColor(0,0,0,0.6f*mfAlpha));
+		if(fPercent > 0)
+		{
+			mpDrawer->DrawGfxObject(mpGfxPartyBar,cVector3f(fX, fY, fZ+1),cVector2f(kBarW*fPercent, kBarH),
+									cColor(1.0f-fPercent, fPercent, 0, mfAlpha));
+		}
+		fY += kBarH + 8;
 	}
 }
 

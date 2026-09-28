@@ -151,6 +151,16 @@ namespace
 		{
 			const uint8_t lId = vGhosts[g].first;
 			const cVector3f vCam = vGhosts[g].second;
+
+			//v12: a dead guest makes no footsteps. Its stride state is
+			//dropped too, so the respawn teleport does not land as one
+			//giant step when it comes back.
+			float fHealth = 100.0f;
+			if(pNet->GetGhostHealth(lId, &fHealth) && fHealth <= 0)
+			{
+				gm_mapNetGhostSteps.erase(lId);
+				continue;
+			}
 			cNetGhostStepState &state = gm_mapNetGhostSteps[lId];
 
 			state.mfSinceStep += afTimeStep;

@@ -118,6 +118,20 @@ bool cNetworkManager::BuildLocalSnapshot(cNetPlayerState *apOut) const
 		lFlags |= eNetPlayerFlag_RunKey;
 	if (eMove == ePlayerMoveState_Jump)
 		lFlags |= eNetPlayerFlag_Jump;
+	/* v12 party health: 0-100 rounded; the Dead bit covers the one-frame
+	   gap between health reaching 0 and the death sequence starting, and a
+	   scripted death (IsDead() is what cPlayer::Damage keys off). */
+	float fHealth = mpInit->mpPlayer->GetHealth();
+	if (fHealth < 0.0f) fHealth = 0.0f;
+	else if (fHealth > 100.0f) fHealth = 100.0f;
+	apOut->mHealth = (uint8_t)(fHealth + 0.5f);
+	if (apOut->mHealth == 0 && fHealth > 0.0f)
+		apOut->mHealth = 1; /* 0 means DEAD to every receiver; 0.3 hp is alive */
+	if (mpInit->mpPlayer->IsDead() || fHealth <= 0.0f)
+	{
+		lFlags |= eNetPlayerFlag_Dead;
+		apOut->mHealth = 0;
+	}
 	apOut->mFlags = lFlags;
 
 	/* v11 velocity: the body's true world velocity over the last physics
@@ -266,6 +280,7 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , msServerName("Penumbra Server")
 	  , mlMaxPlayers(4)
 	  , mpBodySync(new cBodySync())
+	  , mbCoopRespawn(true) /* v12: multiplayer.cfg coop_respawn */
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -325,6 +340,7 @@ void cNetworkManager::ClearGhostsInternal()
 {
 	m_mapGhostSeq.clear(); /* new session, new counters */
 	m_mapGhostMoveState.clear();
+	m_mapGhostHealth.clear();
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
@@ -343,6 +359,7 @@ void cNetworkManager::DropRemotePlayer(uint8_t id)
 {
 	m_mapGhostSeq.erase(id); /* a rejoiner restarts its counter */
 	m_mapGhostMoveState.erase(id);
+	m_mapGhostHealth.erase(id); /* v12: gone = not alive for the respawn rule */
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
 	if (it != m_mapGhosts.end())
 	{
@@ -396,6 +413,10 @@ void cNetworkManager::NetOnEnemyDamaged(const hpl::tString &, float, int) {}
 bool cNetworkManager::PartyHasItem(const hpl::tString &) const { return false; }
 void cNetworkManager::NetOnScriptEvent(int, const hpl::tString &, int) {}
 void cNetworkManager::NetOnEntityDamaged(const hpl::tString &, float, int) {}
+/* v12 party health: nobody is ever connected in the stub build. */
+bool cNetworkManager::GetGhostHealth(uint8_t, float *) const { return false; }
+void cNetworkManager::GetPartyStatus(std::vector<cNetPartyMember> &avOut) const { avOut.clear(); }
+bool cNetworkManager::IsSessionLive() const { return false; }
 
 #else /* PENUMBRA_MULTIPLAYER */
 
@@ -717,6 +738,7 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , msServerName("Penumbra Server")
 	  , mlMaxPlayers(4)
 	  , mpBodySync(new cBodySync())
+	  , mbCoopRespawn(true) /* v12: multiplayer.cfg coop_respawn */
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -882,6 +904,8 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 					mGhostTuning.m_mapGaitOverrides[hpl::tString(name)] = g;
 			}
 		}
+		else if (strcmp(key, "coop_respawn") == 0)
+			mbCoopRespawn = (atoi(val) != 0); /* v12: 0 = vanilla death menu online too */
 		else if (strcmp(key, "max_players") == 0)
 		{
 			int mp = atoi(val);
@@ -1192,6 +1216,7 @@ void cNetworkManager::ClearGhostsInternal()
 {
 	m_mapGhostSeq.clear(); /* new session, new counters */
 	m_mapGhostMoveState.clear();
+	m_mapGhostHealth.clear();
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
@@ -1202,6 +1227,7 @@ void cNetworkManager::DropRemotePlayer(uint8_t id)
 {
 	m_mapGhostSeq.erase(id); /* a rejoiner restarts its counter */
 	m_mapGhostMoveState.erase(id);
+	m_mapGhostHealth.erase(id); /* v12: gone = not alive for the respawn rule */
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
 	if (it != m_mapGhosts.end())
 	{
@@ -1447,6 +1473,11 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 			return;
 		m_mapGhostSeq[st->mPlayerID] = st->mSeq;
 	}
+	/* v12: mirrored health per id (both roles) — kept outside the ghost
+	   entity so it survives our own map change (ghosts are rebuilt). */
+	m_mapGhostHealth[st->mPlayerID] =
+		(st->mFlags & eNetPlayerFlag_Dead) ? (uint8_t)0 :
+		((st->mHealth > 100) ? (uint8_t)100 : st->mHealth);
 	EnsureGhost(st->mPlayerID);
 	std::map<uint8_t, cGhostPlayer *>::iterator gi = m_mapGhosts.find(st->mPlayerID);
 	if (gi != m_mapGhosts.end())
@@ -2662,6 +2693,7 @@ void cNetworkManager::UpdatePreviewGhost(float afTimeStep)
 		st.mVelFwd = EncodeNetVel(fSpeed);
 		st.mVelRight = 0;
 		st.mFlags = lFlags;
+		st.mHealth = 100; /* v12: the preview is never "dead" */
 		mpPreviewGhost->ApplyState(st);
 	}
 
@@ -3046,6 +3078,52 @@ bool cNetworkManager::GetGhostSense(uint8_t alId, hpl::cVector3f *apCamPos, uint
 		*apMoveState = (mi != m_mapGhostMoveState.end()) ? mi->second : (uint8_t)eNetMoveState_Run;
 	}
 	return true;
+}
+
+//-----------------------------------------------------------------------
+// v12 party health (both roles): appended accessors — see NetworkManager.h tail.
+//-----------------------------------------------------------------------
+
+bool cNetworkManager::GetGhostHealth(uint8_t alId, float *apHealth) const
+{
+	if (alId == 0 || alId == mlLocalPlayerId)
+		return false;
+	std::map<uint8_t, uint8_t>::const_iterator it = m_mapGhostHealth.find(alId);
+	if (it == m_mapGhostHealth.end())
+		return false; /* disconnected (DropRemotePlayer) / no state yet */
+	if (apHealth)
+		*apHealth = (float)it->second;
+	return true;
+}
+
+void cNetworkManager::GetPartyStatus(std::vector<cNetPartyMember> &avOut) const
+{
+	avOut.clear();
+	if (!mbHosting && !(mbClientConnected && mbHadJoinPacket))
+		return;
+	for (std::map<uint8_t, uint8_t>::const_iterator it = m_mapGhostHealth.begin();
+		it != m_mapGhostHealth.end(); ++it)
+	{
+		if (it->first == 0 || it->first == mlLocalPlayerId || it->first == kPreviewGhostId)
+			continue;
+		cNetPartyMember m;
+		m.mlId = it->first;
+		m.mfHealth = (float)it->second;
+		tGhostMap::const_iterator gi = m_mapGhosts.find(it->first);
+		if (gi != m_mapGhosts.end() && gi->second)
+		{
+			m.mbHasFeetPos = gi->second->GetLastFeetPos(&m.mvFeetPos);
+			m.mbHasRenderPos = gi->second->GetRenderFeetPos(&m.mvRenderFeetPos);
+		}
+		avOut.push_back(m);
+	}
+}
+
+bool cNetworkManager::IsSessionLive() const
+{
+	if (mbHosting)
+		return GetConnectedGuestCount() > 0;
+	return mbClientConnected && mbHadJoinPacket;
 }
 
 #endif /* PENUMBRA_MULTIPLAYER */

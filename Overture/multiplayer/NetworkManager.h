@@ -27,6 +27,27 @@ struct cDiscoveredServer
 };
 
 //-----------------------------------------------------------------------
+/** v12 party health: one connected remote player as the HUD / inventory
+    party line / co-op respawn see it. Health is the newest mirrored value
+    (0 = dead or Dead flag); the positions are only valid when the flags
+    say so (no state yet, or the ghost is between worlds on a map change). */
+struct cNetPartyMember
+{
+	uint8_t mlId;
+	float mfHealth;               /**< 0-100, 0 = dead */
+	bool mbHasFeetPos;            /**< newest wire feet position known */
+	hpl::cVector3f mvFeetPos;
+	bool mbHasRenderPos;          /**< ghost mesh drawn this frame */
+	hpl::cVector3f mvRenderFeetPos;
+
+	cNetPartyMember()
+		: mlId(0), mfHealth(0.0f), mbHasFeetPos(false), mvFeetPos(0, 0, 0),
+		  mbHasRenderPos(false), mvRenderFeetPos(0, 0, 0)
+	{
+	}
+};
+
+//-----------------------------------------------------------------------
 /** ENet session: listen-server relay. Player pose, host-authoritative bodies
     and enemies stream at 30 Hz (kNetSendPeriodSeconds); remote players are
     drawn as interpolated cGhostPlayer bodies. */
@@ -295,6 +316,27 @@ public:
 	bool GetGhostSense(uint8_t alId, hpl::cVector3f *apCamPos, uint8_t *apMoveState) const;
 private:
 	std::map<uint8_t, uint8_t> m_mapGhostMoveState; /**< host: last wire move state per ghost id */
+
+	//---------------- v12: party health — appended, impl at the file tail ----------------
+public:
+	/** Mirrored health of one remote player (both roles). false = no such
+	    connected player / no state from it yet; *apHealth is 0 when it is
+	    dead (Dead flag or health 0). Survives our own map change (kept per
+	    id, not per ghost entity). */
+	bool GetGhostHealth(uint8_t alId, float *apHealth) const;
+	/** Every remote player we have heard from, with health + positions
+	    (see cNetPartyMember). Empty offline. Never includes the preview
+	    ghost or ourselves. */
+	void GetPartyStatus(std::vector<cNetPartyMember> &avOut) const;
+	/** A real session with somebody on the other end: hosting with >= 1
+	    connected guest, or a synced client. The co-op death rule only
+	    branches when this is true — single-player is untouched. */
+	bool IsSessionLive() const;
+	/** multiplayer.cfg coop_respawn (default 1). */
+	bool IsCoopRespawnEnabled() const { return mbCoopRespawn; }
+private:
+	std::map<uint8_t, uint8_t> m_mapGhostHealth; /**< both roles: newest health per remote id, 0 = dead */
+	bool mbCoopRespawn;
 };
 //-----------------------------------------------------------------------
 /** Pumps cNetworkManager from the GLOBAL updater state, so hosting and

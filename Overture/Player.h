@@ -383,6 +383,11 @@ private:
 
 	iFontData *mpFont;
 
+	/** v12 party health: a 4x4 white gfx object tinted per draw (bar
+	    background + fill) and the world-anchored bar pass, see OnDraw. */
+	cGfxObject *mpGfxPartyBar;
+	void DrawPartyHud();
+
 	cNode3D mFeetNode;
 
 	bool mbActive;

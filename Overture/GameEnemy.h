@@ -380,8 +380,8 @@ public:
 	cVector3f GetFocusFeetPos();
 	cVector3f GetFocusPos();
 	cVector3f GetFocusCamPos();
-	/** 0 for a disconnected ghost (the AI treats it as a corpse). NOTE: a
-	    guest's real health is not on the wire yet — see the TODO in the impl. */
+	/** 0 for a disconnected or DEAD ghost (the AI treats it as a corpse),
+	    else the guest's mirrored health (v12 cNetPlayerState::mHealth). */
 	float GetFocusHealth();
 	float FocusDist2D();
 	float FocusDist();

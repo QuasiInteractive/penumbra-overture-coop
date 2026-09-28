@@ -29,8 +29,12 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
         an on-ground/crouch/run/jump flag byte, and mfPosY is the FEET height
         (character body) instead of the head-bobbing camera Y — the ghost
         animates from exact sender truth instead of inferring it 0.3-0.5 s
-        late from positions. */
-static const uint16_t kNetProtocolVersion = 11;
+        late from positions.
+    v12: party health — cNetPlayerState carries the sender's health (0-100)
+        and a Dead flag bit, so the host's enemy AI stops biting a corpse,
+        friends see each other's health (world bars + inventory party
+        line) and the co-op respawn rule knows whether anybody is alive. */
+static const uint16_t kNetProtocolVersion = 12;
 
 /** Snapshot send period, every sender (cNetworkManager::kSendPeriodSeconds
     is this value). The receiver uses cNetPlayerState::mSeq * this period as
@@ -155,6 +159,9 @@ enum eNetPlayerFlags : uint8_t
 	eNetPlayerFlag_Crouch = 2,   /* crouched, ALSO while airborne from a crouch */
 	eNetPlayerFlag_RunKey = 4,   /* run move state (shift) */
 	eNetPlayerFlag_Jump = 8,     /* jump move state (jump key pressed) */
+	eNetPlayerFlag_Dead = 16,    /* v12: cPlayer::IsDead() (death sequence
+	                                running) — receivers read the health as
+	                                0 whatever mHealth says */
 };
 
 /** v11: cNetPlayerState::mVelFwd / mVelRight scale — int8 units of 1/40 m/s
@@ -183,6 +190,7 @@ struct cNetPlayerState
 	                       units 1/kNetPlayerVelScale m/s */
 	int8_t mVelRight; /**< v11: same along the view right */
 	uint8_t mFlags;   /**< v11: eNetPlayerFlags */
+	uint8_t mHealth;  /**< v12: sender's cPlayer health, 0-100 rounded */
 };
 
 /** Server tells a joining peer their wire id (= eNetPacketType_PlayerJoin). */
@@ -446,7 +454,7 @@ struct cNetScriptEvent
 
 static_assert(sizeof(cNetPlayerJoin) == 2, "");
 static_assert(sizeof(cNetPlayerLeave) == 2, "");
-static_assert(sizeof(cNetPlayerState) == 29, ""); /* v7: +mSeq; v11: +vel/flags */
+static_assert(sizeof(cNetPlayerState) == 30, ""); /* v7: +mSeq; v11: +vel/flags; v12: +mHealth */
 static_assert(sizeof(cNetDiscoveryPing) == 7, "");
 static_assert(sizeof(cNetDiscoveryPong) == 75, "");
 static_assert(sizeof(cNetObjectState) == 33, "");

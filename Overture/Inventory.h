@@ -388,6 +388,12 @@ private:
 
 	cGfxObject *mpBagpack;
 
+	/** v12 party health: "Party" line (one name + bar per connected
+	    player) in the free column right of the slot grid; the bar image is
+	    a solid white 4x4 built from a bitmap, tinted per draw. */
+	cGfxObject *mpGfxPartyBar;
+	void DrawParty();
+
 	tGameItemTypeVec mvItemTypes;
 
 	bool mbActive;

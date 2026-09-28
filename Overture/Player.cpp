@@ -44,6 +44,9 @@
 #include "Triggers.h"
 
 #include "GlobalInit.h"
+#include "NumericalPanel.h"
+#include "DeathMenu.h"
+#include "multiplayer/NetworkManager.h" /* v12: party health HUD */
 
 //////////////////////////////////////////////////////////////////////////
 // CONSTRUCTORS
@@ -157,6 +160,19 @@ cPlayer::cPlayer(cInit *apInit)  : iUpdateable("Player")
 
 	//Create flashlight
 	mpFlashLight = hplNew( cPlayerFlashLight,(mpInit) );
+
+	//v12 party health bars: one solid white 4x4 image, tinted per draw.
+	//Built from a bitmap so no new art file is needed.
+	mpGfxPartyBar = NULL;
+	{
+		iBitmap2D *pBmp = mpGraphics->GetLowLevel()->CreateBitmap2D(cVector2l(4,4),32);
+		if(pBmp)
+		{
+			pBmp->FillRect(cRect2l(0,0,4,4),cColor(1,1,1,1));
+			mpGfxPartyBar = mpGfxDrawer->CreateGfxObject(pBmp,"diffalpha2d");
+			hplDelete(pBmp);
+		}
+	}
 	
 	//Create Glowstick
 	mpGlowStick = hplNew( cPlayerGlowStick,(mpInit) );
@@ -265,6 +281,7 @@ cPlayer::~cPlayer(void)
 	hplDelete( mpBodyCallback);
 	hplDelete( mpDamage);
 	hplDelete( mpDeath);
+	if(mpGfxPartyBar) mpGfxDrawer->DestroyGfxObject(mpGfxPartyBar);
 	hplDelete( mpFlashLight);
 	hplDelete( mpLean);
 	hplDelete( mpEarRing);
@@ -1440,6 +1457,10 @@ void cPlayer::OnDraw()
 	mpHidden->Draw();
 	
 	mpHealth->Draw();
+
+	////////////////////////////////
+	//v12: party health bars above the ghosts (no-op offline)
+	DrawPartyHud();
 	
 	////////////////////////////////
 	//Cross hair
@@ -1717,6 +1738,92 @@ void cPlayer::OnDraw()
 	
 	mvStates[mState]->OnDraw();
 }
+
+//-----------------------------------------------------------------------
+
+/* v12 party health: a 60x6 bar + "P<id>" label projected from ~2 m above
+   each ghost's feet, hidden behind the camera / beyond kFarDist, fading
+   from kFadeDist. Same view*proj + MatrixMulDivideW projection the HaptX
+   crosshair uses (OnDraw above); 800x600 virtual HUD coordinates. Drawn
+   only while the world is the thing on screen: not over the inventory,
+   notebook, panel or death menu, and not during our own death fade. */
+void cPlayer::DrawPartyHud()
+{
+	cNetworkManager *pNet = mpInit->mpNetworkManager;
+	if(pNet==NULL || mpGfxPartyBar==NULL || mpFont==NULL || mpCamera==NULL) return;
+	if(mpScene==NULL || mpScene->GetWorld3D()==NULL) return;
+	if(IsDead()) return;
+	if(	(mpInit->mpInventory && mpInit->mpInventory->IsActive()) ||
+		(mpInit->mpNotebook && mpInit->mpNotebook->IsActive()) ||
+		(mpInit->mpNumericalPanel && mpInit->mpNumericalPanel->IsActive()) ||
+		(mpInit->mpDeathMenu && mpInit->mpDeathMenu->IsActive()))
+	{
+		return;
+	}
+
+	std::vector<cNetPartyMember> vParty;
+	pNet->GetPartyStatus(vParty);
+	if(vParty.empty()) return;
+
+	const float kHeadHeight = 2.0f;  /* bar anchor above the feet */
+	const float kFarDist = 25.0f;    /* hidden beyond this */
+	const float kFadeDist = 15.0f;   /* full alpha up to here, then fades to 0 at kFarDist */
+	const float kBarW = 60.0f, kBarH = 6.0f;
+	const float fZ = 90.0f;
+
+	const cMatrixf &mtxView = mpCamera->GetViewMatrix();
+	const cMatrixf &mtxProj = mpCamera->GetProjectionMatrix();
+	const cVector3f vCamPos = mpCamera->GetPosition();
+
+	for(size_t i=0; i<vParty.size(); ++i)
+	{
+		const cNetPartyMember &m = vParty[i];
+		if(m.mbHasRenderPos==false) continue; /* not in this world (yet) */
+
+		const cVector3f vHead = m.mvRenderFeetPos + cVector3f(0, kHeadHeight, 0);
+		const float fDist = cMath::Vector3Dist(vCamPos, vHead);
+		if(fDist > kFarDist) continue;
+		float fAlpha = 1.0f;
+		if(fDist > kFadeDist) fAlpha = 1.0f - (fDist - kFadeDist) / (kFarDist - kFadeDist);
+		if(fAlpha <= 0.02f) continue;
+
+		//Behind the camera: the view space z is positive (camera looks down -z)
+		cVector3f vView = cMath::MatrixMul(mtxView, vHead);
+		if(vView.z > -0.05f) continue;
+		cVector3f vProj = cMath::MatrixMulDivideW(mtxProj, vView);
+		if(vProj.x < -1.2f || vProj.x > 1.2f || vProj.y < -1.2f || vProj.y > 1.2f) continue;
+
+		cVector2f vPos((vProj.x+1) * 0.5f, (-vProj.y+1) * 0.5f);
+		vPos *= cVector2f(800,600);
+
+		const float fHealth = (m.mfHealth < 0) ? 0.0f : ((m.mfHealth > 100) ? 100.0f : m.mfHealth);
+		const float fPercent = fHealth / 100.0f;
+
+		//Background, fill, label
+		mpGfxDrawer->DrawGfxObject(mpGfxPartyBar,
+									cVector3f(vPos.x - kBarW*0.5f - 1, vPos.y - kBarH*0.5f - 1, fZ),
+									cVector2f(kBarW + 2, kBarH + 2), cColor(0,0,0,0.6f*fAlpha));
+		if(fPercent > 0)
+		{
+			mpGfxDrawer->DrawGfxObject(mpGfxPartyBar,
+										cVector3f(vPos.x - kBarW*0.5f, vPos.y - kBarH*0.5f, fZ+1),
+										cVector2f(kBarW * fPercent, kBarH),
+										cColor(1.0f-fPercent, fPercent, 0, fAlpha));
+		}
+		if(fHealth > 0)
+		{
+			mpFont->Draw(cVector3f(vPos.x, vPos.y - kBarH*0.5f - 15, fZ+2),cVector2f(12,12),
+							cColor(1,1,1,fAlpha),eFontAlign_Center,_W("P%d"),(int)m.mlId);
+		}
+		else
+		{
+			mpFont->Draw(cVector3f(vPos.x, vPos.y - kBarH*0.5f - 15, fZ+2),cVector2f(12,12),
+							cColor(1,0.3f,0.3f,fAlpha),eFontAlign_Center,_W("P%d dead"),(int)m.mlId);
+		}
+	}
+}
+
+//-----------------------------------------------------------------------
 
 void cPlayer::OnPostSceneDraw()
 {

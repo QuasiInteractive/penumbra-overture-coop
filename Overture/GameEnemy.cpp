@@ -1349,6 +1349,14 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 		mpInit->mpNetworkManager->GetGhostCamPositions(vGhosts);
 		for(size_t g=0; g<vGhosts.size() && lCands<8; ++g)
 		{
+			//v12: a dead guest is skipped exactly like the dead local player
+			//above — never a sight candidate, so no enemy locks onto a corpse.
+			float fGhostHealth = 100.0f;
+			if(	mpInit->mpNetworkManager->GetGhostHealth(vGhosts[g].first, &fGhostHealth) &&
+				fGhostHealth <= 0)
+			{
+				continue;
+			}
 			uint8_t lMove = (uint8_t)eNetMoveState_Run;
 			mpInit->mpNetworkManager->GetGhostSense(vGhosts[g].first, NULL, &lMove);
 			const bool bCrouch = (lMove == (uint8_t)eNetMoveState_Crouch);
@@ -1807,15 +1815,14 @@ float iGameEnemy::GetFocusHealth()
 		cVector3f vCam;
 		if(NetReadGhostCam(mlFocusPlayerId, &vCam)==false) return 0.0f;
 
-		/* TODO(net): a guest's REAL health is not on the wire — cNetPlayerState
-		   carries pos/yaw/flashlight/move state only and is frozen while the
-		   ghost stream is being reworked. Until a health byte is mirrored
-		   (protocol bump: fill from mpPlayer->GetHealth() in the local
-		   snapshot, keep per ghost, return it here and skip dead ghosts in
-		   UpdateCheckForPlayer), a DEAD guest still reads as alive: the dog
-		   keeps re-biting a corpse whose cPlayer::Damage drops the packets
-		   instead of eating it / going idle. */
-		return 100.0f;
+		/* v12: the guest's REAL health rides on cNetPlayerState (mHealth +
+		   Dead flag, mirrored per id by cNetworkManager). A dead guest reads
+		   0 like a dead local player: Attack ends in Eat/Flee instead of
+		   re-biting a corpse whose cPlayer::Damage drops the packets. */
+		float fHealth = 100.0f;
+		if(mpInit->mpNetworkManager->GetGhostHealth(mlFocusPlayerId, &fHealth))
+			return fHealth;
+		return 100.0f; /* state seen but no health entry: cannot happen, stay alive */
 	}
 	return mpInit->mpPlayer->GetHealth();
 }

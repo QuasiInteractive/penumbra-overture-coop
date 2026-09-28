@@ -33,6 +33,18 @@ ghost_models=malik.dae,phillip.dae
 # ghost_body_ys=0,0
 # ghost_body_ys_crouch=0,0
 
+# ---- Co-op death (v12) ------------------------------------------------------
+# Every player's health rides on the 30 Hz state packet (protocol v12): a
+# bar above each friend's head (within 25 m) and a "Party" list in the
+# inventory show it, and the host's enemies stop attacking a dead guest.
+# coop_respawn=1 — when you die in a live session while at least one other
+#                  party member is still alive, the death fade plays as usual
+#                  but the death menu does NOT appear: ~3 s later you come
+#                  back with 40 health next to the nearest living member
+#                  (hpl.log says who). If everybody is dead you get the normal
+#                  death menu. 0 = vanilla death menu online too.
+coop_respawn=1
+
 # ---- Ghost animation (v11) ------------------------------------------------
 # ghost_interp_ms=100   — render remote players this far behind their newest
 #                         state (3 packets at 30 Hz). Lower = snappier, higher
