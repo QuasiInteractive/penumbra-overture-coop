@@ -69,3 +69,15 @@ ghost_models=malik.dae,phillip.dae
 # One hpl.log line per change.
 # ghost_preview=0
 # ghost_preview_model=0 — which ghost_models entry the preview uses (0-based)
+
+# ---- Windowed test instances (read by Init.cpp at startup) ----
+# force_windowed=1 overrides the Documents settings.cfg FullScreen setting for
+# THIS install only; window_width/height set the size and window_x/window_y
+# the top-left corner, so two installs on one PC can sit side by side:
+#   redist       (host):  force_windowed=1 window_width=960 window_height=540 window_x=0   window_y=0
+#   redist_guest (guest): force_windowed=1 window_width=960 window_height=540 window_x=960 window_y=0
+# force_windowed=0
+# window_width=960
+# window_height=540
+# window_x=0
+# window_y=0

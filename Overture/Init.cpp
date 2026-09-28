@@ -346,7 +346,7 @@ bool cInit::Init(tString asCommandLine)
 		{
 			char line[256];
 			bool bForceWindowed = false;
-			int lW = 0, lH = 0;
+			int lW = 0, lH = 0, lX = -1, lY = -1;
 			while (fgets(line, sizeof(line), pF))
 			{
 				int v = 0;
@@ -356,6 +356,10 @@ bool cInit::Init(tString asCommandLine)
 					lW = v;
 				else if (sscanf(line, "window_height=%d", &v) == 1)
 					lH = v;
+				else if (sscanf(line, "window_x=%d", &v) == 1)
+					lX = v;
+				else if (sscanf(line, "window_y=%d", &v) == 1)
+					lY = v;
 			}
 			fclose(pF);
 			if (bForceWindowed)
@@ -363,6 +367,19 @@ bool cInit::Init(tString asCommandLine)
 				mbFullScreen = false;
 				if (lW > 0) mvScreenSize.x = lW;
 				if (lH > 0) mvScreenSize.y = lH;
+				/* window_x/window_y: where the window opens (SDL 1.2 reads
+				   this env var in SDL_SetVideoMode) — two side-by-side test
+				   instances each pin their own corner. */
+				if (lX >= 0 && lY >= 0)
+				{
+					char sPos[64];
+					sprintf(sPos, "%d,%d", lX, lY);
+#ifdef _WIN32
+					_putenv_s("SDL_VIDEO_WINDOW_POS", sPos);
+#else
+					setenv("SDL_VIDEO_WINDOW_POS", sPos, 1);
+#endif
+				}
 			}
 		}
 	}
