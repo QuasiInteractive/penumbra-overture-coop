@@ -78,12 +78,15 @@ if(TARGET HPL)
 	# EFX defines of the OpenAL the wrapper was built against (vcpkg openal-soft).
 	# The engine's own include list puts the old dependencies/include AL headers
 	# first, so prepend the same OpenAL include dir OALWrapper found.
-	find_package(OpenAL QUIET)
-	if(TARGET OpenAL::OpenAL)
-		target_include_directories(HPL BEFORE PRIVATE
-			"$<TARGET_PROPERTY:OpenAL::OpenAL,INTERFACE_INCLUDE_DIRECTORIES>")
-	elseif(OPENAL_INCLUDE_DIR)
-		target_include_directories(HPL BEFORE PRIVATE "${OPENAL_INCLUDE_DIR}")
+	set(_penumb_al_inc "")
+	if(OPENAL_INCLUDE_DIR AND EXISTS "${OPENAL_INCLUDE_DIR}")
+		set(_penumb_al_inc "${OPENAL_INCLUDE_DIR}") # cached by OALWrapper's FIND_PACKAGE(OpenAL)
+	elseif(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+		set(_penumb_al_inc "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
+	endif()
+	if(_penumb_al_inc)
+		message(STATUS "HPL OpenAL headers: ${_penumb_al_inc}")
+		target_include_directories(HPL BEFORE PRIVATE "${_penumb_al_inc}")
 	endif()
 endif()
 
