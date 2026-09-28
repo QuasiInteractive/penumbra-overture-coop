@@ -35,8 +35,10 @@ python3 Overture/multiplayer/tools/bvh_to_hpl_clip.py \
 Each run takes about 6 s, overwrites the 15 `<name>_<slot>.dae` files and
 `<name>_clips.json`, and exits non-zero if its self-validation fails. The
 output is deterministic (a second run into another directory is byte-identical),
-so a regenerate is safe to diff. `--only walk,run` limits the slots,
-`--dry-run` computes and logs without writing. After regenerating, delete the
+so a regenerate is safe to diff. `--only walk,run` limits the slots (the
+other slots' files are not touched and their sidecar entries are kept; the
+subset writes the same bytes as a full run), `--dry-run` computes and logs
+without writing. After regenerating, delete the
 engine's `.collcach` cache files for the clips (the loader prefers a cache
 newer than the `.dae`).
 
@@ -45,6 +47,11 @@ newer than the `.dae`).
 BVH frames are 30 fps, `[start, end)`; a looping clip exports frames
 `start..end-1` followed by an exact copy of frame `start` (so `N = end-start+1`
 keys, loop length `(end-start)/30 s`, seamless under HPL's inclusive wrap).
+`stretch` (time-stretch factor) resamples the selection at fractional source
+frames, every BVH channel lerped between its two neighbours (rotations made
+continuous first), giving `round(N*stretch)` forward keys; `pingpong` then
+appends those keys reversed minus both endpoints, so the loop returns to key 0
+exactly (seam 0, no net drift, gait 0).
 Gait = hips XZ drift removed over the range / duration, scaled to the model
 (see "Hips translation"); 0 = not a locomotion clip. The runtime plays a
 locomotion clip at `measured_speed / gait`.
@@ -59,7 +66,7 @@ locomotion clip at `measured_speed / gait`.
 | strafe_walk_r | walk_strafe_right | [116,153) | 38 | yes | 0.77 | 0.88 | |
 | strafe_run_l | run_strafe_left | [117,139) | 23 | yes | 2.10 | 2.39 | frames 0-60 of the source are a standing start |
 | strafe_run_r | run_strafe_right | [133,157) | 25 | yes | 1.84 | 2.09 | frames 0-35 are a standing start |
-| crouch_idle | crouch_idle | auto: [192,283) | 92 | yes | 0 | 0 | `loop:auto:75:105` seam search; deep kneel (hips 0.42 m, head 0.59 m) |
+| crouch_idle | crouch_rise_up | [10,14) x11.25, pingpong | 89 | yes | 0 | 0 | hold of the transitions' shared frame 10 (hips 0.50 m) breathing up 6 cm to f13 and back: 45 keys up + 43 down, 2.93 s. Replaces the pack's crouch_idle.bvh (`loop:auto:75:105` -> [192,283), 92 keys: a deep kneel, hips 0.42 m, knees on the floor, head 0.59 m), kept as a commented alternative in `SLOTS` |
 | crouch_walk | crouch_walk_forward | [82,136) | 55 | yes | 0.76 | 0.87 | hips 0.55-0.69 m |
 | jump | jump_standing | [44,84) | 40 | no | 0 | 0 | airborne 47-59 + landing; `airborne="flat"` |
 | stand_to_crouch | crouch_rise_up, reversed | [10,42) | 32 | no | 0 | 0 | frames 0-9 of the source are a heel-sit squat |
@@ -68,8 +75,8 @@ locomotion clip at `measured_speed / gait`.
 | turn_r | turn_right_90 | [0,60) | 60 | no | 0 | 0 | linear yaw drift (-93.9 deg) removed |
 
 Resulting hips heights (phillip / malik, m): standing clips 0.91-1.03 /
-0.93-1.10, crouch_idle 0.42 / 0.44, crouch_walk 0.55-0.69 / 0.56-0.72, jump
-dips to 0.71 / 0.75 on landing. Lowest foot joint on ground clips stays within
+0.93-1.10, crouch_idle 0.50-0.55 / 0.49-0.56, crouch_walk 0.55-0.69 /
+0.56-0.72, jump dips to 0.71 / 0.75 on landing. Lowest foot joint on ground clips stays within
 about +/-2 cm of the base rest floor (toe base at 0.018 / 0.015 m); the
 exceptions are walk_back (-1.8 / -2.6 cm, the actor's foot sinks 4 cm in the
 source) and the jump take-off/landing frames (down to -8.6 / -9.1 cm, see
@@ -77,7 +84,7 @@ source) and the jump take-off/landing frames (down to -8.6 / -9.1 cm, see
 
 The table lives in `SLOTS` at the top of the converter: `bvh`, `frames`
 (a tuple or `"loop:auto:MIN:MAX"`), `loop`, `reverse`, `remove_yaw`,
-`airborne`, `clamp_y_to_stand`, `notes`.
+`airborne`, `clamp_y_to_stand`, `stretch`, `pingpong`, `notes`.
 
 ## Output format (what the engine needs)
 
@@ -171,8 +178,9 @@ lowest contact joint (feet, toe bases, toe tips, knees) is placed where the
 source's lowest contact joint is: `lowest_tgt = floor_tgt + clearance_src * k`,
 `floor_tgt` = the base rest's lowest contact joint, `clearance_src` = the
 source's lowest contact height (floor = y 0 in the pack). The hips Y is shifted
-by the difference; the shift stays within about 2 cm on standing clips and is
--8 cm in crouch_idle (a kneel, the knees are the contact). Per-slot `airborne`
+by the difference; the shift stays within about 2 cm on standing clips (it
+was -8 cm on the former kneeling crouch_idle, where the knees were the
+contact). Per-slot `airborne`
 mode: `keep` (default) keeps positive clearance, so the hips rise with the
 source's feet; `ground` drops positive clearance, the feet never leave the
 floor; `flat` (jump) does not lock frames whose source contact is off the
@@ -199,9 +207,12 @@ yaw-corrected path so the hips end exactly where they started.
 ## Tuning knobs
 
 - `SLOTS` (top of the converter): source clip, frame range, loop, reverse,
-  `remove_yaw`, `airborne`, `clamp_y_to_stand`. `frames="loop:auto:MIN:MAX"`
-  searches the best seam (joint positions relative to the hips plus hips
-  velocity) for a loop of MIN..MAX frames.
+  `remove_yaw`, `airborne`, `clamp_y_to_stand`, `stretch`, `pingpong`.
+  `frames="loop:auto:MIN:MAX"` searches the best seam (joint positions
+  relative to the hips plus hips velocity) for a loop of MIN..MAX frames.
+  `stretch=F` slows the selection F times (fractional-frame resampling of the
+  BVH channels), `pingpong=True` plays it back to its first frame (an exact
+  loop out of any short monotonic motion, e.g. a hold with a slow bob).
 - `MAP` / `ALIGN_CHILD`: joint mapping and which bones get the rest-direction
   alignment `A(j)`.
 - `CONTACT_TGT` / `CONTACT_SRC` / `GROUND_EPS_CM` (2 cm): floor-lock joint sets
@@ -244,10 +255,15 @@ yaw-corrected path so the hips end exactly where they started.
 
 ## Known caveats
 
-- crouch_idle is the pack's deep kneel (hips 0.42 m, torso pitched ~76 deg,
-  head at 0.59 m); crouch_walk is an upright crouch (hips ~0.62 m), so the
-  crouch idle <-> walk switch pops. The alternative noted in `SLOTS` is to hold
-  crouch_rise_up frames 10-12 with a small bob.
+- crouch_idle is a stretched pingpong hold of crouch_rise_up frames 10-13:
+  it starts on the exact pose both stance transitions start/end on (frame 10,
+  hips 0.50 m) and breathes 6 cm up over 1.47 s and back. That sits between
+  the transition endpoint and crouch_walk (hips 0.55-0.69 m), so the crouch
+  idle <-> walk switch is a ~10 cm hips change under the crossfade instead of
+  the former 20 cm drop onto the pack's deep kneel (crouch_idle.bvh: hips
+  0.42 m, torso pitched ~76 deg, head at 0.59 m; kept as a commented
+  alternative in `SLOTS`). The resampling is linear, so the turnaround at
+  frame 13 flips the hips velocity (about 4 cm/s): a soft kink, not a pop.
 - Gait loop seams (run 5 cm rms / 22 deg, strafe_run_l 7 cm) are inherent in
   the source cycles; the runtime crossfades over them.
 - The feet's 19 deg (phillip) / 15 deg (malik) rest-pitch difference from the

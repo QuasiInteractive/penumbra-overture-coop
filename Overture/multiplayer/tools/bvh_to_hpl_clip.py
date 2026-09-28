@@ -131,6 +131,16 @@ Root motion policy (per slot flags; see README_animations.md):
     key 31 == key 0). 'loop:auto' searches the best [s, e) in a window.
   * reverse=True plays the source frames backwards (stand_to_crouch is the
     reverse of crouch_rise_up).
+  * stretch=F (default 1) time-stretches the selection: the output has
+    round(N*F) keys (N = e-s selected frames) sampled at fractional source
+    frames, every BVH channel lerped between its two neighbouring frames
+    (rotation channels made continuous first, translations plain). A loop
+    period stays e-s source frames, a non-loop / pingpong selection spans
+    s..e-1 inclusive, so key 0 and the last forward key are real frames.
+  * pingpong=True appends the reversed forward sequence minus both
+    endpoints (2M-2 keys), so the loop closes exactly with zero seam and
+    zero net drift; the gait is 0. crouch_idle is a stretched pingpong
+    hold of crouch_rise_up frames 10-13 (see SLOTS).
 
 Usage:
   python3 bvh_to_hpl_clip.py --base <models>/<name>.dae --bvh-dir <pack>/BVH \
@@ -159,9 +169,11 @@ STAND_HIPS_CM = 99.8
 GROUND_EPS_CM = 2.0
 
 # ------------------------------------------------------------------ slot table
-# slot -> dict(bvh, frames, loop, reverse, remove_yaw, clamp_y_to_stand, notes)
+# slot -> dict(bvh, frames, loop, reverse, remove_yaw, airborne, clamp_y_to_stand,
+#              stretch, pingpong, notes)
 # frames = [start, end)  (BVH frame numbers, 30 fps), or "loop:auto:MIN:MAX"
-# (search the best seam for a loop of MIN..MAX frames).
+# (search the best seam for a loop of MIN..MAX frames). stretch = time-stretch
+# factor (fractional-frame resampling), pingpong = play back to the start.
 SLOTS = [
     ("idle", dict(bvh="idle_neutral", frames=(125, 217), loop=True,
                   notes="only pack idle without body yaw drift; seam 0.13 cm")),
@@ -177,8 +189,20 @@ SLOTS = [
                           notes="frames 0-60 of the source are a standing start")),
     ("strafe_run_r", dict(bvh="run_strafe_right", frames=(133, 157), loop=True,
                           notes="frames 0-35 of the source are a standing start")),
-    ("crouch_idle", dict(bvh="crouch_idle", frames="loop:auto:75:105", loop=True,
-                         notes="deep tuck (hips 48 cm); alternative: hold crouch_rise_up f10-12")),
+    # crouch_idle: the pack's crouch_idle.bvh is a deep kneel (hips 0.42 m on
+    # phillip, knees on the floor) while crouch_walk stands at 0.55-0.69 m and
+    # both stance transitions start/end on crouch_rise_up frame 10 (hips
+    # ~0.50 m), so a crouching player who stopped would drop to the knees.
+    # Instead hold crouch_rise_up frames 10-13 (a slow 6.5 cm BVH rise from
+    # the transitions' shared frame), time-stretched 11.25x and played back
+    # and forth: 45 keys up + 43 down + loop duplicate = 89 keys, 2.93 s.
+    ("crouch_idle", dict(bvh="crouch_rise_up", frames=(10, 14), loop=True, stretch=11.25,
+                         pingpong=True,
+                         notes="stretched pingpong hold of crouch_rise_up f10-13: key 0 == "
+                               "stand_to_crouch's last / crouch_to_stand's first key; "
+                               "alternative: crouch_idle.bvh loop:auto:75:105 (deep kneel, hips 0.42 m)")),
+    # ("crouch_idle", dict(bvh="crouch_idle", frames="loop:auto:75:105", loop=True,
+    #                      notes="deep kneel (hips 0.42 m); pops against crouch_walk and the transitions")),
     ("crouch_walk", dict(bvh="crouch_walk_forward", frames=(82, 136), loop=True)),
     ("jump", dict(bvh="jump_standing", frames=(44, 84), loop=False, airborne="flat",
                   notes="airborne 47-59 + landing; the runtime starts the clip on the "
@@ -380,6 +404,20 @@ class BVH(object):
         for f in self.frames:
             if len(f) != k:
                 raise ValueError("%s: frame has %d values, expected %d" % (path, len(f), k))
+        # per motion column: is it a rotation channel (for row() interpolation)
+        self.rot_cols = [name.endswith("rotation") for j in self.joints for name in self.channels[j]]
+
+    def row(self, t):
+        """Motion row at source frame t. An integral t is the stored frame; a
+        fractional t (stretch resampling) lerps every channel between the two
+        neighbouring frames, rotation channels the shorter way round."""
+        if float(t).is_integer():
+            return self.frames[int(t)]
+        i0 = int(math.floor(t))
+        a = t - i0
+        r0, r1 = self.frames[i0], self.frames[i0 + 1]
+        return [v0 + a * ((closest_angle(v1, v0) if rot else v1) - v0)
+                for v0, v1, rot in zip(r0, r1, self.rot_cols)]
 
     def local(self, j, frame):
         ch, base = self.channels[j], self.chidx[j]
@@ -400,13 +438,15 @@ class BVH(object):
         return R, t
 
     def fk(self, fi=None):
-        """World rotation and position (cm) per joint; fi None = rest pose."""
+        """World rotation and position (cm) per joint; fi None = rest pose,
+        fractional fi = interpolated frame (see row())."""
         W, P = {}, {}
+        row = None if fi is None else self.row(fi)
         for j in self.joints:
             if fi is None:
                 R, t = I3, list(self.offset[j])
             else:
-                R, t = self.local(j, self.frames[fi])
+                R, t = self.local(j, row)
             p = self.parent[j]
             if p is None:
                 W[j], P[j] = R, t
@@ -630,23 +670,46 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
         s, e = auto_loop(bvh, lo, hi, log)
     else:
         s, e = frames
-    last = e if loop else e - 1          # last SOURCE frame that takes part
+    stretch = float(cfg.get("stretch", 1.0))
+    pingpong = bool(cfg.get("pingpong", False))
+    # last SOURCE frame that takes part: a plain loop needs frame e for its
+    # seam, a pingpong loop closes on itself
+    last = e if (loop and not pingpong) else e - 1
     if s < 0 or last >= bvh.nframes or e <= s:
         raise SystemExit("%s: frame range [%d,%d) outside 0..%d" % (slot, s, e, bvh.nframes - 1))
+    if stretch <= 0.0:
+        raise SystemExit("%s: stretch must be > 0" % slot)
 
-    # ---- source FK over [s, last] ----
+    # ---- exported source frame positions (forward pass) ----
+    # stretch != 1 resamples at fractional source frames (BVH.row lerps the
+    # channels): a loop period is e-s frames (frame e == frame s), a non-loop
+    # or pingpong selection spans s..e-1 inclusive.
+    n_src = e - s
+    if stretch == 1.0:
+        fwd = list(range(s, e))
+    else:
+        m = int(round(n_src * stretch))
+        if m < 2:
+            raise SystemExit("%s: stretch %g leaves %d key(s)" % (slot, stretch, m))
+        if loop and not pingpong:
+            fwd = [s + n_src * i / float(m) for i in range(m)]
+        else:
+            fwd = [s + (n_src - 1) * i / float(m - 1) for i in range(m)]
+    positions = fwd + ([e] if loop and not pingpong else [])   # ascending, s..last
+
+    # ---- source FK over the positions ----
     src = {}
-    for fi in range(s, last + 1):
+    for fi in positions:
         src[fi] = bvh.fk(fi)
-    hips0 = list(src[s][1]["Hips"])
-    hipsL = list(src[last][1]["Hips"])
+    hips0 = list(src[positions[0]][1]["Hips"])
+    hipsL = list(src[positions[-1]][1]["Hips"])
     span = float(last - s) if last > s else 1.0
 
     # linear yaw drift (turn clips only)
     yaw_total = 0.0
     if cfg.get("remove_yaw"):
-        yaw_prev, acc = yaw_of(src[s][0]["Hips"]), 0.0
-        for fi in range(s + 1, last + 1):
+        yaw_prev, acc = yaw_of(src[positions[0]][0]["Hips"]), 0.0
+        for fi in positions[1:]:
             y = yaw_of(src[fi][0]["Hips"])
             acc += closest_angle(y - yaw_prev, 0.0)
             yaw_prev = y
@@ -666,7 +729,7 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
     # yaw-corrected path so that the last frame's hips land exactly on the
     # first frame's (measuring it on the raw path and rotating afterwards
     # left the turn clips' hips ~18 cm off at the end).
-    hipsL_c = unyawed(last)[1]["Hips"]
+    hipsL_c = unyawed(positions[-1])[1]["Hips"]
     drift = [hipsL_c[0] - hips0[0], 0.0, hipsL_c[2] - hips0[2]]
     drift_len = vlen(drift)
 
@@ -678,10 +741,10 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
             P = {j: vsub(p, d) for j, p in P.items()}
         return W, P
 
-    # ---- exported source frame sequence ----
-    seq = list(range(s, e))           # [s, e)
-    if cfg.get("reverse"):
-        seq = seq[::-1]
+    # ---- exported key sequence ----
+    seq = fwd[::-1] if cfg.get("reverse") else list(fwd)
+    if pingpong:
+        seq = seq + seq[-2:0:-1]      # back to the start, both endpoints excluded
     if loop:
         seq = seq + [seq[0]]          # exact duplicate of the first key (see docstring)
     count = len(seq)
@@ -749,8 +812,10 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
 
     seam = None
     if loop:
-        # true seam: source frame e (dedrifted) vs frame s, on the target
-        _, _, _, We, Pe, _ = pose(e, None)
+        # true seam: the source frame that would follow the last exported key
+        # (frame e, dedrifted; on a pingpong loop key 0's own frame, so 0)
+        # vs key 0, on the target
+        _, _, _, We, Pe, _ = pose(seq[0] if pingpong else e, None)
         Ws, Ps = worlds[0]
         n = len(tgt.joints)
         pos_rms = math.sqrt(sum(vlen(vsub(Pe[j], Ps[j])) ** 2 for j in tgt.joints) / n)
@@ -758,10 +823,12 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
         seam = dict(pos_rms_m=pos_rms, hips_pos_m=vlen(vsub(Pe[HIPS], Ps[HIPS])), rot_max_deg=rot_max)
 
     length_s = (count - 1) / FPS
-    gait_bvh = drift_len / (span / FPS) if loop else 0.0
+    # a pingpong loop returns to its start: no net displacement, not a gait
+    gait_bvh = drift_len / (span / FPS) if (loop and not pingpong) else 0.0
     gait_mps = gait_bvh * k
     meta = dict(
         source=cfg["bvh"] + ".bvh", bvh_frames=[s, e], reverse=bool(cfg.get("reverse", False)),
+        stretch=stretch, pingpong=pingpong,
         frame_count=count, fps=FPS, length_s=round(length_s, 5), loop=loop,
         gait_speed_bvh_cms=round(gait_bvh, 2), gait_speed_mps=round(gait_mps, 4),
         hips_height_m=dict(min=round(min(hips_ys), 4), max=round(max(hips_ys), 4),
@@ -780,7 +847,9 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
     )
     log("  %-16s %-22s [%3d,%3d)%s N=%3d L=%.3fs hips %.3f..%.3f m (lock %+.1f..%+.1f cm)  "
         "foot min %+.3f m (%s; bvh %+.1f cm)  drift %.1f cm -> gait %.2f m/s  yaw %.1f deg%s"
-        % (slot, cfg["bvh"], s, e, " rev" if cfg.get("reverse") else "", count, length_s,
+        % (slot, cfg["bvh"], s, e,
+           (" rev" if cfg.get("reverse") else "") + (" x%g" % stretch if stretch != 1.0 else "")
+           + (" pingpong" if pingpong else ""), count, length_s,
            min(hips_ys), max(hips_ys), min(shifts) * 100, max(shifts) * 100,
            foot_min, foot_min_joint, src_foot_min, drift_len, gait_mps, yaw_total,
            "  seam pos %.1f mm / rot %.1f deg" % (seam["pos_rms_m"] * 1000, seam["rot_max_deg"])
@@ -859,7 +928,11 @@ def main():
     slots = [(s, c) for s, c in SLOTS if not args.only or s in args.only.split(",")]
     if not slots:
         raise SystemExit("--only matched no slot; slots: %s" % " ".join(s for s, _ in SLOTS))
-    bvh_rest = BVH(os.path.join(args.bvh_dir, slots[0][1]["bvh"] + ".bvh"))
+    # the source rest pose (k, A(j)) always comes from the full table's first
+    # slot: the pack's files differ in their offsets by ~1e-6 cm, enough to
+    # change last digits, and a --only subset must write the same bytes as a
+    # full run
+    bvh_rest = BVH(os.path.join(args.bvh_dir, SLOTS[0][1]["bvh"] + ".bvh"))
 
     if args.scale == "auto":
         k = tgt.leg_length() / bvh_leg_length(bvh_rest)
@@ -898,6 +971,16 @@ def main():
         log("  frame0 %s: LeftFoot %s  Head %s  Hips %s" % (slot, pr["LeftFoot"], pr["Head"], pr["Hips"]))
     if not args.dry_run:
         side_path = os.path.join(args.out, "%s_clips.json" % args.name)
+        if args.only and os.path.exists(side_path):
+            # subset run: keep the other slots' entries of the existing
+            # sidecar, in SLOTS order
+            try:
+                with open(side_path, encoding="utf-8") as f:
+                    old = json.load(f).get("clips", {})
+            except ValueError as ex:
+                raise SystemExit("%s is not valid JSON (%s); regenerate without --only" % (side_path, ex))
+            sidecar["clips"] = {slot: sidecar["clips"].get(slot, old.get(slot))
+                                for slot, _ in SLOTS if slot in sidecar["clips"] or slot in old}
         with open(side_path, "w", encoding="utf-8") as f:
             json.dump(sidecar, f, indent=1)
         log("  wrote %s (%s)" % (side_path, "all clips validated" if all_ok else "VALIDATION FAILURES"))
