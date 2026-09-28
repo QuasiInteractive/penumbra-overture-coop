@@ -69,6 +69,12 @@ endif()
 
 add_subdirectory("${OAL_ROOT}" "${CMAKE_BINARY_DIR}/thirdparty/oalwrapper")
 add_subdirectory("${HPL_ROOT}" "${CMAKE_BINARY_DIR}/thirdparty/hpl")
+# HPL1Engine/CMakeLists.txt hardcodes ../OALWrapper/include relative to the
+# engine; when OAL_ROOT points elsewhere (-DOAL_ROOT=...) the engine's OpenAL
+# sources must still find OALWrapper/OAL_Funcs.h.
+if(TARGET HPL)
+	target_include_directories(HPL PRIVATE "${OAL_ROOT}/include")
+endif()
 
 message(STATUS "PENUMBRA_DEPS_USED=${_deps_root}")
 
