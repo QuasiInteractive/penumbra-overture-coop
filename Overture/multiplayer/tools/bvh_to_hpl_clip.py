@@ -142,6 +142,48 @@ Root motion policy (per slot flags; see README_animations.md):
     zero net drift; the gait is 0. crouch_idle is a stretched pingpong
     hold of crouch_rise_up frames 10-13 (see SLOTS).
 
+HIP SWAY DAMPING (per-slot hip_sway, default 1.0 = unchanged)
+--------------------------------------------------------------
+The Motifect actor swings the pelvis a lot: in walk_forward 79-113 the hips
+world roll (about the travel axis) is -6.8..+8.8 deg and the yaw -4.5..+5.4
+deg per stride (half-amplitudes 7.8 / 4.9), with a +-2.4 cm lateral hips
+sway; crouch_walk_forward 82-136 rolls -8.9..+13.7 deg and yaws +-10 deg
+(+-14 / +-21 deg over the whole file), lateral +-9.5 cm. A neutral male walk
+has about half of that, so the ghost "switches his hips". hip_sway=F scales
+those deviations on the SOURCE pose right after the BVH FK, before the yaw /
+drift correction and the retarget (damp_hip_sway), so it is independent of
+the target rig:
+  * reference M = Ry(mean hips yaw over the exported frame range) (the hips
+    forward vector averaged; pitch/roll reference = 0)
+  * deviation D(t) = inv(M) * W_hips(t), decomposed Z-Y-X like the BVH
+    channels (z roll, y yaw, x pitch); roll and yaw are scaled by F, pitch
+    is kept (it is the walk bounce); W'_hips(t) = M * D'(t)
+  * every source joint under the hips except the two leg chains follows the
+    damped pelvis rigidly, W'(j,t) = W'_hips(t) * inv(W_hips(t)) * W(j,t),
+    so spine, arms and head sway less together with the pelvis
+  * the hips lateral translation deviation (component perpendicular to the
+    travel direction = the XZ drift of the selection, minus its mean over
+    the selection) is scaled by F too
+  * the feet stay where the actor put them: foot and toe joints keep their
+    world rotations, and the thigh + shin of each leg are re-aimed by a
+    two-bone IK in source space (plant_leg) so the ankle stays at its
+    original position although the hip socket moved with the damped pelvis
+    (the knee bend is adjusted about its own hinge axis, then the chain is
+    rotated rigidly about the socket). Simply keeping the legs' world
+    rotations would have dragged the planted feet along with the sockets
+    (3 cm in walk, 6 cm in crouch_walk = visible skating). The thigh/shin
+    change is 1.4-7.7 deg; the ankle residual (a straight stance leg cannot
+    lengthen when its socket rises) is <= 6 mm in walk, 0 elsewhere.
+  * the target's XZ origin is the actor's UNDAMPED first-frame hips, so the
+    damped clip keeps the actor's mean lateral hips position (the feet stay
+    put; key 0's hips sit up to ~1 cm off the rest XZ instead)
+The retargeted feet move by <= 6 mm (walk) / <= 5.5 mm (others) against the
+undamped clips (rig proportions differ from the actor's, so the source-space
+IK is not exact on the target), the hips height changes by < 3 mm, the gait
+speeds are unchanged. Applied: walk 0.45, walk_back / strafe_walk /
+crouch_walk 0.5, run / strafe_run 0.6; idle, crouch_idle, jump, the stance
+transitions and the turns stay at 1.0 (their files are byte-identical).
+
 Usage:
   python3 bvh_to_hpl_clip.py --base <models>/<name>.dae --bvh-dir <pack>/BVH \
       --out <models> --name <name> [--scale auto|<m_per_cm>] [--only slot,slot] \
@@ -170,24 +212,33 @@ GROUND_EPS_CM = 2.0
 
 # ------------------------------------------------------------------ slot table
 # slot -> dict(bvh, frames, loop, reverse, remove_yaw, airborne, clamp_y_to_stand,
-#              stretch, pingpong, notes)
+#              stretch, pingpong, hip_sway, notes)
 # frames = [start, end)  (BVH frame numbers, 30 fps), or "loop:auto:MIN:MAX"
 # (search the best seam for a loop of MIN..MAX frames). stretch = time-stretch
 # factor (fractional-frame resampling), pingpong = play back to the start.
+# hip_sway = factor on the hips roll/yaw deviation from the mean facing and on
+# the lateral hips translation, applied to the source world rotations before
+# the retarget; the leg chains keep their world rotations, spine/arms/head
+# follow the damped pelvis (default 1.0 = the actor's motion; see the
+# docstring "HIP SWAY DAMPING"). Measured in the pack (roll / yaw per stride):
+# walk_forward 79-113 -6.8..+8.8 / -4.5..+5.4 deg, run_jog 137-159 -4.4..+3.4
+# / -1.8..+3.4, walk_backward 99-138 +-9 / +-5.5, crouch_walk_forward 82-136
+# -8.9..+13.7 / +-10 (+-14 / +-21 over the file), walk_strafe_left/right yaw
+# +-13, idle_neutral 0.1 / 0.4.
 SLOTS = [
     ("idle", dict(bvh="idle_neutral", frames=(125, 217), loop=True,
                   notes="only pack idle without body yaw drift; seam 0.13 cm")),
-    ("walk", dict(bvh="walk_forward", frames=(79, 113), loop=True,
+    ("walk", dict(bvh="walk_forward", frames=(79, 113), loop=True, hip_sway=0.45,
                   notes="one gait cycle (T=35); use (37,106) for two cycles")),
-    ("run", dict(bvh="run_jog", frames=(137, 159), loop=True,
+    ("run", dict(bvh="run_jog", frames=(137, 159), loop=True, hip_sway=0.6,
                  notes="fast half of run_jog (~2.15 m/s BVH); first half is a 1.05 m/s jog")),
-    ("walk_back", dict(bvh="walk_backward", frames=(99, 138), loop=True)),
-    ("strafe_walk_l", dict(bvh="walk_strafe_left", frames=(78, 179), loop=True,
+    ("walk_back", dict(bvh="walk_backward", frames=(99, 138), loop=True, hip_sway=0.5)),
+    ("strafe_walk_l", dict(bvh="walk_strafe_left", frames=(78, 179), loop=True, hip_sway=0.5,
                            notes="two cycles: the speed pulses inside one cycle")),
-    ("strafe_walk_r", dict(bvh="walk_strafe_right", frames=(116, 153), loop=True)),
-    ("strafe_run_l", dict(bvh="run_strafe_left", frames=(117, 139), loop=True,
+    ("strafe_walk_r", dict(bvh="walk_strafe_right", frames=(116, 153), loop=True, hip_sway=0.5)),
+    ("strafe_run_l", dict(bvh="run_strafe_left", frames=(117, 139), loop=True, hip_sway=0.6,
                           notes="frames 0-60 of the source are a standing start")),
-    ("strafe_run_r", dict(bvh="run_strafe_right", frames=(133, 157), loop=True,
+    ("strafe_run_r", dict(bvh="run_strafe_right", frames=(133, 157), loop=True, hip_sway=0.6,
                           notes="frames 0-35 of the source are a standing start")),
     # crouch_idle: the pack's crouch_idle.bvh is a deep kneel (hips 0.42 m on
     # phillip, knees on the floor) while crouch_walk stands at 0.55-0.69 m and
@@ -203,7 +254,7 @@ SLOTS = [
                                "alternative: crouch_idle.bvh loop:auto:75:105 (deep kneel, hips 0.42 m)")),
     # ("crouch_idle", dict(bvh="crouch_idle", frames="loop:auto:75:105", loop=True,
     #                      notes="deep kneel (hips 0.42 m); pops against crouch_walk and the transitions")),
-    ("crouch_walk", dict(bvh="crouch_walk_forward", frames=(82, 136), loop=True)),
+    ("crouch_walk", dict(bvh="crouch_walk_forward", frames=(82, 136), loop=True, hip_sway=0.5)),
     ("jump", dict(bvh="jump_standing", frames=(44, 84), loop=False, airborne="flat",
                   notes="airborne 47-59 + landing; the runtime starts the clip on the "
                         "airborne edge so the anticipation frames 26-46 are skipped")),
@@ -259,6 +310,10 @@ CONTACT_SRC = ["LeftFoot", "RightFoot", "LeftToeBase", "RightToeBase",
                "LeftToeEnd", "RightToeEnd", "LeftShin", "RightShin"]
 CHECK_FEET = ["LeftFoot", "RightFoot", "LeftToeBase", "RightToeBase",
               "LeftToe_End", "RightToe_End"]
+# source leg chains (hip, knee, ankle): under hip_sway damping the feet keep
+# their world rotations and positions, thigh/shin are re-aimed (plant_leg);
+# everything else under the hips follows the damped pelvis
+LEG_CHAINS_SRC = (("LeftLeg", "LeftShin", "LeftFoot"), ("RightLeg", "RightShin", "RightFoot"))
 
 # ----------------------------------------------------------------- vec math
 I3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
@@ -656,6 +711,148 @@ def auto_loop(bvh, lo, hi, log):
     return best[1], best[2]
 
 
+# ------------------------------------------------------------- hip sway
+def leg_chain_joints(bvh):
+    """Source joints (incl. end sites) at or below a LEG_CHAINS_SRC hip joint."""
+    roots = set(c[0] for c in LEG_CHAINS_SRC)
+    legs = set()
+    for j in list(bvh.joints) + list(bvh.endsite):
+        p = j
+        while p is not None:
+            if p in roots:
+                legs.add(j)
+                break
+            p = bvh.parent[p]
+    return legs
+
+
+def rot_axis_angle(ax, deg):
+    """Rotation matrix about unit axis ax by deg (Rodrigues)."""
+    r = math.radians(deg)
+    c, s = math.cos(r), math.sin(r)
+    x, y, z = ax
+    C = 1.0 - c
+    return [[c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+            [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+            [z * x * C - y * s, z * y * C + x * s, c + z * z * C]]
+
+
+def plant_leg(bvh, chain, W, P, W2, hips_pos2):
+    """Two-bone IK in source space for one leg chain (hip, knee, ankle
+    joint names). The pelvis has been damped (W2["Hips"], hips_pos2), which
+    moved the hip socket; re-aim the thigh and shin (W2[hip], W2[knee], in
+    place) so the ankle stays at its ORIGINAL position P[ankle]: the knee
+    bend is changed about its own hinge axis until the socket-ankle distance
+    fits, then the whole chain is rotated rigidly about the socket onto the
+    goal. Foot and toes keep their world rotations. Returns (max thigh/shin
+    world rotation change deg, ankle residual cm)."""
+    hip, knee, ankle = chain
+    o_k, o_a = bvh.offset[knee], bvh.offset[ankle]
+    l1, l2 = vlen(o_k), vlen(o_a)
+    S = vadd(hips_pos2, mv(W2["Hips"], bvh.offset[hip]))       # damped socket
+    A = P[ankle]                                                # goal: the actor's ankle
+    Wt, Ws = W[hip], W[knee]
+    K0 = vadd(S, mv(Wt, o_k))
+    A0 = vadd(K0, mv(Ws, o_a))
+    d0 = vlen(vsub(A0, S))
+    d = max(abs(l1 - l2) * (1.0 + 1e-4) + 1e-6, min((l1 + l2) * (1.0 - 1e-4), vlen(vsub(A, S))))
+
+    def interior(dist):
+        return math.acos(max(-1.0, min(1.0, (l1 * l1 + l2 * l2 - dist * dist) / (2.0 * l1 * l2))))
+
+    Ws1 = Ws
+    if abs(d - d0) > 1e-9:
+        dphi = math.degrees(interior(d) - interior(d0))
+        t_dir, s_dir = vsub(K0, S), vsub(A0, K0)
+        ax = cross(t_dir, s_dir)
+        if vlen(ax) > 1e-4 * l1 * l2:
+            ax = vnorm(ax)                                      # the knee's own hinge axis
+        else:
+            ax = vnorm([Ws[0][0], Ws[1][0], Ws[2][0]])          # straight leg: knee local X
+        facing = [W2["Hips"][0][2], 0.0, W2["Hips"][2][2]]
+        best = None
+        for sgn in (1.0, -1.0):
+            Wc = mat_mul(rot_axis_angle(ax, sgn * dphi), Ws)
+            A1 = vadd(K0, mv(Wc, o_a))
+            err = abs(vlen(vsub(A1, S)) - d)
+            # tie-break (straight leg): the knee bends forward
+            R2 = rot_from_to(vnorm(vsub(A1, S)), vnorm(vsub(A, S)))
+            K2 = vadd(S, mv(R2, vsub(K0, S)))
+            mid = vscale(vadd(S, A), 0.5)
+            fwd = sum(a * b for a, b in zip(vsub(K2, mid), facing))
+            key = (round(err, 9), -fwd)
+            if best is None or key < best[0]:
+                best = (key, Wc)
+        Ws1 = best[1]
+    A1 = vadd(K0, mv(Ws1, o_a))
+    R2 = rot_from_to(vnorm(vsub(A1, S)), vnorm(vsub(A, S)))
+    Wt2 = normalize_rot(mat_mul(R2, Wt))
+    Ws2 = normalize_rot(mat_mul(R2, Ws1))
+    W2[hip], W2[knee] = Wt2, Ws2
+    A2 = vadd(vadd(S, mv(Wt2, o_k)), mv(Ws2, o_a))
+    return (max(rot_angle_deg(mat_mul(mat_t(Wt), Wt2)), rot_angle_deg(mat_mul(mat_t(Ws), Ws2))),
+            vlen(vsub(A2, A)))
+
+
+def damp_hip_sway(bvh, src, positions, factor):
+    """Scale the hips roll/yaw deviation from the mean facing and the lateral
+    hips translation by `factor` on the source world rotations/positions
+    (src[fi] = (W, P), modified in place; see the docstring). Spine, arms
+    and head follow the pelvis rigidly; the feet keep their world rotations
+    and their positions (thigh/shin re-aimed by plant_leg). Returns the
+    measured deviations: dict(roll, yaw, pitch [deg], lateral [cm]) ->
+    (min_before, max_before, min_after, max_after), plus mean_yaw_deg,
+    leg_fix_deg (max thigh/shin change) and ankle_residual_cm (max)."""
+    # mean facing (yaw only): the hips' forward (+Z) vector averaged in XZ
+    fx = sum(src[fi][0]["Hips"][0][2] for fi in positions)
+    fz = sum(src[fi][0]["Hips"][2][2] for fi in positions)
+    mean_yaw = math.degrees(math.atan2(fx, fz))
+    M = rot_axis("y", mean_yaw)
+    Mt = mat_t(M)
+    legs = leg_chain_joints(bvh)
+    # lateral axis: perpendicular (in XZ) to the travel direction = the hips
+    # drift over the selection; a non-travelling selection uses the facing
+    h0, hL = src[positions[0]][1]["Hips"], src[positions[-1]][1]["Hips"]
+    d = [hL[0] - h0[0], 0.0, hL[2] - h0[2]]
+    n = vnorm([-d[2], 0.0, d[0]]) if vlen(d) > 1.0 else [M[0][0], M[1][0], M[2][0]]
+    lat = {fi: sum(src[fi][1]["Hips"][i] * n[i] for i in range(3)) for fi in positions}
+    lat_mean = sum(lat.values()) / len(lat)
+    stats = {key: [] for key in ("roll", "yaw", "pitch", "lateral")}
+    leg_fix, ankle_res = 0.0, 0.0
+    for fi in positions:
+        W, P = src[fi]
+        Wh = W["Hips"]
+        z, y, x = euler_zyx(mat_mul(Mt, Wh))          # BVH channel order Z, Y, X
+        Wh2 = normalize_rot(mat_mul(M, rot_zyx(z * factor, y * factor, x)))
+        delta = mat_mul(Wh2, mat_t(Wh))                # W'_hips * inv(W_hips)
+        W2 = {j: (w if j in legs else normalize_rot(mat_mul(delta, w))) for j, w in W.items()}
+        W2["Hips"] = Wh2
+        dev = lat[fi] - lat_mean
+        hips2 = vadd(P["Hips"], vscale(n, (factor - 1.0) * dev))
+        for chain in LEG_CHAINS_SRC:
+            fix, res = plant_leg(bvh, chain, W, P, W2, hips2)
+            leg_fix, ankle_res = max(leg_fix, fix), max(ankle_res, res)
+        # positions: FK of the damped pose (hierarchy order, parents first)
+        P2 = {"Hips": hips2}
+        for j in bvh.joints[1:] + list(bvh.endsite):
+            p = bvh.parent[j]
+            P2[j] = vadd(P2[p], mv(W2[p], bvh.offset[j]))
+        src[fi] = (W2, P2)
+        z2, y2, x2 = euler_zyx(mat_mul(Mt, Wh2))
+        stats["roll"].append((z, z2))
+        stats["yaw"].append((y, y2))
+        stats["pitch"].append((x, x2))
+        stats["lateral"].append((dev, dev * factor))
+    out = {}
+    for key, pairs in stats.items():
+        out[key] = (min(a for a, _ in pairs), max(a for a, _ in pairs),
+                    min(b for _, b in pairs), max(b for _, b in pairs))
+    out["mean_yaw_deg"] = mean_yaw
+    out["leg_fix_deg"] = leg_fix
+    out["ankle_residual_cm"] = ankle_res
+    return out
+
+
 # ------------------------------------------------------------------ per slot
 def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
     bvh = BVH(os.path.join(bvh_dir, cfg["bvh"] + ".bvh"))
@@ -701,6 +898,23 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
     src = {}
     for fi in positions:
         src[fi] = bvh.fk(fi)
+    # the target's XZ origin: the ACTOR's first-frame hips (before any sway
+    # damping), so damping the pelvis sway never moves the planted feet
+    hips_anchor = list(src[positions[0]][1]["Hips"])
+    # hip sway damping on the source world rotations (before yaw/drift
+    # correction and before the retarget; see the docstring)
+    hip_sway = float(cfg.get("hip_sway", 1.0))
+    if hip_sway < 0.0:
+        raise SystemExit("%s: hip_sway must be >= 0" % slot)
+    sway = None
+    if hip_sway != 1.0:
+        sway = damp_hip_sway(bvh, src, positions, hip_sway)
+        log("  %-16s hip_sway %.2f about mean yaw %.1f deg: roll %+.1f..%+.1f -> %+.1f..%+.1f  "
+            "yaw %+.1f..%+.1f -> %+.1f..%+.1f  pitch kept %+.1f..%+.1f  lateral %+.1f..%+.1f -> %+.1f..%+.1f cm"
+            % ((slot, hip_sway, sway["mean_yaw_deg"]) + sway["roll"] + sway["yaw"] + sway["pitch"][:2]
+               + sway["lateral"]))
+        log("  %-16s legs re-aimed to keep the feet planted: thigh/shin max %.2f deg, ankle residual max %.2f mm"
+            % (slot, sway["leg_fix_deg"], sway["ankle_residual_cm"] * 10))
     hips0 = list(src[positions[0]][1]["Hips"])
     hipsL = list(src[positions[-1]][1]["Hips"])
     span = float(last - s) if last > s else 1.0
@@ -759,8 +973,8 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
         W, P = corrected(fi)
         hb = P["Hips"]
         hy = hips_rest[1] + (hb[1] - stand_cm) * k
-        hips_t = [hips_rest[0] + (hb[0] - hips0[0]) * k, hy,
-                  hips_rest[2] + (hb[2] - hips0[2]) * k]
+        hips_t = [hips_rest[0] + (hb[0] - hips_anchor[0]) * k, hy,
+                  hips_rest[2] + (hb[2] - hips_anchor[2]) * k]
         rots, trans, euler = rt.frame(W, hips_t, prev_euler)
         Wt, Pt = tgt.fk(rots, trans)
         src_low = min(P[j][1] for j in CONTACT_SRC if j in P)
@@ -843,6 +1057,12 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
         foot_min_y_m=round(foot_min, 4), foot_min_joint=foot_min_joint,
         bvh_foot_min_y_cm=round(src_foot_min, 2),
         seam=None if seam is None else {kk: round(v, 4) for kk, v in seam.items()},
+        hip_sway=hip_sway,
+        hip_sway_deviation=None if sway is None else {
+            kk: dict(before=[round(sway[kk][0], 2), round(sway[kk][1], 2)],
+                     after=[round(sway[kk][2], 2), round(sway[kk][3], 2)])
+            for kk in ("roll", "yaw", "pitch", "lateral")},
+        hip_sway_leg_fix_deg=None if sway is None else round(sway["leg_fix_deg"], 2),
         notes=cfg.get("notes", ""),
     )
     log("  %-16s %-22s [%3d,%3d)%s N=%3d L=%.3fs hips %.3f..%.3f m (lock %+.1f..%+.1f cm)  "

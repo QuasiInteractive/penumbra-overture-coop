@@ -56,23 +56,23 @@ Gait = hips XZ drift removed over the range / duration, scaled to the model
 (see "Hips translation"); 0 = not a locomotion clip. The runtime plays a
 locomotion clip at `measured_speed / gait`.
 
-| slot | pack clip | frames | keys | loop | phillip gait m/s | malik gait m/s | notes |
-|---|---|---|---|---|---|---|---|
-| idle | idle_neutral | [125,217) | 93 | yes | 0 | 0 | only pack idle without body yaw drift |
-| walk | walk_forward | [79,113) | 35 | yes | 1.28 | 1.45 | one gait cycle (T = 35 f) |
-| run | run_jog | [137,159) | 23 | yes | 1.92 | 2.18 | fast half of run_jog; first half is a 1.05 m/s jog |
-| walk_back | walk_backward | [99,138) | 40 | yes | 0.72 | 0.81 | |
-| strafe_walk_l | walk_strafe_left | [78,179) | 102 | yes | 0.54 | 0.61 | two cycles (speed pulses inside one) |
-| strafe_walk_r | walk_strafe_right | [116,153) | 38 | yes | 0.77 | 0.88 | |
-| strafe_run_l | run_strafe_left | [117,139) | 23 | yes | 2.10 | 2.39 | frames 0-60 of the source are a standing start |
-| strafe_run_r | run_strafe_right | [133,157) | 25 | yes | 1.84 | 2.09 | frames 0-35 are a standing start |
-| crouch_idle | crouch_rise_up | [10,14) x11.25, pingpong | 89 | yes | 0 | 0 | hold of the transitions' shared frame 10 (hips 0.50 m) breathing up 6 cm to f13 and back: 45 keys up + 43 down, 2.93 s. Replaces the pack's crouch_idle.bvh (`loop:auto:75:105` -> [192,283), 92 keys: a deep kneel, hips 0.42 m, knees on the floor, head 0.59 m), kept as a commented alternative in `SLOTS` |
-| crouch_walk | crouch_walk_forward | [82,136) | 55 | yes | 0.76 | 0.87 | hips 0.55-0.69 m |
-| jump | jump_standing | [44,84) | 40 | no | 0 | 0 | airborne 47-59 + landing; `airborne="flat"` |
-| stand_to_crouch | crouch_rise_up, reversed | [10,42) | 32 | no | 0 | 0 | frames 0-9 of the source are a heel-sit squat |
-| crouch_to_stand | crouch_rise_up | [10,42) | 32 | no | 0 | 0 | same length as stand_to_crouch (runtime lerps the Y offset over it) |
-| turn_l | turn_left_90 | [0,40) | 40 | no | 0 | 0 | linear yaw drift (+92.7 deg) removed |
-| turn_r | turn_right_90 | [0,60) | 60 | no | 0 | 0 | linear yaw drift (-93.9 deg) removed |
+| slot | pack clip | frames | keys | loop | hip_sway | phillip gait m/s | malik gait m/s | notes |
+|---|---|---|---|---|---|---|---|---|
+| idle | idle_neutral | [125,217) | 93 | yes | 1 | 0 | 0 | only pack idle without body yaw drift |
+| walk | walk_forward | [79,113) | 35 | yes | 0.45 | 1.28 | 1.45 | one gait cycle (T = 35 f) |
+| run | run_jog | [137,159) | 23 | yes | 0.6 | 1.92 | 2.18 | fast half of run_jog; first half is a 1.05 m/s jog |
+| walk_back | walk_backward | [99,138) | 40 | yes | 0.5 | 0.72 | 0.81 | |
+| strafe_walk_l | walk_strafe_left | [78,179) | 102 | yes | 0.5 | 0.54 | 0.61 | two cycles (speed pulses inside one) |
+| strafe_walk_r | walk_strafe_right | [116,153) | 38 | yes | 0.5 | 0.77 | 0.88 | |
+| strafe_run_l | run_strafe_left | [117,139) | 23 | yes | 0.6 | 2.10 | 2.39 | frames 0-60 of the source are a standing start |
+| strafe_run_r | run_strafe_right | [133,157) | 25 | yes | 0.6 | 1.84 | 2.09 | frames 0-35 are a standing start |
+| crouch_idle | crouch_rise_up | [10,14) x11.25, pingpong | 89 | yes | 1 | 0 | 0 | hold of the transitions' shared frame 10 (hips 0.50 m) breathing up 6 cm to f13 and back: 45 keys up + 43 down, 2.93 s. Replaces the pack's crouch_idle.bvh (`loop:auto:75:105` -> [192,283), 92 keys: a deep kneel, hips 0.42 m, knees on the floor, head 0.59 m), kept as a commented alternative in `SLOTS` |
+| crouch_walk | crouch_walk_forward | [82,136) | 55 | yes | 0.5 | 0.76 | 0.87 | hips 0.55-0.69 m |
+| jump | jump_standing | [44,84) | 40 | no | 1 | 0 | 0 | airborne 47-59 + landing; `airborne="flat"` |
+| stand_to_crouch | crouch_rise_up, reversed | [10,42) | 32 | no | 1 | 0 | 0 | frames 0-9 of the source are a heel-sit squat |
+| crouch_to_stand | crouch_rise_up | [10,42) | 32 | no | 1 | 0 | 0 | same length as stand_to_crouch (runtime lerps the Y offset over it) |
+| turn_l | turn_left_90 | [0,40) | 40 | no | 1 | 0 | 0 | linear yaw drift (+92.7 deg) removed |
+| turn_r | turn_right_90 | [0,60) | 60 | no | 1 | 0 | 0 | linear yaw drift (-93.9 deg) removed |
 
 Resulting hips heights (phillip / malik, m): standing clips 0.91-1.03 /
 0.93-1.10, crouch_idle 0.50-0.55 / 0.49-0.56, crouch_walk 0.55-0.69 /
@@ -84,7 +84,7 @@ source) and the jump take-off/landing frames (down to -8.6 / -9.1 cm, see
 
 The table lives in `SLOTS` at the top of the converter: `bvh`, `frames`
 (a tuple or `"loop:auto:MIN:MAX"`), `loop`, `reverse`, `remove_yaw`,
-`airborne`, `clamp_y_to_stand`, `stretch`, `pingpong`, `notes`.
+`airborne`, `clamp_y_to_stand`, `stretch`, `pingpong`, `hip_sway`, `notes`.
 
 ## Output format (what the engine needs)
 
@@ -158,12 +158,70 @@ only), Index2/3/4 -> Index1/2/3 (the BVH index has an extra metacarpal),
 Leg->UpLeg, Shin->Leg, Foot, ToeBase. The mapping is filtered to the joints the
 base actually has (malik has no thumbs), so the same table serves both models.
 
+## Hip sway damping (`hip_sway`)
+
+The Motifect actor swings the pelvis more than a neutral male walk (about
+twice as much): measured in the pack, hips world roll (about the travel
+axis) / yaw deviation from the mean facing, per stride:
+
+| pack clip | frames | roll deg | yaw deg | lateral hips sway cm |
+|---|---|---|---|---|
+| walk_forward | 79-113 | -6.8..+8.8 (half-amplitude 7.8) | -4.5..+5.4 (4.9) | +-2.4 |
+| run_jog | 137-159 | -4.4..+3.4 | -1.8..+3.4 | +-1.1 |
+| walk_backward | 99-138 | -8.8..+9.9 | -5.1..+5.8 | +-3.5 |
+| crouch_walk_forward | 82-136 | -8.9..+13.7 | -10.0..+9.4 | +-9.5 |
+| crouch_walk_forward | whole file | -12..+15 | -20..+20 | +-23 |
+| walk_strafe_left / right | table ranges | -4..+5 | +-13 | +-7 / +-4 |
+| idle_neutral | 125-217 | +-0.1 | +-0.4 | +-0.2 |
+
+The per-slot `hip_sway` factor (default 1.0 = the actor's motion) damps that
+on the source pose right after the BVH FK, before the drift/yaw correction
+and the retarget, so it is independent of the target rig
+(`damp_hip_sway` in the converter):
+
+1. reference `M = Ry(mean hips yaw)` over the exported frame range (hips
+   forward vector averaged; pitch/roll reference 0); deviation
+   `D(t) = inv(M) * W_hips(t)` decomposed Z-Y-X like the BVH channels (roll
+   z, yaw y, pitch x); roll and yaw scaled by `hip_sway`, pitch kept (the
+   walk bounce); `W'_hips = M * D'`.
+2. Spine, arms and head follow the damped pelvis rigidly
+   (`W' = W'_hips * inv(W_hips) * W`).
+3. The hips lateral translation deviation (perpendicular to the XZ drift,
+   minus its mean over the range) is scaled by the same factor.
+4. The feet stay where the actor put them: foot/toe joints keep their world
+   rotations and a two-bone IK (`plant_leg`) re-aims thigh and shin so the
+   ankle stays at its original position although the hip socket moved with
+   the pelvis (knee bend about its own hinge, then a rigid rotation about the
+   socket). Keeping the legs' world rotations instead would drag the planted
+   feet along with the sockets (3 cm in walk, 6 cm in crouch_walk = visible
+   skating). Thigh/shin change 1.4-7.7 deg; the ankle residual (a straight
+   stance leg cannot lengthen when its socket rises) is <= 6 mm in walk, 0
+   in the other slots.
+5. The target's XZ origin is the actor's undamped first-frame hips, so the
+   damped clip keeps the actor's mean lateral hips position (key 0's hips sit
+   up to ~1 cm off the rest XZ instead of exactly on it).
+
+Result on the retargeted clips (independent FK, before vs after): hips roll
+and yaw half-amplitudes scaled by exactly the factor (walk 7.8 -> 3.5 /
+4.9 -> 2.2 deg, run 3.9 -> 2.3 / 2.6 -> 1.6, crouch_walk 11.3 -> 5.7 /
+9.7 -> 4.9), feet/toe positions within 6 mm (walk) / 5.5 mm (others) of
+the undamped clips (the rigs' hip-socket offsets and thigh/shin ratios differ
+from the actor's, so the source-space IK is not exact on the target), hips
+height within 3 mm, gait speeds and loop closure unchanged. Slots at 1.0
+write byte-identical files. The converter log prints the before/after
+deviations and the leg correction per damped slot; the sidecar carries them
+as `hip_sway`, `hip_sway_deviation`, `hip_sway_leg_fix_deg`.
+
 ## Hips translation, floor lock, root motion
 
 ```
 hips.y  = base_bind_hips.y  + (bvh_y  - STAND_HIPS_CM) * k
-hips.xz = base_bind_hips.xz + (bvh_xz_dedrifted - bvh_xz_dedrifted[first]) * k
+hips.xz = base_bind_hips.xz + (bvh_xz_dedrifted - bvh_xz_undamped[first]) * k
 ```
+
+(the XZ anchor is the actor's first exported hips position before any
+`hip_sway` damping, so damping never moves the feet; without damping the
+two are the same and the first key's hips sit exactly on the rest XZ).
 
 `k` (metres per BVH cm, `--scale`, default `auto`) is the leg-length ratio
 (base thigh+shin / BVH thigh+shin: phillip 0.00894, malik 0.01018), not the
@@ -207,12 +265,17 @@ yaw-corrected path so the hips end exactly where they started.
 ## Tuning knobs
 
 - `SLOTS` (top of the converter): source clip, frame range, loop, reverse,
-  `remove_yaw`, `airborne`, `clamp_y_to_stand`, `stretch`, `pingpong`.
+  `remove_yaw`, `airborne`, `clamp_y_to_stand`, `stretch`, `pingpong`,
+  `hip_sway`.
   `frames="loop:auto:MIN:MAX"` searches the best seam (joint positions
   relative to the hips plus hips velocity) for a loop of MIN..MAX frames.
   `stretch=F` slows the selection F times (fractional-frame resampling of the
   BVH channels), `pingpong=True` plays it back to its first frame (an exact
   loop out of any short monotonic motion, e.g. a hold with a slow bob).
+  `hip_sway=F` (default 1) scales the pelvis roll/yaw deviation from the
+  mean facing and the lateral hips sway by F, feet kept planted (see "Hip
+  sway damping"); 0.45 on walk, 0.5 on walk_back / strafes / crouch_walk,
+  0.6 on the runs. Lower = stiffer pelvis; 1 = the actor's motion.
 - `MAP` / `ALIGN_CHILD`: joint mapping and which bones get the rest-direction
   alignment `A(j)`.
 - `CONTACT_TGT` / `CONTACT_SRC` / `GROUND_EPS_CM` (2 cm): floor-lock joint sets
