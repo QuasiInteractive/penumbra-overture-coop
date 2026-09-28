@@ -3,12 +3,16 @@
 # join=HOST:PRT — auto-connect once a map is loaded
 # port=7777    — default listen / F10 localhost join port
 #
-# Remote-player body mesh — put .dae files in:
-#   multiplayer/models/greenlandman.dae
+# Remote-player body mesh — .dae files (+ their <name>_<clip>.dae siblings) in:
+#   multiplayer/models/malik.dae
 #   multiplayer/models/phillip.dae
 # PlayerID 1 (host) uses the first mesh, ID 2 the second — same order everywhere.
 #
-# ghost_body_y is offset from synced camera Y (eyes) to mesh origin — tune until feet touch the floor.
+# v11: the wire carries the sender's FEET height and the shipped meshes have
+# their origin at the feet, so no grounding offset is needed any more.
+# ghost_body_y / ghost_body_y_crouch are now extra offsets FROM THE FEET
+# (default 0). Values below -0.9 are treated as the old camera-relative
+# numbers and converted (logged) — delete them from an old cfg.
 
 host=0
 # server_name=  — shown in the LAN server browser (spaces OK, 31 chars max)
@@ -17,16 +21,51 @@ server_name=Penumbra Server
 max_players=4
 port=7777
 # join=127.0.0.1:7777
-# Host (id 1) appears as greenlandman.dae to others; client (id 2) survivor2 — more peers rotate.
-ghost_models=greenlandman.dae,phillip.dae
+# Host (id 1) appears as malik.dae to others; client (id 2) phillip — more peers rotate.
+ghost_models=malik.dae,phillip.dae
 # Alternative: single mesh — ghost_model=foo.dae
-ghost_body_y=-1.72
-# ghost_body_y_crouch= — same offset while the remote player crouches (their camera
-# drops ~0.7 m but their feet don't). Unset = ghost_body_y + 0.7. Tune by eye.
-# ghost_body_y_crouch=-1.02
+# ghost_body_y=0
+# ghost_body_y_crouch=0
 
-# Per-mesh ghost grounding (CSV, indexed like ghost_models — different rigs
-# ground at different heights). Overrides ghost_body_y/_crouch per mesh.
+# Per-mesh grounding overrides (CSV, indexed like ghost_models — a rig whose
+# origin is NOT at its feet). Overrides ghost_body_y/_crouch per mesh.
 # More negative = mesh lower.
-# ghost_body_ys=-1.45,-1.48
-# ghost_body_ys_crouch=-1.10,-1.13
+# ghost_body_ys=0,0
+# ghost_body_ys_crouch=0,0
+
+# ---- Ghost animation (v11) ------------------------------------------------
+# ghost_interp_ms=100   — render remote players this far behind their newest
+#                         state (3 packets at 30 Hz). Lower = snappier, higher
+#                         = smoother on a jittery link. 0..250.
+# ghost_turn_rate=720   — body yaw follows the remote view yaw at most this
+#                         fast (deg/s). 30..3600.
+# ghost_gait_<slot>=    — metres per second the clip covers at playback
+#                         speed 1.0; the ghost plays each locomotion clip at
+#                         (real speed / gait), clamped 0.6..1.8, so the feet
+#                         stop sliding. Defaults are measured from the shipped
+#                         phillip clips (each model's <name>_clips.json is read
+#                         when present). Slots: walk, run, crouch_walk,
+#                         walk_back, strafe_walk (both sides), strafe_run (both
+#                         sides); an exact clip name (strafe_walk_l) overrides
+#                         one clip.
+# ghost_gait_walk=1.28
+# ghost_gait_run=1.92
+# ghost_gait_crouch_walk=0.76
+# ghost_gait_walk_back=0.72
+# ghost_gait_strafe_walk=0.65
+# ghost_gait_strafe_run=1.97
+# ghost_anim_trace=0    — 1 logs every clip change and a 5-second state trace
+#                         per ghost to hpl.log (synchronous disk writes: leave
+#                         off in real sessions).
+
+# ---- Ghost preview (offline animation check) -------------------------------
+# ghost_preview=1 puts a LOCAL ghost 2 m in front of you, facing you, as soon
+# as a map is up (no session needed). It is driven through the same path a
+# network ghost is. Keys while it exists:
+#   F6 / F7 — next / previous clip (all loaded clips, one-shots replay)
+#   F8      — toggle crouch stance (plays the stand<->crouch transitions)
+#   F2      — treadmill off / walk / run: walks a 1 m circle at the real
+#             game.cfg speeds so gait scaling + clip selection can be judged
+# One hpl.log line per change.
+# ghost_preview=0
+# ghost_preview_model=0 — which ghost_models entry the preview uses (0-based)

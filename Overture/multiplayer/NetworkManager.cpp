@@ -40,14 +40,174 @@ static void ScriptVarNetThunk(int alOp, const char* asName, int alVal)
 #include <cmath>
 
 //======================================================================
+// Shared by the real and the stub build.
+//======================================================================
+
+namespace
+{
+/** Wire id of the local preview ghost (ghost_preview=1) — above any real
+    guest id, never sent, never in m_mapGhosts. */
+const uint8_t kPreviewGhostId = 250;
+
+/** m/s -> cNetPlayerState::mVelFwd/mVelRight (1/kNetPlayerVelScale m/s, saturating). */
+int8_t EncodeNetVel(float afMetersPerSec)
+{
+	float f = afMetersPerSec * kNetPlayerVelScale;
+	if (f > 127.0f) f = 127.0f;
+	else if (f < -127.0f) f = -127.0f;
+	const int l = (f >= 0.0f) ? (int)(f + 0.5f) : -(int)(-f + 0.5f);
+	return (int8_t)l;
+}
+}
+
+bool cNetworkManager::BuildLocalSnapshot(cNetPlayerState *apOut) const
+{
+	if (!apOut || !mpInit || !mpInit->mpPlayer)
+		return false;
+	cCamera3D *cam = mpInit->mpPlayer->GetCamera();
+	if (!cam)
+		return false;
+	iCharacterBody *pBody = mpInit->mpPlayer->GetCharacterBody();
+
+	memset(apOut, 0, sizeof(*apOut));
+	const cVector3f p = cam->GetPosition();
+	apOut->mType = eNetPacketType_PlayerState;
+	apOut->mPlayerID = mlLocalPlayerId;
+	apOut->mfPosX = p.x;
+	/* v11: FEET height, not the camera's — the camera carries the head-bob
+	   (cPlayerHeadMove) and the ghost mesh origin is at its feet. */
+	apOut->mfPosY = pBody ? pBody->GetFeetPosition().y : p.y;
+	apOut->mfPosZ = p.z;
+	apOut->mfPitch = cam->GetPitch();
+	apOut->mfYaw = cam->GetYaw();
+	cPlayerFlashLight *fl = mpInit->mpPlayer->GetFlashLight();
+	apOut->mbFlashlightOn = (uint8_t)(fl && fl->IsActive() && !fl->IsDisabled());
+	/* Engine -> wire stance mapping, explicit per state so an engine enum
+	   reorder cannot silently change the protocol (the wire values are frozen
+	   — see eNetMoveState). Unknown states go out as Run. */
+	const ePlayerMoveState eMove = mpInit->mpPlayer->GetMoveState();
+	switch (eMove)
+	{
+	case ePlayerMoveState_Walk:   apOut->mMoveState = eNetMoveState_Walk;   break;
+	case ePlayerMoveState_Run:    apOut->mMoveState = eNetMoveState_Run;    break;
+	case ePlayerMoveState_Still:  apOut->mMoveState = eNetMoveState_Still;  break;
+	case ePlayerMoveState_Jump:   apOut->mMoveState = eNetMoveState_Jump;   break;
+	case ePlayerMoveState_Crouch: apOut->mMoveState = eNetMoveState_Crouch; break;
+	default:                      apOut->mMoveState = eNetMoveState_Run;    break;
+	}
+
+	/* v11 flags: ground contact from the character body; crouch/run survive
+	   a jump because the jump state remembers what it was entered from. */
+	bool bCrouch = (eMove == ePlayerMoveState_Crouch);
+	bool bRun = (eMove == ePlayerMoveState_Run);
+	if (eMove == ePlayerMoveState_Jump)
+	{
+		iPlayerMoveState *pJump = mpInit->mpPlayer->GetMoveStateData(ePlayerMoveState_Jump);
+		if (pJump)
+		{
+			bCrouch = (pJump->mPrevMoveState == ePlayerMoveState_Crouch);
+			bRun = (pJump->mPrevMoveState == ePlayerMoveState_Run);
+		}
+	}
+	uint8_t lFlags = 0;
+	if (pBody == NULL || pBody->IsOnGround())
+		lFlags |= eNetPlayerFlag_OnGround;
+	if (bCrouch)
+		lFlags |= eNetPlayerFlag_Crouch;
+	if (bRun)
+		lFlags |= eNetPlayerFlag_RunKey;
+	if (eMove == ePlayerMoveState_Jump)
+		lFlags |= eNetPlayerFlag_Jump;
+	apOut->mFlags = lFlags;
+
+	/* v11 velocity: the body's true world velocity over the last physics
+	   step, projected on the view frame (forward = (-sin y, 0, -cos y),
+	   right = (cos y, 0, -sin y) — cCamera3D::UpdateMoveMatrix). */
+	if (pBody)
+	{
+		float fStep = mpInit->mpGame ? mpInit->mpGame->GetStepSize() : 0.0f;
+		if (fStep <= 0.0f)
+			fStep = 1.0f / 60.0f;
+		const cVector3f v = pBody->GetVelocity(fStep);
+		const float fSinY = sinf(apOut->mfYaw);
+		const float fCosY = cosf(apOut->mfYaw);
+		apOut->mVelFwd = EncodeNetVel(-v.x * fSinY - v.z * fCosY);
+		apOut->mVelRight = EncodeNetVel(v.x * fCosY - v.z * fSinY);
+	}
+	return mlLocalPlayerId != 0;
+}
+
+cGhostPlayer *cNetworkManager::CreateGhost(uint8_t alId, size_t alMeshIdx)
+{
+	if (!mpWorld)
+		return NULL;
+	hpl::tString sMesh;
+	if (mvGhostMeshPaths.empty() == false)
+		sMesh = mvGhostMeshPaths[alMeshIdx % mvGhostMeshPaths.size()];
+
+	/* v11: the wire carries the sender's FEET and the exported meshes have
+	   their origin at the feet, so the mesh lands on the wire position with
+	   NO offset. The sender's camera sits feetY + Height/2 + CameraHeightAdd
+	   + 0.71 above that (Player.cpp:376,968 plus the empirical +0.71 that four
+	   rounds of eyeball-grounding against verified-grounded clips measured
+	   in the pre-v11 camera-relative days) — that eye height is what the
+	   enemy senses and the lights get. */
+	float fCamAdd = 0.0f, fStandH = 1.9f, fCrouchH = 1.0f;
+	if (mpInit && mpInit->mpGameConfig)
+	{
+		fCamAdd = mpInit->mpGameConfig->GetFloat("Player", "CameraHeightAdd", 0);
+		fStandH = mpInit->mpGameConfig->GetFloat("Player", "Height", 1.9f);
+		fCrouchH = mpInit->mpGameConfig->GetFloat("Player", "CrouchHeight", 1.0f);
+	}
+	const float kCamFeetCorrection = 0.71f;
+	const float fEyeStand = fStandH * 0.5f + fCamAdd + kCamFeetCorrection;
+	const float fEyeCrouch = fCrouchH * 0.5f + fCamAdd + kCamFeetCorrection;
+
+	/* multiplayer.cfg overrides are offsets from the FEET now (any value <
+	   9000 wins). A pre-v11 cfg still holds camera-relative values like
+	   -1.45 — anything below -0.9 m can only be one of those, so convert it
+	   (camera - eye height = feet) instead of sinking the mesh. */
+	float fStandOffset = (mfGhostMeshBodyYOffset > 9000.0f) ? 0.0f : mfGhostMeshBodyYOffset;
+	float fCrouchOffset = (mfGhostMeshBodyYOffsetCrouch > 9000.0f) ? fStandOffset : mfGhostMeshBodyYOffsetCrouch;
+	if (mvGhostMeshPaths.empty() == false && mvGhostBodyYList.empty() == false)
+	{
+		const size_t lMeshIdx = alMeshIdx % mvGhostMeshPaths.size();
+		fStandOffset = mvGhostBodyYList[lMeshIdx % mvGhostBodyYList.size()];
+		fCrouchOffset = fStandOffset;
+		if (mvGhostBodyYCrouchList.empty() == false)
+			fCrouchOffset = mvGhostBodyYCrouchList[lMeshIdx % mvGhostBodyYCrouchList.size()];
+	}
+	bool bLegacy = false;
+	if (fStandOffset < -0.9f) { fStandOffset += fEyeStand; bLegacy = true; }
+	if (fCrouchOffset < -0.9f) { fCrouchOffset += fEyeCrouch; bLegacy = true; }
+	if (bLegacy)
+		Log(" multiplayer: ghost_body_y* look camera-relative (pre-v11); v11 offsets are from the FEET — using %.2f/%.2f, set 0 or remove the keys\n",
+			fStandOffset, fCrouchOffset);
+
+	return hplNew(cGhostPlayer, (mpWorld, alId, sMesh, fStandOffset, fCrouchOffset,
+		fEyeStand, fEyeCrouch, &mGhostTuning));
+}
+
+void cNetworkManager::DestroyPreviewGhost(bool abOrphan)
+{
+	if (mpPreviewGhost == NULL)
+		return;
+	if (abOrphan)
+		mpPreviewGhost->OrphanWorld();
+	hplDelete(mpPreviewGhost);
+	mpPreviewGhost = NULL;
+}
+
+//======================================================================
 
 #ifndef PENUMBRA_MULTIPLAYER
 
 struct cNetworkManager::Impl {};
 
-const float cNetworkManager::kSendPeriodSeconds = 1.0f / 30.0f; /* v10:
+const float cNetworkManager::kSendPeriodSeconds = kNetSendPeriodSeconds; /* v10:
     20 -> 30 Hz — noticeably smoother object/enemy motion; ~18 KB/s peak
-    is still nothing for any internet link */
+    is still nothing for any internet link. v11: the receiver clocks ghost
+    interpolation off seq * period, so the value lives in NetworkPackets.h */
 const float cNetworkManager::kDiscoveryWindowSeconds = 1.5f;
 
 cNetworkManager::cNetworkManager(cInit *apInit)
@@ -75,6 +235,21 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mvGhostMeshPaths()
 	  , mfGhostMeshBodyYOffset(9999.0f)  /* AUTO: derived from game.cfg Player Height/CameraHeightAdd */
 	  , mfGhostMeshBodyYOffsetCrouch(9999.0f) /* AUTO: derived from CrouchHeight/CameraHeightAdd */
+	  , mvGhostBodyYList()
+	  , mvGhostBodyYCrouchList()
+	  , mGhostTuning()
+	  , mbGhostPreview(false)
+	  , mlGhostPreviewModel(0)
+	  , mpPreviewGhost(NULL)
+	  , mlPreviewSeq(0)
+	  , mfPreviewSendAccum(0)
+	  , mfPreviewSpawnDelay(0.75f)
+	  , mvPreviewCenter(0, 0, 0)
+	  , mfPreviewFacingYaw(0)
+	  , mfPreviewCircleAngle(0)
+	  , mlPreviewClipIdx(-1)
+	  , mbPreviewCrouch(false)
+	  , mlPreviewTreadmill(0)
 	  , mvDiscovered()
 	  , mbDiscoveryActive(false)
 	  , mfDiscoveryTimeLeft(0)
@@ -142,39 +317,7 @@ void cNetworkManager::ClearGhostsInternal()
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
-}
-
-bool cNetworkManager::BuildLocalSnapshot(cNetPlayerState *apOut) const
-{
-	if (!apOut || !mpInit || !mpInit->mpPlayer)
-		return false;
-	cCamera3D *cam = mpInit->mpPlayer->GetCamera();
-	if (!cam)
-		return false;
-
-	cVector3f p = cam->GetPosition();
-	apOut->mType = eNetPacketType_PlayerState;
-	apOut->mPlayerID = mlLocalPlayerId;
-	apOut->mfPosX = p.x;
-	apOut->mfPosY = p.y;
-	apOut->mfPosZ = p.z;
-	apOut->mfPitch = cam->GetPitch();
-	apOut->mfYaw = cam->GetYaw();
-	cPlayerFlashLight *fl = mpInit->mpPlayer->GetFlashLight();
-	apOut->mbFlashlightOn = (uint8_t)(fl && fl->IsActive() && !fl->IsDisabled());
-	/* Engine -> wire stance mapping, explicit per state so an engine enum
-	   reorder cannot silently change the protocol (the wire values are frozen
-	   — see eNetMoveState). Unknown states go out as Run. */
-	switch (mpInit->mpPlayer->GetMoveState())
-	{
-	case ePlayerMoveState_Walk:   apOut->mMoveState = eNetMoveState_Walk;   break;
-	case ePlayerMoveState_Run:    apOut->mMoveState = eNetMoveState_Run;    break;
-	case ePlayerMoveState_Still:  apOut->mMoveState = eNetMoveState_Still;  break;
-	case ePlayerMoveState_Jump:   apOut->mMoveState = eNetMoveState_Jump;   break;
-	case ePlayerMoveState_Crouch: apOut->mMoveState = eNetMoveState_Crouch; break;
-	default:                      apOut->mMoveState = eNetMoveState_Run;    break;
-	}
-	return mlLocalPlayerId != 0;
+	DestroyPreviewGhost(false);
 }
 
 void cNetworkManager::EmitLocalSnapshots()
@@ -235,6 +378,7 @@ void cNetworkManager::NetOnItemDropped(const hpl::tString &, const hpl::tString 
 int cNetworkManager::GetConnectedGuestCount() const { return 0; }
 bool cNetworkManager::IsEnemyPuppetMode() const { return false; }
 void cNetworkManager::GetGhostCamPositions(std::vector<std::pair<uint8_t, hpl::cVector3f> > &avOut) { avOut.clear(); }
+bool cNetworkManager::GetGhostSense(uint8_t, hpl::cVector3f *, uint8_t *) const { return false; }
 void cNetworkManager::SendPlayerDamage(uint8_t, float) {}
 void cNetworkManager::NetOnEnemyDamaged(const hpl::tString &, float, int) {}
 bool cNetworkManager::PartyHasItem(const hpl::tString &) const { return false; }
@@ -304,9 +448,10 @@ struct cNetworkManager::Impl
 	}
 };
 
-const float cNetworkManager::kSendPeriodSeconds = 1.0f / 30.0f; /* v10:
+const float cNetworkManager::kSendPeriodSeconds = kNetSendPeriodSeconds; /* v10:
     20 -> 30 Hz — noticeably smoother object/enemy motion; ~18 KB/s peak
-    is still nothing for any internet link */
+    is still nothing for any internet link. v11: the receiver clocks ghost
+    interpolation off seq * period, so the value lives in NetworkPackets.h */
 const float cNetworkManager::kDiscoveryWindowSeconds = 1.5f;
 
 namespace
@@ -434,15 +579,6 @@ static void ParseCsvFloats(const char *src, std::vector<float> &out)
 	}
 }
 
-static const hpl::tString &GhostMeshPathForId(const std::vector<hpl::tString> &paths,
-											  uint8_t id)
-{
-	static const hpl::tString sEmptyGhostMesh;
-	if (paths.empty() || id == 0)
-		return sEmptyGhostMesh;
-	return paths[(size_t)(id - 1) % paths.size()];
-}
-
 /** Reliable = channel 0 (control), else channel 1 unsequenced (streams). */
 static void SendStructToPeer(ENetPeer *apPeer, const void *apData, size_t alLen, bool abReliable)
 {
@@ -548,6 +684,21 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mvGhostMeshPaths()
 	  , mfGhostMeshBodyYOffset(9999.0f)  /* AUTO: derived from game.cfg Player Height/CameraHeightAdd */
 	  , mfGhostMeshBodyYOffsetCrouch(9999.0f) /* AUTO: derived from CrouchHeight/CameraHeightAdd */
+	  , mvGhostBodyYList()
+	  , mvGhostBodyYCrouchList()
+	  , mGhostTuning()
+	  , mbGhostPreview(false)
+	  , mlGhostPreviewModel(0)
+	  , mpPreviewGhost(NULL)
+	  , mlPreviewSeq(0)
+	  , mfPreviewSendAccum(0)
+	  , mfPreviewSpawnDelay(0.75f)
+	  , mvPreviewCenter(0, 0, 0)
+	  , mfPreviewFacingYaw(0)
+	  , mfPreviewCircleAngle(0)
+	  , mlPreviewClipIdx(-1)
+	  , mbPreviewCrouch(false)
+	  , mlPreviewTreadmill(0)
 	  , mvDiscovered()
 	  , mbDiscoveryActive(false)
 	  , mfDiscoveryTimeLeft(0)
@@ -584,6 +735,12 @@ void cNetworkManager::RegisterInputActions()
 	inp->AddAction(hplNew(cActionKeyboard, ("MultiplayerHost", inp, eKey_F11)));
 	inp->AddAction(hplNew(cActionKeyboard, ("MultiplayerJoinLocal", inp, eKey_F10)));
 	inp->AddAction(hplNew(cActionKeyboard, ("MultiplayerDiscover", inp, eKey_F9)));
+	/* Ghost preview keys (only polled with ghost_preview=1). F1/F4/F5/F12 are
+	   the game's, F9-F11 ours; F2/F6/F7/F8 are free. */
+	inp->AddAction(hplNew(cActionKeyboard, ("GhostPreviewNext", inp, eKey_F6)));
+	inp->AddAction(hplNew(cActionKeyboard, ("GhostPreviewPrev", inp, eKey_F7)));
+	inp->AddAction(hplNew(cActionKeyboard, ("GhostPreviewCrouch", inp, eKey_F8)));
+	inp->AddAction(hplNew(cActionKeyboard, ("GhostPreviewTreadmill", inp, eKey_F2)));
 	Log(" multiplayer: F11=toggle HOST :%u — F10=JOIN 127.0.0.1:%u — F9=LAN discovery — menu Multiplayer · multiplayer.cfg\n",
 		(unsigned)mlDefaultPort, (unsigned)mlDefaultPort);
 }
@@ -666,6 +823,53 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 			ParseCsvFloats(val, mvGhostBodyYList);
 		else if (strcmp(key, "ghost_body_ys_crouch") == 0)
 			ParseCsvFloats(val, mvGhostBodyYCrouchList);
+		else if (strcmp(key, "ghost_preview") == 0)
+			mbGhostPreview = (atoi(val) != 0);
+		else if (strcmp(key, "ghost_preview_model") == 0)
+		{
+			const int m = atoi(val);
+			mlGhostPreviewModel = (m < 0) ? 0 : m;
+		}
+		else if (strcmp(key, "ghost_anim_trace") == 0)
+			mGhostTuning.mbAnimTrace = (atoi(val) != 0);
+		else if (strcmp(key, "ghost_interp_ms") == 0)
+		{
+			float ms = static_cast<float>(atof(val));
+			if (ms < 0.0f) ms = 0.0f;
+			else if (ms > 250.0f) ms = 250.0f;
+			mGhostTuning.mfInterpDelaySec = ms / 1000.0f;
+		}
+		else if (strcmp(key, "ghost_turn_rate") == 0)
+		{
+			float deg = static_cast<float>(atof(val));
+			if (deg < 30.0f) deg = 30.0f;
+			else if (deg > 3600.0f) deg = 3600.0f;
+			mGhostTuning.mfTurnRateRadPerSec = deg * (kPif / 180.0f);
+		}
+		else if (strncmp(key, "ghost_gait_", 11) == 0)
+		{
+			/* ghost_gait_<clip>=m/s at playback speed 1.0. The six slot names
+			   (walk, run, crouch_walk, walk_back, strafe_walk, strafe_run) set
+			   the clip(s) of that slot; an exact clip name (strafe_walk_l)
+			   overrides one clip. */
+			const char *name = key + 11;
+			const float g = static_cast<float>(atof(val));
+			if (name[0] && g > 0.05f && g < 10.0f)
+			{
+				if (strcmp(name, "strafe_walk") == 0)
+				{
+					mGhostTuning.m_mapGaitOverrides["strafe_walk_l"] = g;
+					mGhostTuning.m_mapGaitOverrides["strafe_walk_r"] = g;
+				}
+				else if (strcmp(name, "strafe_run") == 0)
+				{
+					mGhostTuning.m_mapGaitOverrides["strafe_run_l"] = g;
+					mGhostTuning.m_mapGaitOverrides["strafe_run_r"] = g;
+				}
+				else
+					mGhostTuning.m_mapGaitOverrides[hpl::tString(name)] = g;
+			}
+		}
 		else if (strcmp(key, "max_players") == 0)
 		{
 			int mp = atoi(val);
@@ -978,6 +1182,7 @@ void cNetworkManager::ClearGhostsInternal()
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
+	DestroyPreviewGhost(false); /* respawns on the next Update if still enabled */
 }
 
 void cNetworkManager::DropRemotePlayer(uint8_t id)
@@ -997,78 +1202,11 @@ void cNetworkManager::EnsureGhost(uint8_t id)
 		return;
 	if (m_mapGhosts.find(id) != m_mapGhosts.end())
 		return;
-	const hpl::tString &mesh = GhostMeshPathForId(mvGhostMeshPaths, id);
-	/* Feet-on-ground by construction: the player camera sits at
-	 *   feetY + bodySize.y/2 + CameraHeightAdd            (Player.cpp:376,968)
-	 * with bodySize.y = Player/Height standing, Player/CrouchHeight crouched
-	 * (Player.cpp:71-80,989). The ghost mesh origin is at its feet, so
-	 * cameraY - (H/2 + add) grounds it exactly, using the SAME game.cfg
-	 * values that position the player. multiplayer.cfg keys stay as
-	 * explicit overrides (any value < 9000 wins). */
-	const float fCamAdd  = mpInit->mpGameConfig->GetFloat("Player", "CameraHeightAdd", 0);
-	const float fStandH  = mpInit->mpGameConfig->GetFloat("Player", "Height", 1.9f);
-	const float fCrouchH = mpInit->mpGameConfig->GetFloat("Player", "CrouchHeight", 1.0f);
-	/* EMPIRICAL +0.71: the camera rides ~0.71 m HIGHER above the feet than
-	   the H/2+add guess. Measured by four rounds of user eyeball-tuning
-	   ("auto" -0.74 -> -1.45 grounded) against clip files that verify as
-	   perfectly grounded (FK toes at 0.000 m) — so the discrepancy is in
-	   this formula, not the models. Crouch agrees: -(0.475-0.085)-0.71 =
-	   -1.10, the user-approved crouch value. (A further -5 cm was tried and
-	   REVERTED: in-game the mesh visibly sank shin-deep — 0.71 is the value
-	   that matches the verified-grounded clips.) */
-	const float kCamFeetCorrection = 0.71f;
-	float fStandOffset = (mfGhostMeshBodyYOffset > 9000.0f)
-		? -(fStandH * 0.5f + fCamAdd + kCamFeetCorrection)
-		: mfGhostMeshBodyYOffset;
-	float fCrouchOffset = (mfGhostMeshBodyYOffsetCrouch > 9000.0f)
-		? -(fCrouchH * 0.5f + fCamAdd + kCamFeetCorrection)
-		: mfGhostMeshBodyYOffsetCrouch;
-	/* Per-mesh overrides: different rigs ground at different heights. Indexed
-	   like the mesh list; a stand list alone keeps the stand->crouch delta. */
-	if (mvGhostMeshPaths.empty() == false && mvGhostBodyYList.empty() == false)
-	{
-		const size_t lMeshIdx = (size_t)(id - 1) % mvGhostMeshPaths.size();
-		const float fPerMesh = mvGhostBodyYList[lMeshIdx % mvGhostBodyYList.size()];
-		fCrouchOffset += fPerMesh - fStandOffset;
-		fStandOffset = fPerMesh;
-		if (mvGhostBodyYCrouchList.empty() == false)
-			fCrouchOffset = mvGhostBodyYCrouchList[lMeshIdx % mvGhostBodyYCrouchList.size()];
-	}
-	m_mapGhosts[id] =
-		hplNew(cGhostPlayer, (mpWorld, id, mesh, fStandOffset, fCrouchOffset));
-}
-
-bool cNetworkManager::BuildLocalSnapshot(cNetPlayerState *apOut) const
-{
-	if (!apOut || !mpInit || !mpInit->mpPlayer)
-		return false;
-	cCamera3D *cam = mpInit->mpPlayer->GetCamera();
-	if (!cam)
-		return false;
-
-	cVector3f p = cam->GetPosition();
-	apOut->mType = eNetPacketType_PlayerState;
-	apOut->mPlayerID = mlLocalPlayerId;
-	apOut->mfPosX = p.x;
-	apOut->mfPosY = p.y;
-	apOut->mfPosZ = p.z;
-	apOut->mfPitch = cam->GetPitch();
-	apOut->mfYaw = cam->GetYaw();
-	cPlayerFlashLight *fl = mpInit->mpPlayer->GetFlashLight();
-	apOut->mbFlashlightOn = (uint8_t)(fl && fl->IsActive() && !fl->IsDisabled());
-	/* Engine -> wire stance mapping, explicit per state so an engine enum
-	   reorder cannot silently change the protocol (the wire values are frozen
-	   — see eNetMoveState). Unknown states go out as Run. */
-	switch (mpInit->mpPlayer->GetMoveState())
-	{
-	case ePlayerMoveState_Walk:   apOut->mMoveState = eNetMoveState_Walk;   break;
-	case ePlayerMoveState_Run:    apOut->mMoveState = eNetMoveState_Run;    break;
-	case ePlayerMoveState_Still:  apOut->mMoveState = eNetMoveState_Still;  break;
-	case ePlayerMoveState_Jump:   apOut->mMoveState = eNetMoveState_Jump;   break;
-	case ePlayerMoveState_Crouch: apOut->mMoveState = eNetMoveState_Crouch; break;
-	default:                      apOut->mMoveState = eNetMoveState_Run;    break;
-	}
-	return mlLocalPlayerId != 0;
+	/* PlayerID picks the mesh as index (id-1) modulo the list length —
+	   id 1 => first .dae, id 2 => second (same order on every machine). */
+	cGhostPlayer *pGhost = CreateGhost(id, (size_t)(id - 1));
+	if (pGhost)
+		m_mapGhosts[id] = pGhost;
 }
 
 void cNetworkManager::DispatchIncoming(const void *data, size_t len)
@@ -1299,6 +1437,7 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 	std::map<uint8_t, cGhostPlayer *>::iterator gi = m_mapGhosts.find(st->mPlayerID);
 	if (gi != m_mapGhosts.end())
 		gi->second->ApplyState(*st);
+	m_mapGhostMoveState[st->mPlayerID] = st->mMoveState; /* enemy senses: stealth + hearing (GetGhostSense) */
 
 	/* Spawn-at-friend: the first HOST state after the census verifies (same
 	   map, same identities) teleports the joining guest to the host's side.
@@ -1320,8 +1459,9 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		mpInit->mpPlayer->GetCharacterBody())
 	{
 		mbSpawnedAtHost = true;
-		/* wire pos is the host CAMERA; feet = cam - stand eye height */
-		cVector3f vFeet(st->mfPosX, st->mfPosY - 1.50f + 0.25f, st->mfPosZ);
+		/* v11: wire Y is the host's FEET already (a hair up so the capsule
+		   never starts intersecting the floor) */
+		cVector3f vFeet(st->mfPosX, st->mfPosY + 0.05f, st->mfPosZ);
 		iCharacterBody *pBody = mpInit->mpPlayer->GetCharacterBody();
 		const cVector3f vCur = pBody->GetFeetPosition();
 		const cVector3f vD = vFeet - vCur;
@@ -2248,6 +2388,8 @@ void cNetworkManager::Update(float afTimeStep)
 			}
 			m_mapGhosts.clear();
 		}
+		DestroyPreviewGhost(true); /* same dead world; respawns after a short delay */
+		mfPreviewSpawnDelay = 0.75f;
 		mpWorld = w;
 	}
 
@@ -2336,7 +2478,179 @@ void cNetworkManager::Update(float afTimeStep)
 	}
 	Service(0);
 
+	/* v11: every ghost interpolates/animates once per tick, AFTER the last
+	   Service(0) so this tick's states are already in the buffers. */
+	UpdateGhosts(afTimeStep);
+
 	mpBodySync->LogStatsTick(afTimeStep);
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::UpdateGhosts(float afTimeStep)
+{
+	for (tGhostMap::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
+	{
+		if (it->second)
+			it->second->Update(afTimeStep);
+	}
+	UpdatePreviewGhost(afTimeStep);
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::UpdatePreviewGhost(float afTimeStep)
+{
+	if (mbGhostPreview == false || !mpInit || !mpInit->mpGame)
+		return;
+	cPlayer *pPlayer = mpInit->mpPlayer;
+	iCharacterBody *pBody = pPlayer ? pPlayer->GetCharacterBody() : NULL;
+	cCamera3D *pCam = pPlayer ? pPlayer->GetCamera() : NULL;
+	if (!mpWorld || !pBody || !pCam)
+		return;
+
+	if (mpPreviewGhost == NULL)
+	{
+		/* a fresh world: give the map its first frames so the player stands
+		   at the real start before we measure "2 m ahead" */
+		mfPreviewSpawnDelay -= afTimeStep;
+		if (mfPreviewSpawnDelay > 0.0f)
+			return;
+
+		const float fYaw = pCam->GetYaw();
+		const cVector3f vFwd(-sinf(fYaw), 0.0f, -cosf(fYaw));
+		mvPreviewCenter = pBody->GetFeetPosition() + vFwd * 2.0f;
+		mfPreviewFacingYaw = fYaw + kPif; /* faces the player */
+		mfPreviewCircleAngle = 0.0f;
+		mlPreviewSeq = 0;
+		mfPreviewSendAccum = 0.0f;
+
+		mpPreviewGhost = CreateGhost(kPreviewGhostId, (size_t)mlGhostPreviewModel);
+		if (mpPreviewGhost == NULL)
+		{
+			mbGhostPreview = false;
+			Log(" multiplayer: ghost preview could not create a ghost — disabled\n");
+			return;
+		}
+		Log(" multiplayer: ghost preview spawned 2 m ahead (mesh #%d) — F6/F7 cycle clips, F8 crouch, F2 treadmill off/walk/run; ghost_anim_trace=1 logs the selector\n",
+			mlGhostPreviewModel);
+		if (mlPreviewClipIdx >= 0)
+			mpPreviewGhost->DebugPlayClip(cGhostPlayer::GetClipName(mlPreviewClipIdx));
+	}
+
+	/* keys */
+	hpl::cInput *inp = mpInit->mpGame->GetInput();
+	if (inp)
+	{
+		const int lClipNum = cGhostPlayer::GetClipCount();
+		int lDir = 0;
+		if (inp->BecameTriggerd("GhostPreviewNext"))
+			lDir = 1;
+		else if (inp->BecameTriggerd("GhostPreviewPrev"))
+			lDir = -1;
+		if (lDir != 0 && lClipNum > 0)
+		{
+			/* step to the next LOADED clip (a clip whose file failed is skipped) */
+			int lIdx = mlPreviewClipIdx;
+			bool bSet = false;
+			for (int lTry = 0; lTry < lClipNum && bSet == false; ++lTry)
+			{
+				lIdx = ((lIdx + lDir) % lClipNum + lClipNum) % lClipNum;
+				bSet = mpPreviewGhost->DebugPlayClip(cGhostPlayer::GetClipName(lIdx));
+			}
+			if (bSet)
+			{
+				mlPreviewClipIdx = lIdx;
+				if (mlPreviewTreadmill != 0)
+					mlPreviewTreadmill = 0; /* a forced clip stands still */
+				Log(" multiplayer: ghost preview clip '%s' (%d/%d)\n",
+					cGhostPlayer::GetClipName(lIdx), lIdx + 1, lClipNum);
+			}
+			else
+				Log(" multiplayer: ghost preview: no clips loaded on this mesh\n");
+		}
+		if (inp->BecameTriggerd("GhostPreviewCrouch"))
+		{
+			mbPreviewCrouch = !mbPreviewCrouch;
+			Log(" multiplayer: ghost preview stance: %s\n", mbPreviewCrouch ? "crouch" : "stand");
+		}
+		if (inp->BecameTriggerd("GhostPreviewTreadmill"))
+		{
+			mlPreviewTreadmill = (mlPreviewTreadmill + 1) % 3;
+			if (mlPreviewTreadmill != 0)
+			{
+				mlPreviewClipIdx = -1; /* the real selector picks the clips */
+				mpPreviewGhost->DebugPlayClip("");
+			}
+			Log(" multiplayer: ghost preview treadmill: %s\n",
+				mlPreviewTreadmill == 0 ? "off" : (mlPreviewTreadmill == 1 ? "walk (1 m circle)" : "run (1 m circle)"));
+		}
+	}
+
+	/* Synthetic sender at the real send rate, through the real receive path:
+	   seq clock, interpolation delay, selector, gait scaling — all exercised. */
+	mfPreviewSendAccum += afTimeStep;
+	while (mfPreviewSendAccum >= kSendPeriodSeconds)
+	{
+		mfPreviewSendAccum -= kSendPeriodSeconds;
+
+		cVector3f vPos = mvPreviewCenter;
+		float fYaw = mfPreviewFacingYaw;
+		float fSpeed = 0.0f;
+		uint8_t lFlags = eNetPlayerFlag_OnGround;
+		uint8_t lMoveState = eNetMoveState_Walk;
+		if (mbPreviewCrouch)
+		{
+			lFlags |= eNetPlayerFlag_Crouch;
+			lMoveState = eNetMoveState_Crouch;
+		}
+		if (mlPreviewTreadmill != 0)
+		{
+			/* true player speeds from game.cfg via the player's own move
+			   states (Movement_Walk/Run/Crouch ForwardSpeed) */
+			const ePlayerMoveState eState = mbPreviewCrouch ? ePlayerMoveState_Crouch
+				: (mlPreviewTreadmill == 2 ? ePlayerMoveState_Run : ePlayerMoveState_Walk);
+			iPlayerMoveState *pMove = pPlayer->GetMoveStateData(eState);
+			fSpeed = pMove ? pMove->mfForwardSpeed : 0.0f;
+			if (fSpeed <= 0.05f)
+				fSpeed = mbPreviewCrouch ? 0.9f : (mlPreviewTreadmill == 2 ? 3.0f : 1.5f);
+			if (mlPreviewTreadmill == 2 && mbPreviewCrouch == false)
+			{
+				lFlags |= eNetPlayerFlag_RunKey;
+				lMoveState = eNetMoveState_Run;
+			}
+
+			const float kRadius = 1.0f;
+			mfPreviewCircleAngle += (fSpeed / kRadius) * kSendPeriodSeconds;
+			if (mfPreviewCircleAngle > 2.0f * kPif)
+				mfPreviewCircleAngle -= 2.0f * kPif;
+			const float a = mfPreviewCircleAngle;
+			vPos = mvPreviewCenter + cVector3f(cosf(a) * kRadius, 0.0f, sinf(a) * kRadius);
+			/* facing = direction of travel (the circle's tangent) in the
+			   camera yaw convention forward = (-sin y, 0, -cos y) */
+			const float fDx = -sinf(a), fDz = cosf(a);
+			fYaw = atan2f(-fDx, -fDz);
+		}
+
+		cNetPlayerState st;
+		memset(&st, 0, sizeof(st));
+		st.mType = eNetPacketType_PlayerState;
+		st.mPlayerID = kPreviewGhostId;
+		st.mSeq = ++mlPreviewSeq;
+		st.mfPosX = vPos.x;
+		st.mfPosY = vPos.y;
+		st.mfPosZ = vPos.z;
+		st.mfPitch = 0.0f;
+		st.mfYaw = fYaw;
+		st.mbFlashlightOn = 0;
+		st.mMoveState = lMoveState;
+		st.mVelFwd = EncodeNetVel(fSpeed);
+		st.mVelRight = 0;
+		st.mFlags = lFlags;
+		mpPreviewGhost->ApplyState(st);
+	}
+
+	mpPreviewGhost->Update(afTimeStep);
 }
 
 /** Same GetAdaptersInfo walk the discovery pinger does, but for HUMANS: the
@@ -2693,6 +3007,30 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 		Log(" multiplayer: discovery done — %u server(s)\n", (unsigned)mvDiscovered.size());
 		StopDiscovery();
 	}
+}
+
+//-----------------------------------------------------------------------
+// Enemy senses (host): appended accessor — see NetworkManager.h tail.
+//-----------------------------------------------------------------------
+
+bool cNetworkManager::GetGhostSense(uint8_t alId, hpl::cVector3f *apCamPos, uint8_t *apMoveState) const
+{
+	if (!mbHosting)
+		return false; /* only the host's AI has any business asking */
+	tGhostMap::const_iterator it = m_mapGhosts.find(alId);
+	if (it == m_mapGhosts.end() || !it->second)
+		return false; /* disconnected (DropRemotePlayer) / never joined */
+	cVector3f v;
+	if (!it->second->GetLastStatePos(&v))
+		return false; /* no state yet */
+	if (apCamPos)
+		*apCamPos = v;
+	if (apMoveState)
+	{
+		std::map<uint8_t, uint8_t>::const_iterator mi = m_mapGhostMoveState.find(alId);
+		*apMoveState = (mi != m_mapGhostMoveState.end()) ? mi->second : (uint8_t)eNetMoveState_Run;
+	}
+	return true;
 }
 
 #endif /* PENUMBRA_MULTIPLAYER */

@@ -27,7 +27,9 @@ struct cDiscoveredServer
 };
 
 //-----------------------------------------------------------------------
-/** ENet session: listen-server relay, non-authoritative pose @ ~20 Hz. */
+/** ENet session: listen-server relay. Player pose, host-authoritative bodies
+    and enemies stream at 30 Hz (kNetSendPeriodSeconds); remote players are
+    drawn as interpolated cGhostPlayer bodies. */
 class cNetworkManager
 {
 public:
@@ -201,6 +203,29 @@ private:
 	std::vector<float> mvGhostBodyYList;
 	std::vector<float> mvGhostBodyYCrouchList;
 
+	/** v11 ghost tuning from multiplayer.cfg (ghost_interp_ms, ghost_turn_rate,
+	    ghost_anim_trace, ghost_gait_*), copied into every ghost at creation. */
+	cGhostTuning mGhostTuning;
+
+	/** ghost_preview=1: a LOCAL ghost (id kPreviewGhostId, never in
+	    m_mapGhosts, never sent) stands 2 m ahead of the player and is fed
+	    synthetic states through the normal ApplyState/Update path, so clips,
+	    crossfades, gait scaling and interpolation can be eyeballed offline.
+	    F6/F7 cycle clips, F8 toggles crouch, F2 cycles the treadmill
+	    (off / walk / run in a circle). */
+	bool mbGhostPreview;
+	int mlGhostPreviewModel;      /**< ghost_preview_model: index into ghost_models */
+	cGhostPlayer *mpPreviewGhost;
+	uint16_t mlPreviewSeq;        /**< synthetic sender counter */
+	float mfPreviewSendAccum;     /**< synthetic states go out at kSendPeriodSeconds */
+	float mfPreviewSpawnDelay;    /**< seconds after a world change before spawning */
+	hpl::cVector3f mvPreviewCenter; /**< feet position 2 m ahead of the player at spawn */
+	float mfPreviewFacingYaw;     /**< faces the player (player yaw + pi) */
+	float mfPreviewCircleAngle;   /**< treadmill: angle on the 1 m circle */
+	int mlPreviewClipIdx;         /**< forced clip index into cGhostPlayer::GetClipName, -1 = automatic */
+	bool mbPreviewCrouch;
+	int mlPreviewTreadmill;       /**< 0 off, 1 walk, 2 run */
+
 	/** Browser results + window state (see StartDiscovery). */
 	std::vector<cDiscoveredServer> mvDiscovered;
 	bool mbDiscoveryActive;
@@ -220,6 +245,12 @@ private:
 	Impl *mpImpl;
 
 	void ClearGhostsInternal();
+	/** Ghost for a wire id using mesh list entry alMeshIdx (mod list size),
+	    offsets/eye heights from game.cfg + cfg overrides, shared tuning.
+	    NULL without a world. Caller owns the result. */
+	cGhostPlayer *CreateGhost(uint8_t alId, size_t alMeshIdx);
+	/** Delete the preview ghost (abOrphan = the world already died). */
+	void DestroyPreviewGhost(bool abOrphan);
 	bool BuildLocalSnapshot(cNetPlayerState *apOut) const;
 	void EmitLocalSnapshots();
 	void DispatchIncoming(const void *data, size_t len);
@@ -231,6 +262,11 @@ private:
 
 #ifdef PENUMBRA_MULTIPLAYER
 	void Service(int alTimeoutMs);
+	/** Per-frame ghost interpolation/animation (every ghost + the preview),
+	    after the last Service(0) so this tick's packets are in the buffers. */
+	void UpdateGhosts(float afTimeStep);
+	/** Preview spawn / keys / synthetic sender (ghost_preview=1). */
+	void UpdatePreviewGhost(float afTimeStep);
 	void OpenHostDiscovery();
 	void CloseHostDiscovery();
 	void SendDiscoveryPings();
@@ -247,6 +283,18 @@ private:
 	/** Both roles: our player holds this body -> force-release (snatched). */
 	void ForceReleaseIfHolding(uint32_t alHash);
 #endif
+
+	//---------------- enemy senses (host) — appended, impl at the file tail ----------------
+public:
+	/** Host AI: one ghost's LATEST wire camera position and eNetMoveState.
+	    false = no such connected ghost / no state yet / not hosting — the
+	    enemy code reads that as "gone". Either out pointer may be NULL. Used
+	    every frame by the focus accessors (live tracking between sight
+	    ticks), by the stealth approximation (crouch) and by the host-side
+	    ghost footstep triggers (hearing). */
+	bool GetGhostSense(uint8_t alId, hpl::cVector3f *apCamPos, uint8_t *apMoveState) const;
+private:
+	std::map<uint8_t, uint8_t> m_mapGhostMoveState; /**< host: last wire move state per ghost id */
 };
 //-----------------------------------------------------------------------
 /** Pumps cNetworkManager from the GLOBAL updater state, so hosting and

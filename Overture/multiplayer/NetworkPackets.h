@@ -1,9 +1,9 @@
 /*
- * Phase 1 — binary UDP payloads carried by ENet (same-endian peers; Windows x86 coop).
+ * Binary UDP payloads carried by ENet (same-endian peers; Windows x86 coop).
  *
  * Reliable vs unreliable: join/leave are tiny control messages worth sending reliably;
- * player pose is resent every tick (~20/sec) so unreliable is fine — a dropped packet is
- * replaced by the next one (no need for TCP-style ordering here).
+ * player pose is resent every tick (30/sec, kSendPeriodSeconds) so unreliable is fine —
+ * a dropped packet is replaced by the next one (no need for TCP-style ordering here).
  *
  * Discovery (types 5/6) does NOT travel over ENet: it is raw UDP broadcast on
  * kNetDiscoveryPort so browsers can find hosts without knowing any address.
@@ -24,8 +24,19 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
         snap the pose and ZERO motion, so sending them was pure bandwidth)
         + cNetBodyCensus. Both machines must rebuild.
     v4: rung 4 — map-generation byte in cNetObjectStateBatch + cNetBodyCensus
-        (packets from the previous map can no longer touch the new one). */
-static const uint16_t kNetProtocolVersion = 10;
+        (packets from the previous map can no longer touch the new one).
+    v11: cNetPlayerState carries the sender's body-local planar velocity and
+        an on-ground/crouch/run/jump flag byte, and mfPosY is the FEET height
+        (character body) instead of the head-bobbing camera Y — the ghost
+        animates from exact sender truth instead of inferring it 0.3-0.5 s
+        late from positions. */
+static const uint16_t kNetProtocolVersion = 11;
+
+/** Snapshot send period, every sender (cNetworkManager::kSendPeriodSeconds
+    is this value). The receiver uses cNetPlayerState::mSeq * this period as
+    the SENDER's clock for ghost interpolation, so it must be one constant
+    on both machines — it is protocol, not tuning. */
+static const float kNetSendPeriodSeconds = 1.0f / 30.0f;
 
 /** Well-known discovery port = default game port (7777) + 1.
  *
@@ -134,6 +145,22 @@ enum eNetMoveState : uint8_t
 	eNetMoveState_Crouch = 4,
 };
 
+/** v11: cNetPlayerState::mFlags bits. The stance/ground truth the sender
+    knows for free (iCharacterBody::IsOnGround, the move state and the state
+    a jump was entered FROM) — mMoveState alone lost the crouch during a
+    crouch-jump and never said whether the feet touch the floor. */
+enum eNetPlayerFlags : uint8_t
+{
+	eNetPlayerFlag_OnGround = 1, /* character body has ground contact */
+	eNetPlayerFlag_Crouch = 2,   /* crouched, ALSO while airborne from a crouch */
+	eNetPlayerFlag_RunKey = 4,   /* run move state (shift) */
+	eNetPlayerFlag_Jump = 8,     /* jump move state (jump key pressed) */
+};
+
+/** v11: cNetPlayerState::mVelFwd / mVelRight scale — int8 units of 1/40 m/s
+    (+-3.175 m/s covers Movement_Run ForwardSpeed with margin). */
+static const float kNetPlayerVelScale = 40.0f;
+
 #pragma pack(push, 1)
 struct cNetPlayerState
 {
@@ -144,11 +171,18 @@ struct cNetPlayerState
 	    newer one snaps the ghost backward and flips its measured movement
 	    direction 180 deg (the "impossible backpedal at 4.6 m/s" in the first
 	    live-session log). Receivers drop anything not newer. */
-	float mfPosX, mfPosY, mfPosZ;
+	float mfPosX, mfPosY, mfPosZ; /**< v11: mfPosY is the sender's FEET height
+	    (iCharacterBody::GetFeetPosition) — no head-bob, and the ghost mesh
+	    origin (at its feet) lands on it directly. X/Z stay the camera's. */
 	float mfPitch, mfYaw; /**< radians, FPS view (roll omitted on wire) */
 	uint8_t mbFlashlightOn;
 	uint8_t mMoveState; /**< eNetMoveState value (Walk/Run/Still/Jump/Crouch) —
-	                         drives the ghost's stance offset and clip choice */
+	                         kept for the stance Y-offset overrides; the ghost
+	                         animates from the v11 fields below */
+	int8_t mVelFwd;   /**< v11: planar body velocity along the view forward,
+	                       units 1/kNetPlayerVelScale m/s */
+	int8_t mVelRight; /**< v11: same along the view right */
+	uint8_t mFlags;   /**< v11: eNetPlayerFlags */
 };
 
 /** Server tells a joining peer their wire id (= eNetPacketType_PlayerJoin). */
@@ -412,7 +446,7 @@ struct cNetScriptEvent
 
 static_assert(sizeof(cNetPlayerJoin) == 2, "");
 static_assert(sizeof(cNetPlayerLeave) == 2, "");
-static_assert(sizeof(cNetPlayerState) == 26, ""); /* v7: +mSeq */
+static_assert(sizeof(cNetPlayerState) == 29, ""); /* v7: +mSeq; v11: +vel/flags */
 static_assert(sizeof(cNetDiscoveryPing) == 7, "");
 static_assert(sizeof(cNetDiscoveryPong) == 75, "");
 static_assert(sizeof(cNetObjectState) == 33, "");
