@@ -20,6 +20,7 @@
 #include "GameMessageHandler.h"
 
 #include "Init.h"
+#include "GameScripts.h" /* co-op: cNetScriptPlayerScope */
 #include "Player.h"
 #include "EffectHandler.h"
 #include "Inventory.h"
@@ -208,6 +209,7 @@ void cGameMessageHandler::ShowNext()
 			tString sCommand = msOverCallback + "()";
 			msOverCallback ="";
 
+			cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 			mpInit->RunScriptCommand(sCommand);
 		}
 		else

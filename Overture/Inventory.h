@@ -289,6 +289,7 @@ public:
 class cInventory  : public iUpdateable
 {
 friend class cSaveHandler;
+friend class cNetworkManager; /* co-op world snapshot: reads m_mapItems names */
 public:
 	cInventory(cInit *apInit);
 	~cInventory();

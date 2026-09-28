@@ -19,6 +19,7 @@
 #include "Inventory.h"
 
 #include "Init.h"
+#include "GameScripts.h" /* co-op: cNetScriptPlayerScope */
 #include "Player.h"
 #include "GameItem.h"
 #include "GameItemType.h"
@@ -1770,6 +1771,7 @@ void cInventory::CheckPickupCallback(const tString &asItem)
 	cInventoryPickupCallback *pCallback = it->second;
 
 	tString sCommand = pCallback->msFunction + "(\""+asItem+"\")";
+	cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 	mpInit->RunScriptCommand(sCommand);
 }
 
@@ -1796,6 +1798,7 @@ bool cInventory::CheckUseCallback(const tString &asItem, const tString &asObject
 
 	if(sCommand!="")
 	{
+		cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 		mpInit->RunScriptCommand(sCommand);
 		return true;
 	}
@@ -1832,6 +1835,7 @@ bool cInventory::CheckCombineCallback(const tString &asItem1,const tString &asIt
 
 		tString sCommand = pFinalCallback->msFunction + "(\""+asItem1+"\", \""+asItem2+"\", "+
 														cString::ToString(sString,"")+")";
+		cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 		mpInit->RunScriptCommand(sCommand);
 		return true;
 	}

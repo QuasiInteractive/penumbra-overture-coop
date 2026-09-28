@@ -20,6 +20,7 @@
 
 #include "PlayerHelper.h"
 #include "Init.h"
+#include "GameScripts.h" /* co-op: cNetScriptPlayerScope */
 #include "GameEntity.h"
 #include "MapHandler.h"
 #include "PlayerMoveStates.h"
@@ -1237,6 +1238,7 @@ void cPlayer::Update(float afTimeStep)
 					tString sCommand = GetCollideCommand(
 						pCallback->msFuncName[eGameCollideScriptType_During],
 						"Player", CollideIt->first);
+					cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 					mpInit->RunScriptCommand(sCommand);
 				}
 			}
@@ -1247,6 +1249,7 @@ void cPlayer::Update(float afTimeStep)
 					tString sCommand = GetCollideCommand(
 						pCallback->msFuncName[eGameCollideScriptType_Enter],
 						"Player", CollideIt->first);
+					cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 					mpInit->RunScriptCommand(sCommand);
 				}
 
@@ -1262,6 +1265,7 @@ void cPlayer::Update(float afTimeStep)
 					tString sCommand = GetCollideCommand(
 						pCallback->msFuncName[eGameCollideScriptType_Leave],
 						"Player", CollideIt->first);
+					cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 					mpInit->RunScriptCommand(sCommand);
 				}
 

@@ -90,6 +90,14 @@ public:
 	/** True once host+guest censuses compared equal for the current map. */
 	bool CensusMatched() const { return mbCensusMatched; }
 
+	/** v14 world snapshot: generation bookkeeping for the MapReady handshake
+	    and the snapshot/enemy-batch stale-map guards. */
+	uint8_t GetMapGen() const { return mlMapGen; }
+	bool HasRemoteCensus() const { return mbRemoteCensusKnown; }
+	uint8_t GetRemoteMapGen() const { return mlRemoteMapGen; }
+	/** Guest: is this the host generation we paired our census with? */
+	bool IsRemoteGen(uint8_t alGen) const { return mbRemoteMapGenKnown && alGen == mlRemoteMapGen; }
+
 	/** 1 Hz streamed/applied/bytes trace while anything flows. */
 	void LogStatsTick(float afTimeStep);
 

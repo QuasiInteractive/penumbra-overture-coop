@@ -12,7 +12,10 @@
 #include "GameEntity.h" /* iGameEntity for the one-of-each item sweep */
 #include "GameEnemy.h"   /* Phase 6: shared-enemy streaming */
 #include "CharacterMove.h"
-#include "GameScripts.h" /* v9: NetApplyScriptEvent */
+#include "GameScripts.h" /* v9: NetApplyScriptEvent; v14: gbNetScriptPlayerContext */
+#include "GameSwingDoor.h" /* v14 world snapshot: door locks */
+#include "GameLamp.h"      /* v14 world snapshot: lamp lit */
+#include "Inventory.h"     /* v14 world snapshot: party item names */
 
 /* v9: the engine's script-var writes fire this (see engine ScriptFuncs.cpp) */
 namespace hpl { extern void (*gpScriptVarNetCallback)(int alOp, const char* asName, int alVal); }
@@ -286,6 +289,12 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mvPartyEvents()
 	  , m_setJoinAnnounced()
 	  , mfSinceJoinSeconds(0)
+	  , mvSnapChunks()      /* v14: world snapshot */
+	  , mlSnapId(0)
+	  , mlSnapGen(0)
+	  , mbSnapBuffering(false)
+	  , mfSnapAge(0)
+	  , mlSnapIdOut(0)
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -753,6 +762,12 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mvPartyEvents()
 	  , m_setJoinAnnounced()
 	  , mfSinceJoinSeconds(0)
+	  , mvSnapChunks()      /* v14: world snapshot */
+	  , mlSnapId(0)
+	  , mlSnapGen(0)
+	  , mbSnapBuffering(false)
+	  , mfSnapAge(0)
+	  , mlSnapIdOut(0)
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -1353,8 +1368,27 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		{
 			cNetBodyCensus census;
 			memcpy(&census, data, sizeof(census));
+			const bool bNewGen = !mpBodySync->HasRemoteCensus() ||
+				mpBodySync->GetRemoteMapGen() != census.mMapGen;
 			mpBodySync->OnCensusReceived(census);
+			if (bNewGen)
+				mbEnemySeqInKnown = false; /* v14 (5c): host reloaded — its enemy seq restarted */
+			/* v14 hook 2: we already stand in a world (census taken) and the
+			   host just (re)announced its own — reconnect while in-game, or
+			   a host save/load on the same map. Ask for the world state. */
+			if (mpBodySync->HasCensus())
+				SendMapReady();
 		}
+		return;
+	}
+
+	if (t == eNetPacketType_MapReady)
+		return; /* v14: host-only, answered in Service (needs the peer) */
+
+	if (t == eNetPacketType_WorldSnapshot)
+	{
+		if (!mbHosting)
+			HandleSnapshotChunk(data, len);
 		return;
 	}
 
@@ -1496,6 +1530,24 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 			if (se.mOp == eNetScriptOp_RemoveItem)
 				m_setPartyItems.erase(tString(se.msName)); /* consumed for everyone */
 			NetApplyScriptEvent((int)se.mOp, tString(se.msName), (int)se.mlVal);
+			/* v14 (5b): the host is the single authority for Add ops — after
+			   applying a guest's delta, broadcast the absolute value so the
+			   author and every other guest land on the same number. */
+			if (mbHosting && mpInit && mpInit->mpGame &&
+				(se.mOp == eNetScriptOp_LocalVarAdd || se.mOp == eNetScriptOp_GlobalVarAdd))
+			{
+				cScene *pScene = mpInit->mpGame->GetScene();
+				cScriptVar *pVar = pScene ? ((se.mOp == eNetScriptOp_LocalVarAdd) ?
+					pScene->GetLocalVar(tString(se.msName)) : pScene->GetGlobalVar(tString(se.msName))) : NULL;
+				if (pVar)
+				{
+					cNetScriptEvent setPkt = se;
+					setPkt.mOp = (se.mOp == eNetScriptOp_LocalVarAdd) ?
+						(uint8_t)eNetScriptOp_LocalVarSet : (uint8_t)eNetScriptOp_GlobalVarSet;
+					setPkt.mlVal = (int32_t)pVar->mlVal;
+					SendReliableEvent(&setPkt, sizeof(setPkt));
+				}
+			}
 		}
 		return;
 	}
@@ -1704,25 +1756,9 @@ void cNetworkManager::Service(int timeoutMs)
 				SendMapBeacon(ev.peer); /* ...and where the party is, so a guest
 				    sitting in the menu launches straight into our map */
 				SendNameTable(ev.peer); /* v13: who is already here (listed silently) */
-				/* ...and one reliable full snapshot, so a mid-game joiner
-				   starts from the host's exact current poses instead of the
-				   map defaults (rung 2). Chunked to stay under MTU. */
-				{
-					unsigned char aSnapBuf[cBodySync::kMaxBatchBytes];
-					uint32_t lCursor = 0;
-					int lChunks = 0;
-					size_t lLen;
-					while ((lLen = mpBodySync->BuildSnapshotChunk(aSnapBuf, &lCursor)) != 0)
-					{
-						ENetPacket *sp = enet_packet_create(aSnapBuf, lLen, ENET_PACKET_FLAG_RELIABLE);
-						if (sp)
-							enet_peer_send(ev.peer, 0, sp);
-						++lChunks;
-					}
-					if (lChunks > 0)
-						Log(" multiplayer: full body snapshot -> peer id=%u (%d chunk(s))\n",
-							(unsigned)aid, lChunks);
-				}
+				/* v14: NO world/body snapshot here — the guest has no world yet
+				   (or a stale one). It asks with MapReady once its census is
+				   paired with ours, and SendWorldSnapshot answers. */
 				Log(" multiplayer: peer connected id=%u\n", (unsigned)aid);
 			}
 			else if (ev.peer == mpImpl->mpServerPeer)
@@ -1807,13 +1843,30 @@ void cNetworkManager::Service(int timeoutMs)
 					OnPlayerNameReceived(author, pn->msName, sizeof(pn->msName));
 					SendNameTable(NULL);
 				}
+				else if (author >= 2 && lFirst == eNetPacketType_MapReady)
+				{
+					/* v14: needs the peer to answer with the snapshot */
+					HandleMapReady(ev.peer, pk->data, (size_t)pk->dataLength);
+				}
 				else if (author >= 2 && (lFirst == eNetPacketType_MapChange ||
 					lFirst == eNetPacketType_ItemPickup ||
 					lFirst == eNetPacketType_ItemDrop ||
 					lFirst == eNetPacketType_ScriptEvent ||
 					lFirst == eNetPacketType_EntityDamage))
 				{
-					for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+					/* v14 (5b): a guest's var ADD is not relayed blindly — the
+					   host applies it and broadcasts the resulting absolute
+					   Set (DispatchIncoming), so every machine converges. */
+					bool bRelay = true;
+					if (lFirst == eNetPacketType_ScriptEvent &&
+						(size_t)pk->dataLength >= sizeof(cNetScriptEvent))
+					{
+						cNetScriptEvent peek;
+						memcpy(&peek, pk->data, sizeof(peek));
+						if (peek.mOp == eNetScriptOp_LocalVarAdd || peek.mOp == eNetScriptOp_GlobalVarAdd)
+							bRelay = false;
+					}
+					for (size_t i = 0; bRelay && i < mpImpl->mpHost->peerCount; ++i)
 					{
 						ENetPeer *dst = &mpImpl->mpHost->peers[i];
 						if (dst == ev.peer || dst->state != ENET_PEER_STATE_CONNECTED)
@@ -1964,6 +2017,11 @@ bool cNetworkManager::PartyHasItem(const hpl::tString &asName) const
 
 void cNetworkManager::NetOnScriptEvent(int alOp, const hpl::tString &asName, int alVal)
 {
+	/* v14 (5a): an item consumed by a script running HERE leaves the party
+	   set too (a friend's key we used) — before any early return, or a
+	   HasItem() gate stays open forever. Empty offline, so a no-op there. */
+	if (alOp == eNetScriptOp_RemoveItem)
+		m_setPartyItems.erase(asName);
 	if (gbNetScriptApplying)
 		return; /* this mutation IS a replication — do not echo it */
 	if (!mpImpl || !mpImpl->mpHost)
@@ -1976,6 +2034,31 @@ void cNetworkManager::NetOnScriptEvent(int alOp, const hpl::tString &asName, int
 	pkt.mOp = (uint8_t)alOp;
 	strncpy(pkt.msName, asName.c_str(), sizeof(pkt.msName) - 1);
 	pkt.mlVal = alVal;
+
+	/* v14 (5b): Add ops. Both machines run the same symmetric scripts
+	   (OnStart/OnLoad/OnUpdate/timers), so relaying every local +1 doubled
+	   the counter. The HOST is the authority: it broadcasts the absolute
+	   value (a Set) instead of the delta. A GUEST applied its +1 locally
+	   already; it forwards the delta only when the script ran because of
+	   something only it did (player context) — for a symmetric script the
+	   host runs the same code and its Set arrives shortly. */
+	if (alOp == eNetScriptOp_LocalVarAdd || alOp == eNetScriptOp_GlobalVarAdd)
+	{
+		if (mbHosting)
+		{
+			cScene *pScene = (mpInit && mpInit->mpGame) ? mpInit->mpGame->GetScene() : NULL;
+			cScriptVar *pVar = pScene ? ((alOp == eNetScriptOp_LocalVarAdd) ?
+				pScene->GetLocalVar(asName) : pScene->GetGlobalVar(asName)) : NULL;
+			if (pVar) /* the engine fires the callback AFTER the add (v14) */
+			{
+				pkt.mOp = (alOp == eNetScriptOp_LocalVarAdd) ?
+					(uint8_t)eNetScriptOp_LocalVarSet : (uint8_t)eNetScriptOp_GlobalVarSet;
+				pkt.mlVal = (int32_t)pVar->mlVal;
+			}
+		}
+		else if (!gbNetScriptPlayerContext)
+			return; /* symmetric script: the host's Set(abs) is on its way */
+	}
 	SendReliableEvent(&pkt, sizeof(pkt));
 }
 
@@ -2045,55 +2128,76 @@ void cNetworkManager::NetOnEnemyDamaged(const hpl::tString &asName, float afDama
 /** Host, at the send tick: every enemy's pose + vitals + commanded clip.
     Whole roster each tick — Penumbra maps carry a handful of enemies, so a
     full batch is ~30 B each and always under MTU. */
+/** One enemy's wire state (the roster stream and the v14 snapshot share
+    it). False = no character body yet, nothing to say. */
+static bool FillEnemyState(iGameEnemy *apEnemy, cNetEnemyState *apOut)
+{
+	if (apEnemy == NULL || apOut == NULL || apEnemy->GetMover() == NULL)
+		return false;
+	iCharacterBody *pBody = apEnemy->GetMover()->GetCharBody();
+	if (pBody == NULL)
+		return false;
+	apOut->mlNameHash = NetHashName(apEnemy->GetName().c_str());
+	const cVector3f v = pBody->GetFeetPosition();
+	apOut->mfPosX = v.x; apOut->mfPosY = v.y; apOut->mfPosZ = v.z;
+	apOut->mfYaw = pBody->GetYaw();
+	apOut->mfHealth = apEnemy->GetHealth();
+	apOut->mlAnimHash = apEnemy->GetNetAnimHash();
+	apOut->mFlags = (uint8_t)((apEnemy->GetNetAnimLoop() ? 1 : 0) |
+		(apEnemy->IsActive() ? 2 : 0));
+	return true;
+}
+
 void cNetworkManager::EmitEnemyStates()
 {
 	if (!mbHosting || !mpImpl || !mpImpl->mpHost || !mpInit || !mpInit->mpMapHandler)
 		return;
 
-	unsigned char aBuf[sizeof(cNetEnemyBatch) + 8 * sizeof(cNetEnemyState)];
+	/* v14 (5c): the roster is streamed in chunks of kMaxEnemiesPerBatch —
+	   the old fixed 8-entry buffer silently left enemy 9+ un-puppeted
+	   (running LOCAL AI on the guest). Each chunk carries its own seq; the
+	   guest only drops a chunk that is older than the newest it applied. */
+	unsigned char aBuf[sizeof(cNetEnemyBatch) + kMaxEnemiesPerBatch * sizeof(cNetEnemyState)];
 	int lCount = 0;
 	tGameEnemyIterator it = mpInit->mpMapHandler->GetGameEnemyIterator();
-	while (it.HasNext() && lCount < 8)
+	for (;;)
 	{
-		iGameEnemy *pEnemy = it.Next();
-		if (pEnemy == NULL || pEnemy->GetMover() == NULL)
-			continue;
-		iCharacterBody *pBody = pEnemy->GetMover()->GetCharBody();
-		if (pBody == NULL)
-			continue;
+		iGameEnemy *pEnemy = it.HasNext() ? it.Next() : NULL;
+		if (pEnemy)
+		{
+			cNetEnemyState st;
+			if (FillEnemyState(pEnemy, &st))
+			{
+				memcpy(aBuf + sizeof(cNetEnemyBatch) + (size_t)lCount * sizeof(cNetEnemyState),
+					&st, sizeof(st));
+				++lCount;
+			}
+		}
 
-		cNetEnemyState st;
-		st.mlNameHash = NetHashName(pEnemy->GetName().c_str());
-		const cVector3f v = pBody->GetFeetPosition();
-		st.mfPosX = v.x; st.mfPosY = v.y; st.mfPosZ = v.z;
-		st.mfYaw = pBody->GetYaw();
-		st.mfHealth = pEnemy->GetHealth();
-		st.mlAnimHash = pEnemy->GetNetAnimHash();
-		st.mFlags = (uint8_t)((pEnemy->GetNetAnimLoop() ? 1 : 0) |
-			(pEnemy->IsActive() ? 2 : 0));
-		memcpy(aBuf + sizeof(cNetEnemyBatch) + (size_t)lCount * sizeof(cNetEnemyState),
-			&st, sizeof(st));
-		++lCount;
-	}
-	if (lCount == 0)
-		return;
+		const bool bLast = !it.HasNext();
+		if (lCount > 0 && (lCount >= (int)kMaxEnemiesPerBatch || bLast))
+		{
+			cNetEnemyBatch hdr;
+			hdr.mType = eNetPacketType_EnemyState;
+			hdr.mCount = (uint8_t)lCount;
+			hdr.mMapGen = mpBodySync->GetMapGen(); /* v14: stale-map guard, was 0 */
+			hdr.mSeq = ++mlEnemySeqOut;
+			memcpy(aBuf, &hdr, sizeof(hdr));
+			const size_t lLen = sizeof(hdr) + (size_t)lCount * sizeof(cNetEnemyState);
 
-	cNetEnemyBatch hdr;
-	hdr.mType = eNetPacketType_EnemyState;
-	hdr.mCount = (uint8_t)lCount;
-	hdr.mMapGen = 0; /* reserved — unknown hashes are already inert */
-	hdr.mSeq = ++mlEnemySeqOut;
-	memcpy(aBuf, &hdr, sizeof(hdr));
-	const size_t lLen = sizeof(hdr) + (size_t)lCount * sizeof(cNetEnemyState);
-
-	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
-	{
-		ENetPeer *pd = &mpImpl->mpHost->peers[i];
-		if (pd->state != ENET_PEER_STATE_CONNECTED)
-			continue;
-		ENetPacket *pkt = enet_packet_create(aBuf, lLen, ENET_PACKET_FLAG_UNSEQUENCED);
-		if (pkt)
-			enet_peer_send(pd, 1, pkt);
+			for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+			{
+				ENetPeer *pd = &mpImpl->mpHost->peers[i];
+				if (pd->state != ENET_PEER_STATE_CONNECTED)
+					continue;
+				ENetPacket *pkt = enet_packet_create(aBuf, lLen, ENET_PACKET_FLAG_UNSEQUENCED);
+				if (pkt)
+					enet_peer_send(pd, 1, pkt);
+			}
+			lCount = 0;
+		}
+		if (bLast)
+			break;
 	}
 }
 
@@ -2106,6 +2210,11 @@ void cNetworkManager::ApplyEnemyBatch(const void *apData, size_t alLen)
 	if (!apData || alLen < sizeof(cNetEnemyBatch))
 		return;
 	const cNetEnemyBatch *pHdr = (const cNetEnemyBatch *)apData;
+	/* v14 (5c): a batch from a generation we did not pair with (in flight
+	   across a level change, or the host's previous load) must not touch
+	   these enemies — same guard as the body batches. */
+	if (!mpBodySync->IsRemoteGen(pHdr->mMapGen))
+		return;
 	if (mbEnemySeqInKnown && (int16_t)(pHdr->mSeq - mlEnemySeqIn) <= 0)
 		return; /* reordered stale batch */
 	mlEnemySeqIn = pHdr->mSeq;
@@ -2119,22 +2228,26 @@ void cNetworkManager::ApplyEnemyBatch(const void *apData, size_t alLen)
 		lCount = lWhole;
 	const unsigned char *pRaw = (const unsigned char *)apData;
 
+	/* v14 (5c): one hash -> enemy index per batch instead of a roster scan
+	   per entry (40 entries x N enemies at 30 Hz added up). */
+	std::map<uint32_t, iGameEnemy *> mapEnemies;
+	{
+		tGameEnemyIterator eit = mpInit->mpMapHandler->GetGameEnemyIterator();
+		while (eit.HasNext())
+		{
+			iGameEnemy *pE = eit.Next();
+			if (pE)
+				mapEnemies.insert(std::make_pair(NetHashName(pE->GetName().c_str()), pE));
+		}
+	}
+
 	for (size_t i = 0; i < lCount; ++i)
 	{
 		cNetEnemyState st;
 		memcpy(&st, pRaw + sizeof(cNetEnemyBatch) + i * sizeof(cNetEnemyState), sizeof(st));
 
-		iGameEnemy *pEnemy = NULL;
-		tGameEnemyIterator eit = mpInit->mpMapHandler->GetGameEnemyIterator();
-		while (eit.HasNext())
-		{
-			iGameEnemy *pE = eit.Next();
-			if (pE && NetHashName(pE->GetName().c_str()) == st.mlNameHash)
-			{
-				pEnemy = pE;
-				break;
-			}
-		}
+		std::map<uint32_t, iGameEnemy *>::iterator ei = mapEnemies.find(st.mlNameHash);
+		iGameEnemy *pEnemy = (ei != mapEnemies.end()) ? ei->second : NULL;
 		if (pEnemy == NULL)
 			continue; /* different map or a despawned enemy */
 		if (pEnemy->GetHealth() <= 0)
@@ -2142,7 +2255,11 @@ void cNetworkManager::ApplyEnemyBatch(const void *apData, size_t alLen)
 
 		if (st.mfHealth <= 0)
 		{
-			/* host says it died: run the LOCAL death for ragdoll/sounds */
+			/* host says it died: run the LOCAL death for ragdoll/sounds —
+			   but never its death SCRIPT (v14 5b): the host ran that, and
+			   its effects arrive as script events; running it here too
+			   doubled every AddLocalVar in a kill-counter puzzle. */
+			pEnemy->SetOnDeathCallback("");
 			pEnemy->SetNetPuppet(false);
 			pEnemy->Damage(100000.0f, 100);
 			continue;
@@ -2214,6 +2331,10 @@ void cNetworkManager::NetOnItemPicked(const hpl::tString &asEntityName)
 	pkt.mlQualHash = QualifiedItemHash(asEntityName);
 	strncpy(pkt.msItemName, asEntityName.c_str(), sizeof(pkt.msItemName) - 1);
 	SendReliableEvent(&pkt, sizeof(pkt));
+	/* v14 (5a): our OWN picks belong in the taken set too — it is what the
+	   world snapshot serialises for a joiner (only received pickups were
+	   recorded before). The entity is being destroyed here anyway. */
+	m_setTakenItems.insert(pkt.mlQualHash);
 }
 
 void cNetworkManager::NetOnItemDropped(const hpl::tString &asName, const hpl::tString &asFile,
@@ -2495,6 +2616,11 @@ void cNetworkManager::Update(float afTimeStep)
 		DestroyPreviewGhost(true); /* same dead world; respawns after a short delay */
 		mfPreviewSpawnDelay = 0.75f;
 		mpWorld = w;
+		/* v14: the new world pairs afresh — accept the next enemy batch
+		   regardless of seq, and forget a snapshot meant for the old world
+		   (our next MapReady requests a new one). */
+		mbEnemySeqInKnown = false;
+		ResetSnapshotBuffer();
 	}
 
 	/* Phase 5: cBodySync tracks the world itself (per-world state dies with
@@ -2515,6 +2641,26 @@ void cNetworkManager::Update(float afTimeStep)
 		   fade-in shows them. */
 		mbLocalMapChangeArmed = false;
 		ApplyTakenItems();
+		/* v14 hook 1: our census for a NEW world is in and the host's is
+		   already known (menu launch via beacon, a followed MapChange, our
+		   own save reload) — ask the host for this world's state. Runs one
+		   frame after the load, i.e. after OnStart/OnLoad/PreUpdate, which
+		   is exactly what the host's state must overwrite. */
+		if (!mbHosting && mpBodySync->HasRemoteCensus())
+			SendMapReady();
+	}
+
+	/* v14: a snapshot whose End never comes (host died mid-send) must not
+	   sit in memory forever, nor apply minutes later. */
+	if (mbSnapBuffering)
+	{
+		mfSnapAge += afTimeStep;
+		if (mfSnapAge > 10.0f)
+		{
+			Log(" multiplayer: world snapshot id=%u timed out (%u chunk(s) buffered) - dropped\n",
+				(unsigned)mlSnapId, (unsigned)mvSnapChunks.size());
+			ResetSnapshotBuffer();
+		}
 	}
 
 	/* Rung 3: drive the guests' grab springs in the authoritative sim. */
@@ -3188,6 +3334,810 @@ bool cNetworkManager::IsSessionLive() const
 	if (mbHosting)
 		return GetConnectedGuestCount() > 0;
 	return mbClientConnected && mbHadJoinPacket;
+}
+
+//-----------------------------------------------------------------------
+// v14 world snapshot (late join / reconnect / host save+load): appended —
+// see NetworkManager.h tail and multiplayer/README.md "World snapshot".
+//-----------------------------------------------------------------------
+
+namespace
+{
+/** RAII: gbNetScriptApplying for the whole apply, restored on every path
+    (the script hooks, NetOnScriptEvent, NetOnEntityDamaged and the engine
+    var callback all go silent, so nothing we set echoes back to the host). */
+struct cNetApplyScope
+{
+	bool mbPrev;
+	cNetApplyScope() : mbPrev(gbNetScriptApplying) { gbNetScriptApplying = true; }
+	~cNetApplyScope() { gbNetScriptApplying = mbPrev; }
+private:
+	cNetApplyScope(const cNetApplyScope &);
+	cNetApplyScope &operator=(const cNetApplyScope &);
+};
+
+/** MapReady identity: lowercase, extension-stripped map name (the same
+    normalisation QualifiedItemHash uses). */
+static uint32_t SnapMapNameHash(const tString &asMap)
+{
+	return NetHashName(cString::ToLowerCase(cString::SetFileExt(asMap, "")).c_str());
+}
+
+/** Host-side chunk writer. Entries of ONE section are appended and split
+    into chunks of at most kNetSnapMaxChunkPayload payload bytes; every
+    section yields at least one chunk (mCount may be 0) so the receiver can
+    tell "the host has none" from "the section never arrived". */
+class cSnapWriter
+{
+public:
+	cSnapWriter(uint8_t alGen, uint8_t alId)
+		: mlGen(alGen), mlId(alId), mlSection(0), mbOpen(false), mlCount(0) {}
+
+	void Begin(uint8_t alSection)
+	{
+		Flush();
+		mlSection = alSection;
+		mbOpen = true;
+		mlCount = 0;
+		mvCur.clear();
+	}
+
+	void Add(const void *apEntry, size_t alSize)
+	{
+		if (!mbOpen || apEntry == NULL || alSize == 0 || alSize > kNetSnapMaxChunkPayload)
+			return;
+		if (mlCount > 0 && mvCur.size() + alSize > (size_t)kNetSnapMaxChunkPayload)
+		{
+			const uint8_t lSection = mlSection;
+			Flush();
+			mlSection = lSection;
+			mbOpen = true;
+		}
+		const unsigned char *p = (const unsigned char *)apEntry;
+		mvCur.insert(mvCur.end(), p, p + alSize);
+		++mlCount;
+	}
+
+	void Flush()
+	{
+		if (!mbOpen)
+			return;
+		cNetSnapshotHdr hdr;
+		hdr.mType = eNetPacketType_WorldSnapshot;
+		hdr.mSection = mlSection;
+		hdr.mMapGen = mlGen;
+		hdr.mSnapId = mlId;
+		hdr.mCount = (uint16_t)mlCount; /* <= 300 per chunk (4 B entries) */
+		std::vector<uint8_t> chunk(sizeof(hdr) + mvCur.size());
+		memcpy(&chunk[0], &hdr, sizeof(hdr));
+		if (!mvCur.empty())
+			memcpy(&chunk[sizeof(hdr)], &mvCur[0], mvCur.size());
+		mvChunks.push_back(chunk);
+		mvCur.clear();
+		mlCount = 0;
+		mbOpen = false;
+	}
+
+	std::vector<std::vector<uint8_t> > mvChunks;
+
+private:
+	uint8_t mlGen, mlId, mlSection;
+	bool mbOpen;
+	size_t mlCount;
+	std::vector<uint8_t> mvCur;
+};
+
+/** Guest side: header + whole entries of one buffered chunk. Returns the
+    entry count actually present (mCount clamped to what the packet holds). */
+static size_t SnapChunkEntries(const std::vector<uint8_t> &avChunk, size_t alEntrySize,
+	cNetSnapshotHdr *apHdr, const unsigned char **appFirst)
+{
+	if (avChunk.size() < sizeof(cNetSnapshotHdr) || alEntrySize == 0)
+		return 0;
+	memcpy(apHdr, &avChunk[0], sizeof(cNetSnapshotHdr));
+	*appFirst = &avChunk[0] + sizeof(cNetSnapshotHdr);
+	size_t lCount = apHdr->mCount;
+	const size_t lWhole = (avChunk.size() - sizeof(cNetSnapshotHdr)) / alEntrySize;
+	if (lCount > lWhole)
+		lCount = lWhole; /* truncated / corrupt length: whole entries only */
+	return lCount;
+}
+
+/** Wire floats are untrusted: NaN/inf must never reach a body or a health. */
+static bool SnapFinite(float afX)
+{
+	return afX == afX && afX <= 3.0e38f && afX >= -3.0e38f;
+}
+
+/** Entity types gameplay DESTROYS (picked items, broken objects): absent on
+    the host = gone for the party. Areas/links/ladders are never destroyed
+    by gameplay, so their absence means a map mismatch, not state. */
+static bool SnapTypeIsDestroyable(eGameEntityType aType)
+{
+	return aType == eGameEntityType_Item || aType == eGameEntityType_Object ||
+		aType == eGameEntityType_SwingDoor || aType == eGameEntityType_Door ||
+		aType == eGameEntityType_DoorPanel || aType == eGameEntityType_Lamp;
+}
+} // namespace
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::ResetSnapshotBuffer()
+{
+	mvSnapChunks.clear();
+	mbSnapBuffering = false;
+	mfSnapAge = 0;
+	mlSnapId = 0;
+	mlSnapGen = 0;
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::SendMapReady()
+{
+	if (mbHosting || !mpImpl || !mpImpl->mpHost || !mpImpl->mpServerPeer ||
+		mpImpl->mpServerPeer->state != ENET_PEER_STATE_CONNECTED)
+		return;
+	if (!mpBodySync->HasCensus() || !mpBodySync->HasRemoteCensus())
+		return; /* paired = both censuses known for OUR current world */
+	if (!mpInit || !mpInit->mpMapHandler)
+		return;
+	const tString sMap = mpInit->mpMapHandler->GetCurrentMapName();
+	if (sMap.empty())
+		return; /* menu: no world to be ready in */
+
+	cNetBodyCensus mine;
+	mpBodySync->BuildCensusPacket(&mine);
+
+	cNetMapReady pkt;
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.mType = eNetPacketType_MapReady;
+	pkt.mMapGen = mpBodySync->GetRemoteMapGen();
+	pkt.mlMapNameHash = SnapMapNameHash(sMap);
+	pkt.mlLocalBodyCount = mine.mlBodyCount;
+	pkt.mlLocalChecksum = mine.mlChecksum;
+	SendStructToPeer(mpImpl->mpServerPeer, &pkt, sizeof(pkt), true);
+	Log(" multiplayer: MapReady sent gen=%u map '%s' (census %u/0x%08X)\n",
+		(unsigned)pkt.mMapGen, sMap.c_str(), (unsigned)mine.mlBodyCount, mine.mlChecksum);
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::HandleMapReady(ENetPeer *apPeer, const void *apData, size_t alLen)
+{
+	if (!mbHosting || !apPeer || !apData || alLen < sizeof(cNetMapReady))
+		return;
+	cNetMapReady mr;
+	memcpy(&mr, apData, sizeof(mr));
+	const unsigned lGuest = (unsigned)PeerGetId(apPeer);
+
+	if (mr.mMapGen != mpBodySync->GetMapGen())
+	{
+		/* paired with a world we already left (our reload/transition): the
+		   census for the new one is on its way; it will ask again */
+		Log(" multiplayer: guest %u ready on STALE gen %u (ours %u) - ignored\n",
+			lGuest, (unsigned)mr.mMapGen, (unsigned)mpBodySync->GetMapGen());
+		return;
+	}
+	if (!mpInit || !mpInit->mpMapHandler || !mpInit->mpGame)
+		return;
+	const tString sMap = mpInit->mpMapHandler->GetCurrentMapName();
+	if (sMap.empty() || mr.mlMapNameHash != SnapMapNameHash(sMap))
+	{
+		/* standing on another map: the beacon already told it where to go;
+		   it sends MapReady again once it has followed */
+		Log(" multiplayer: guest %u ready on another map (hash 0x%08X, ours '%s') - no snapshot\n",
+			lGuest, (unsigned)mr.mlMapNameHash, sMap.c_str());
+		return;
+	}
+	if (mpInit->mpGame->GetScene() == NULL || mpInit->mpGame->GetScene()->GetWorld3D() == NULL ||
+		!mpBodySync->HasCensus())
+		return;
+
+	cNetBodyCensus mine;
+	mpBodySync->BuildCensusPacket(&mine);
+	Log(" multiplayer: guest %u ready on gen %u (census %u/0x%08X vs ours %u/0x%08X)\n",
+		lGuest, (unsigned)mr.mMapGen, (unsigned)mr.mlLocalBodyCount, mr.mlLocalChecksum,
+		(unsigned)mine.mlBodyCount, mine.mlChecksum);
+	SendWorldSnapshot(apPeer);
+}
+
+//-----------------------------------------------------------------------
+
+int cNetworkManager::SendBodySnapshot(ENetPeer *apPeer, size_t *apBytesOut)
+{
+	if (!mbHosting || !apPeer || apPeer->state != ENET_PEER_STATE_CONNECTED)
+		return 0;
+	/* Every replicable body, resting ones flagged Sleeping (the guest pins
+	   those and disables the twin); primes m_mapSent so the delta path does
+	   not resend what this just carried. Reliable ch0: ordered with the
+	   snapshot sections around it. */
+	unsigned char aSnapBuf[cBodySync::kMaxBatchBytes];
+	uint32_t lCursor = 0;
+	int lChunks = 0;
+	size_t lLen;
+	while ((lLen = mpBodySync->BuildSnapshotChunk(aSnapBuf, &lCursor)) != 0)
+	{
+		SendStructToPeer(apPeer, aSnapBuf, lLen, true);
+		++lChunks;
+		if (apBytesOut)
+			*apBytesOut += lLen;
+	}
+	return lChunks;
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::SendWorldSnapshot(ENetPeer *apPeer)
+{
+	if (!mbHosting || !apPeer || apPeer->state != ENET_PEER_STATE_CONNECTED)
+		return;
+	if (!mpInit || !mpInit->mpMapHandler || !mpInit->mpGame)
+		return;
+	cScene *pScene = mpInit->mpGame->GetScene();
+	if (pScene == NULL || pScene->GetWorld3D() == NULL)
+		return;
+
+	const uint8_t lGen = mpBodySync->GetMapGen();
+	const uint8_t lId = ++mlSnapIdOut;
+	cSnapWriter w(lGen, lId);
+	int lVarsL = 0, lVarsG = 0, lEnts = 0, lTaken = 0, lParty = 0, lEnemies = 0, lTimers = 0, lSkipped = 0;
+
+	/* a. script vars — local, then global. The scene keys them lowercase;
+	   msName keeps the script's spelling (what CreateLocalVar wants back). */
+	for (int lPass = 0; lPass < 2; ++lPass)
+	{
+		w.Begin(lPass == 0 ? (uint8_t)eNetSnap_LocalVar : (uint8_t)eNetSnap_GlobalVar);
+		tScriptVarMap *pMap = lPass == 0 ? pScene->GetLocalVarMap() : pScene->GetGlobalVarMap();
+		if (pMap == NULL)
+			continue;
+		for (tScriptVarMapIt it = pMap->begin(); it != pMap->end(); ++it)
+		{
+			const tString &sName = it->second.msName.empty() ? it->first : it->second.msName;
+			if (sName.empty())
+				continue;
+			if (sName.size() >= sizeof(cNetSnapVar().msName))
+			{
+				Log(" multiplayer: snapshot: var name '%s' too long - skipped\n", sName.c_str());
+				++lSkipped;
+				continue;
+			}
+			cNetSnapVar e;
+			memset(&e, 0, sizeof(e));
+			strncpy(e.msName, sName.c_str(), sizeof(e.msName) - 1);
+			e.mlVal = (int32_t)it->second.mlVal;
+			w.Add(&e, sizeof(e));
+			if (lPass == 0) ++lVarsL; else ++lVarsG;
+		}
+	}
+
+	/* b/c/g1. every non-enemy game entity: presence, active, lock, lit,
+	   health. Unqualified name hash (the generation scopes the map);
+	   duplicate names (a multimap) keep the first, like the body index. */
+	{
+		w.Begin(eNetSnap_Entity);
+		std::set<uint32_t> setSeen;
+		tGameEntityIterator it = mpInit->mpMapHandler->GetGameEntityIterator();
+		while (it.HasNext())
+		{
+			iGameEntity *pEnt = it.Next();
+			if (pEnt == NULL || pEnt->GetType() == eGameEntityType_Enemy || pEnt->GetName().empty())
+				continue;
+			const uint32_t lHash = NetHashName(pEnt->GetName().c_str());
+			if (!setSeen.insert(lHash).second)
+			{
+				Log(" multiplayer: snapshot: duplicate entity name '%s' - second skipped\n",
+					pEnt->GetName().c_str());
+				++lSkipped;
+				continue;
+			}
+			cNetSnapEntity e;
+			memset(&e, 0, sizeof(e));
+			e.mlNameHash = lHash;
+			e.mType = (uint8_t)pEnt->GetType();
+			e.mFlags = pEnt->IsActive() ? kNetSnapEntityFlag_Active : 0;
+			if (pEnt->GetType() == eGameEntityType_SwingDoor &&
+				static_cast<cGameSwingDoor *>(pEnt)->IsLocked())
+				e.mFlags |= kNetSnapEntityFlag_Locked;
+			if (pEnt->GetType() == eGameEntityType_Lamp &&
+				static_cast<cGameLamp *>(pEnt)->IsLit())
+				e.mFlags |= kNetSnapEntityFlag_Lit;
+			e.mfHealth = pEnt->GetHealth();
+			w.Add(&e, sizeof(e));
+			++lEnts;
+		}
+	}
+
+	/* d. taken items (whole session, qualified map:name hashes — after 5a
+	   our own picks are in here too) and the party inventory (our items +
+	   what the other guests told us they hold). */
+	{
+		w.Begin(eNetSnap_TakenItem);
+		for (std::set<uint32_t>::const_iterator it = m_setTakenItems.begin(); it != m_setTakenItems.end(); ++it)
+		{
+			const uint32_t lHash = *it;
+			w.Add(&lHash, sizeof(lHash));
+			++lTaken;
+		}
+
+		w.Begin(eNetSnap_PartyItem);
+		std::set<tString> setParty(m_setPartyItems);
+		if (mpInit->mpInventory)
+		{
+			for (tInventoryItemMapIt it = mpInit->mpInventory->m_mapItems.begin();
+				it != mpInit->mpInventory->m_mapItems.end(); ++it)
+			{
+				if (it->second)
+					setParty.insert(it->second->GetName());
+			}
+		}
+		for (std::set<tString>::const_iterator it = setParty.begin(); it != setParty.end(); ++it)
+		{
+			char aName[32];
+			if (it->empty())
+				continue;
+			if (it->size() >= sizeof(aName))
+			{
+				Log(" multiplayer: snapshot: item name '%s' too long - skipped\n", it->c_str());
+				++lSkipped;
+				continue;
+			}
+			memset(aName, 0, sizeof(aName));
+			strncpy(aName, it->c_str(), sizeof(aName) - 1);
+			w.Add(aName, sizeof(aName));
+			++lParty;
+		}
+	}
+
+	/* f. enemy roster: the same entries the stream carries. */
+	{
+		w.Begin(eNetSnap_Enemy);
+		tGameEnemyIterator it = mpInit->mpMapHandler->GetGameEnemyIterator();
+		while (it.HasNext())
+		{
+			cNetEnemyState st;
+			if (!FillEnemyState(it.Next(), &st))
+				continue;
+			w.Add(&st, sizeof(st));
+			++lEnemies;
+		}
+	}
+
+	/* g2. LOCAL timers (global ones outlive the map and are not its state). */
+	{
+		w.Begin(eNetSnap_Timer);
+		for (tGameTimerListIt it = mpInit->mpMapHandler->mlstTimers.begin();
+			it != mpInit->mpMapHandler->mlstTimers.end(); ++it)
+		{
+			cGameTimer *pTimer = *it;
+			if (pTimer == NULL || pTimer->mbGlobal || pTimer->mbDeleteMe)
+				continue;
+			if (pTimer->msName.empty() ||
+				pTimer->msName.size() >= sizeof(cNetSnapTimer().msName) ||
+				pTimer->msCallback.size() >= sizeof(cNetSnapTimer().msCallback))
+			{
+				Log(" multiplayer: snapshot: timer '%s' name/callback too long - skipped\n",
+					pTimer->msName.c_str());
+				++lSkipped;
+				continue;
+			}
+			cNetSnapTimer e;
+			memset(&e, 0, sizeof(e));
+			strncpy(e.msName, pTimer->msName.c_str(), sizeof(e.msName) - 1);
+			strncpy(e.msCallback, pTimer->msCallback.c_str(), sizeof(e.msCallback) - 1);
+			e.mfTime = pTimer->mfTime;
+			e.mbPaused = pTimer->mbPaused ? 1 : 0;
+			w.Add(&e, sizeof(e));
+			++lTimers;
+		}
+		w.Flush();
+	}
+
+	/* Send: Begin, the section chunks, the body poses (ObjectState chunks,
+	   same reliable channel = same order), End. */
+	size_t lBytes = 0;
+	cNetSnapshotHdr hdr;
+	hdr.mType = eNetPacketType_WorldSnapshot;
+	hdr.mSection = eNetSnap_Begin;
+	hdr.mMapGen = lGen;
+	hdr.mSnapId = lId;
+	hdr.mCount = (uint16_t)(w.mvChunks.size() > 65535 ? 65535 : w.mvChunks.size());
+	SendStructToPeer(apPeer, &hdr, sizeof(hdr), true);
+	lBytes += sizeof(hdr);
+
+	for (size_t i = 0; i < w.mvChunks.size(); ++i)
+	{
+		SendStructToPeer(apPeer, &w.mvChunks[i][0], w.mvChunks[i].size(), true);
+		lBytes += w.mvChunks[i].size();
+	}
+
+	const int lBodyChunks = SendBodySnapshot(apPeer, &lBytes);
+
+	hdr.mSection = eNetSnap_End;
+	hdr.mCount = (uint16_t)(lBodyChunks > 65535 ? 65535 : lBodyChunks);
+	SendStructToPeer(apPeer, &hdr, sizeof(hdr), true);
+	lBytes += sizeof(hdr);
+
+	Log(" multiplayer: world snapshot -> peer %u: %u chunks, %u bytes (id=%u gen=%u; vars %d/%d, entities %d, taken %d, party %d, enemies %d, timers %d, bodies %d chunks, skipped %d)\n",
+		(unsigned)PeerGetId(apPeer), (unsigned)(w.mvChunks.size() + (size_t)lBodyChunks + 2),
+		(unsigned)lBytes, (unsigned)lId, (unsigned)lGen, lVarsL, lVarsG, lEnts, lTaken, lParty,
+		lEnemies, lTimers, lBodyChunks, lSkipped);
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::HandleSnapshotChunk(const void *apData, size_t alLen)
+{
+	if (mbHosting || !apData || alLen < sizeof(cNetSnapshotHdr))
+		return;
+	cNetSnapshotHdr hdr;
+	memcpy(&hdr, apData, sizeof(hdr));
+
+	if (!mpBodySync->IsRemoteGen(hdr.mMapGen))
+	{
+		if (hdr.mSection == eNetSnap_Begin)
+			Log(" multiplayer: world snapshot id=%u for gen %u (paired %u) - dropped\n",
+				(unsigned)hdr.mSnapId, (unsigned)hdr.mMapGen, (unsigned)mpBodySync->GetRemoteMapGen());
+		return;
+	}
+
+	if (hdr.mSection == eNetSnap_Begin)
+	{
+		if (mbSnapBuffering)
+			Log(" multiplayer: world snapshot id=%u superseded by id=%u - discarded\n",
+				(unsigned)mlSnapId, (unsigned)hdr.mSnapId);
+		ResetSnapshotBuffer();
+		mlSnapId = hdr.mSnapId;
+		mlSnapGen = hdr.mMapGen;
+		mbSnapBuffering = true;
+		mfSnapAge = 0;
+		Log(" multiplayer: world snapshot begin id=%u gen=%u (%u section chunk(s))\n",
+			(unsigned)hdr.mSnapId, (unsigned)hdr.mMapGen, (unsigned)hdr.mCount);
+		return;
+	}
+	if (!mbSnapBuffering || hdr.mSnapId != mlSnapId)
+		return; /* stray chunk of another snapshot */
+
+	if (hdr.mSection == eNetSnap_End)
+	{
+		Log(" multiplayer: world snapshot end id=%u: %u section chunk(s), %u body chunk(s) - applying\n",
+			(unsigned)hdr.mSnapId, (unsigned)mvSnapChunks.size(), (unsigned)hdr.mCount);
+		ApplyWorldSnapshot();
+		ResetSnapshotBuffer();
+		return;
+	}
+	if (hdr.mSection < eNetSnap_LocalVar || hdr.mSection > eNetSnap_Timer)
+		return; /* unknown section */
+	if (mvSnapChunks.size() >= 4096)
+	{
+		Log(" multiplayer: world snapshot id=%u: too many chunks - dropped\n", (unsigned)mlSnapId);
+		ResetSnapshotBuffer();
+		return;
+	}
+	const uint8_t *pRaw = (const uint8_t *)apData;
+	mvSnapChunks.push_back(std::vector<uint8_t>(pRaw, pRaw + alLen));
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::ApplyWorldSnapshot()
+{
+	if (mbHosting || !mpInit || !mpInit->mpGame || !mpInit->mpMapHandler)
+		return;
+	cScene *pScene = mpInit->mpGame->GetScene();
+	if (pScene == NULL || pScene->GetWorld3D() == NULL)
+	{
+		Log(" multiplayer: world snapshot id=%u: no world - dropped\n", (unsigned)mlSnapId);
+		return;
+	}
+	if (!mpBodySync->IsRemoteGen(mlSnapGen))
+	{
+		Log(" multiplayer: world snapshot id=%u: gen %u no longer paired - dropped\n",
+			(unsigned)mlSnapId, (unsigned)mlSnapGen);
+		return;
+	}
+	if (mbLocalMapChangeArmed)
+	{
+		Log(" multiplayer: world snapshot id=%u: we are leaving this map - dropped\n",
+			(unsigned)mlSnapId);
+		return;
+	}
+
+	cNetApplyScope applyScope; /* nothing below echoes back to the host */
+
+	int lVarsL = 0, lVarsG = 0, lEnts = 0, lActive = 0, lAbsent = 0, lMissing = 0, lDoors = 0,
+		lLamps = 0, lTaken = 0, lParty = 0, lEnemies = 0, lEnemiesDead = 0, lTimers = 0;
+	bool bHaveEntities = false, bHaveParty = false, bHaveTimers = false;
+	cNetSnapshotHdr hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	const unsigned char *pFirst = NULL;
+
+	/* 1. vars first: polled by OnUpdate scripts, so they are final before
+	   anything visible changes. */
+	for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+	{
+		const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(cNetSnapVar), &hdr, &pFirst);
+		if (hdr.mSection != eNetSnap_LocalVar && hdr.mSection != eNetSnap_GlobalVar)
+			continue;
+		for (size_t i = 0; i < lCount; ++i)
+		{
+			cNetSnapVar v;
+			memcpy(&v, pFirst + i * sizeof(v), sizeof(v));
+			v.msName[sizeof(v.msName) - 1] = 0; /* untrusted wire string */
+			if (v.msName[0] == 0)
+				continue;
+			if (hdr.mSection == eNetSnap_LocalVar)
+			{
+				pScene->CreateLocalVar(tString(v.msName))->mlVal = (int)v.mlVal;
+				++lVarsL;
+			}
+			else
+			{
+				pScene->CreateGlobalVar(tString(v.msName))->mlVal = (int)v.mlVal;
+				++lVarsG;
+			}
+		}
+	}
+
+	/* 2. entities: one hash -> entity index, then the host's entries, then
+	   the "present here, absent on the host" sweep. */
+	{
+		std::map<uint32_t, iGameEntity *> mapEnts;
+		{
+			tGameEntityIterator it = mpInit->mpMapHandler->GetGameEntityIterator();
+			while (it.HasNext())
+			{
+				iGameEntity *pEnt = it.Next();
+				if (pEnt == NULL || pEnt->GetType() == eGameEntityType_Enemy || pEnt->GetName().empty())
+					continue;
+				mapEnts.insert(std::make_pair(NetHashName(pEnt->GetName().c_str()), pEnt));
+			}
+		}
+		std::set<uint32_t> setSeen;
+
+		for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+		{
+			const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(cNetSnapEntity), &hdr, &pFirst);
+			if (hdr.mSection != eNetSnap_Entity)
+				continue;
+			bHaveEntities = true;
+			for (size_t i = 0; i < lCount; ++i)
+			{
+				cNetSnapEntity e;
+				memcpy(&e, pFirst + i * sizeof(e), sizeof(e));
+				++lEnts;
+				setSeen.insert(e.mlNameHash);
+
+				std::map<uint32_t, iGameEntity *>::iterator ei = mapEnts.find(e.mlNameHash);
+				if (ei == mapEnts.end())
+				{
+					/* host-only entity (ReplaceEntity result, a drop twin that
+					   failed to spawn here): never CREATE — log and skip */
+					Log(" multiplayer: snapshot: host entity 0x%08X (type %u) does not exist here - skipped\n",
+						(unsigned)e.mlNameHash, (unsigned)e.mType);
+					++lMissing;
+					continue;
+				}
+				iGameEntity *pEnt = ei->second;
+				if ((uint8_t)pEnt->GetType() != e.mType)
+					continue; /* same name, different kind: not the same thing */
+
+				const bool bActive = (e.mFlags & kNetSnapEntityFlag_Active) != 0;
+				if (pEnt->IsActive() != bActive)
+				{
+					if (!bActive)
+					{
+						/* our player may be holding one of its bodies */
+						for (int b = 0; b < pEnt->GetBodyNum(); ++b)
+						{
+							uint32_t lBodyHash;
+							if (pEnt->GetBody(b) && mpBodySync->GetHashForBody(pEnt->GetBody(b), &lBodyHash))
+								ForceReleaseIfHolding(lBodyHash);
+						}
+					}
+					pEnt->SetActive(bActive);
+					++lActive;
+				}
+				if (pEnt->GetType() == eGameEntityType_SwingDoor)
+				{
+					/* after the body pose (already pinned on arrival), so the
+					   +-1 degree hinge clamp lands on the host's door pose */
+					cGameSwingDoor *pDoor = static_cast<cGameSwingDoor *>(pEnt);
+					const bool bLocked = (e.mFlags & kNetSnapEntityFlag_Locked) != 0;
+					if (pDoor->IsLocked() != bLocked)
+					{
+						pDoor->SetLocked(bLocked);
+						++lDoors;
+					}
+				}
+				else if (pEnt->GetType() == eGameEntityType_Lamp)
+				{
+					cGameLamp *pLamp = static_cast<cGameLamp *>(pEnt);
+					const bool bLit = (e.mFlags & kNetSnapEntityFlag_Lit) != 0;
+					if (pLamp->IsLit() != bLit)
+					{
+						/* silence the lit-change script: the host ran it */
+						const tString sCallback = pLamp->GetLitChangeCallback();
+						pLamp->SetLitChangeCallback("");
+						pLamp->SetLit(bLit, false);
+						pLamp->SetLitChangeCallback(sCallback);
+						++lLamps;
+					}
+				}
+				/* alive breakables: plain assign (SetHealth's > 0 branch);
+				   a host-side death is carried by ABSENCE, not by health */
+				if (SnapFinite(e.mfHealth) && e.mfHealth > 0 && pEnt->GetHealth() > 0 &&
+					e.mfHealth != pEnt->GetHealth())
+					pEnt->SetHealth(e.mfHealth);
+			}
+		}
+
+		if (bHaveEntities)
+		{
+			for (std::map<uint32_t, iGameEntity *>::iterator mi = mapEnts.begin(); mi != mapEnts.end(); ++mi)
+			{
+				if (setSeen.count(mi->first))
+					continue;
+				iGameEntity *pEnt = mi->second;
+				if (!SnapTypeIsDestroyable(pEnt->GetType()))
+				{
+					Log(" multiplayer: snapshot: '%s' exists here but not on the host (map mismatch?)\n",
+						pEnt->GetName().c_str());
+					continue;
+				}
+				if (!pEnt->IsActive())
+					continue;
+				for (int b = 0; b < pEnt->GetBodyNum(); ++b)
+				{
+					uint32_t lBodyHash;
+					if (pEnt->GetBody(b) && mpBodySync->GetHashForBody(pEnt->GetBody(b), &lBodyHash))
+						ForceReleaseIfHolding(lBodyHash);
+				}
+				pEnt->SetActive(false);
+				++lAbsent;
+				Log(" multiplayer: snapshot: '%s' is gone on the host (picked up / broken) - deactivated\n",
+					pEnt->GetName().c_str());
+			}
+		}
+	}
+
+	/* 3. enemies — after the entity actives so nothing undoes SetActive. */
+	{
+		std::map<uint32_t, iGameEnemy *> mapEnemies;
+		{
+			tGameEnemyIterator it = mpInit->mpMapHandler->GetGameEnemyIterator();
+			while (it.HasNext())
+			{
+				iGameEnemy *pE = it.Next();
+				if (pE)
+					mapEnemies.insert(std::make_pair(NetHashName(pE->GetName().c_str()), pE));
+			}
+		}
+		for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+		{
+			const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(cNetEnemyState), &hdr, &pFirst);
+			if (hdr.mSection != eNetSnap_Enemy)
+				continue;
+			for (size_t i = 0; i < lCount; ++i)
+			{
+				cNetEnemyState st;
+				memcpy(&st, pFirst + i * sizeof(st), sizeof(st));
+				std::map<uint32_t, iGameEnemy *>::iterator ei = mapEnemies.find(st.mlNameHash);
+				if (ei == mapEnemies.end())
+					continue;
+				iGameEnemy *pEnemy = ei->second;
+				if (!SnapFinite(st.mfPosX) || !SnapFinite(st.mfPosY) || !SnapFinite(st.mfPosZ) ||
+					!SnapFinite(st.mfYaw) || !SnapFinite(st.mfHealth))
+					continue; /* garbage entry */
+				const cVector3f vFeet(st.mfPosX, st.mfPosY, st.mfPosZ);
+
+				if (st.mfHealth <= 0)
+				{
+					if (pEnemy->GetHealth() > 0)
+					{
+						/* dead on the host: ragdoll at the host's spot, and
+						   NEVER its death script (the host ran it) */
+						pEnemy->SetOnDeathCallback("");
+						if (pEnemy->GetMover() && pEnemy->GetMover()->GetCharBody())
+						{
+							pEnemy->GetMover()->GetCharBody()->SetFeetPosition(vFeet);
+							pEnemy->GetMover()->GetCharBody()->SetYaw(st.mfYaw);
+						}
+						pEnemy->SetNetPuppet(false);
+						pEnemy->Damage(100000.0f, 100);
+						++lEnemiesDead;
+					}
+					continue;
+				}
+				if (pEnemy->GetHealth() <= 0)
+					continue; /* dead here, alive there: the ragdoll owns it */
+
+				pEnemy->SetNetPuppet(true);
+				const bool bActive = (st.mFlags & 2) != 0;
+				if (pEnemy->IsActive() != bActive)
+					pEnemy->SetActive(bActive);
+				pEnemy->NetSetTarget(vFeet, st.mfYaw); /* snaps at > 3 m */
+				if (st.mfHealth != pEnemy->GetHealth())
+					pEnemy->SetHealth(st.mfHealth); /* > 0 here: plain assign */
+				++lEnemies;
+			}
+		}
+	}
+
+	/* 4. body poses were pinned on arrival (ObjectState chunks). */
+
+	/* 5. taken items (insert + sweep) and the party inventory (replace —
+	   JoinGame cleared it; our OWN inventory is never touched). */
+	for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+	{
+		const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(uint32_t), &hdr, &pFirst);
+		if (hdr.mSection != eNetSnap_TakenItem)
+			continue;
+		for (size_t i = 0; i < lCount; ++i)
+		{
+			uint32_t lHash;
+			memcpy(&lHash, pFirst + i * sizeof(lHash), sizeof(lHash));
+			m_setTakenItems.insert(lHash);
+			++lTaken;
+		}
+	}
+	if (lTaken > 0)
+		ApplyTakenItems();
+	for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+	{
+		const size_t lCount = SnapChunkEntries(mvSnapChunks[c], 32, &hdr, &pFirst);
+		if (hdr.mSection != eNetSnap_PartyItem)
+			continue;
+		if (!bHaveParty)
+		{
+			bHaveParty = true;
+			m_setPartyItems.clear();
+		}
+		for (size_t i = 0; i < lCount; ++i)
+		{
+			char aName[32];
+			memcpy(aName, pFirst + i * sizeof(aName), sizeof(aName));
+			aName[sizeof(aName) - 1] = 0;
+			if (aName[0] == 0)
+				continue;
+			m_setPartyItems.insert(tString(aName));
+			++lParty;
+		}
+	}
+
+	/* 6. local timers: ours (created by our own OnStart) are replaced by
+	   the host's — theirs fire later on both machines alike. */
+	for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+	{
+		const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(cNetSnapTimer), &hdr, &pFirst);
+		if (hdr.mSection != eNetSnap_Timer)
+			continue;
+		if (!bHaveTimers)
+		{
+			bHaveTimers = true;
+			mpInit->mpMapHandler->RemoveLocalTimers();
+		}
+		for (size_t i = 0; i < lCount; ++i)
+		{
+			cNetSnapTimer t;
+			memcpy(&t, pFirst + i * sizeof(t), sizeof(t));
+			t.msName[sizeof(t.msName) - 1] = 0;
+			t.msCallback[sizeof(t.msCallback) - 1] = 0;
+			if (t.msName[0] == 0 || !SnapFinite(t.mfTime))
+				continue;
+			cGameTimer *pTimer = mpInit->mpMapHandler->CreateTimer(tString(t.msName), t.mfTime,
+				tString(t.msCallback), false);
+			if (pTimer)
+				pTimer->mbPaused = t.mbPaused != 0;
+			++lTimers;
+		}
+	}
+
+	/* 7. done: the enemy stream restarts from whatever seq comes next. */
+	mbEnemySeqInKnown = false;
+	Log(" multiplayer: world snapshot id=%u applied: vars %d/%d, entities %d (%d active changed, %d deactivated: absent on host, %d unknown here), doors %d, lamps %d, taken %d, party %d, enemies %d (+%d dead), timers %d\n",
+		(unsigned)mlSnapId, lVarsL, lVarsG, lEnts, lActive, lAbsent, lMissing, lDoors, lLamps,
+		lTaken, lParty, lEnemies, lEnemiesDead, lTimers);
 }
 
 #endif /* PENUMBRA_MULTIPLAYER */

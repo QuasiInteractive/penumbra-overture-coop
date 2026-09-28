@@ -8,6 +8,8 @@ All dedicated multiplayer source lives in this folder. Work here first; game glu
 |------|------|
 | `NetworkPackets.h` | Packed ENet payloads (player state, bodies, enemies, script/item events, join/leave) + discovery ping/pong, protocol magic/version (`kNetProtocolVersion`), `kNetSendPeriodSeconds`, `kNetDiscoveryPort`. |
 | `NetworkManager.h` / `.cpp` | Listen-server host, client join, 30 Hz state relay, LAN/Hamachi discovery (raw UDP broadcast), `multiplayer.cfg` (read + the `player_name` writer), F9/F10/F11, per-frame ghost updates, the ghost preview mode, player names + the party event feed (v13). |
+| `NetworkPackets.h` | Packed ENet payloads (player state, bodies, enemies, script/item events, join/leave, v14 MapReady + WorldSnapshot sections) + discovery ping/pong, protocol magic/version (`kNetProtocolVersion`), `kNetSendPeriodSeconds`, `kNetDiscoveryPort`. |
+| `NetworkManager.h` / `.cpp` | Listen-server host, client join, 30 Hz state relay, LAN/Hamachi discovery (raw UDP broadcast), `multiplayer.cfg`, F9/F10/F11, per-frame ghost updates, the ghost preview mode. |
 | `BodySync.h` / `.cpp` | Shared physics: host-authoritative body replication. Name-hash identity, map-load census (host/guest verify), host state batches, guest apply. |
 | `GhostPlayer.h` / `.cpp` | Remote peer visuals (skinned mesh + marker light + flashlight). Interpolation buffer on the sender's clock, clip selection from the wire velocity/flags, weight-preserving crossfades, gait-scaled playback. Not a real `cPlayer`. |
 | `multiplayer.cfg.example` | Copy next to `overture.exe` as `multiplayer.cfg`. |
@@ -28,6 +30,7 @@ breakable damage are replicated as reliable events; map changes move the
 whole party). Player state, bodies and enemies stream at **30 Hz**
 (`kNetSendPeriodSeconds`); every wire layout change bumps
 `kNetProtocolVersion` (currently **13**), and the connect handshake refuses
+`kNetProtocolVersion` (currently **14**), and the connect handshake refuses
 mismatched builds.
 
 Remote players are drawn as **ghosts** (`cGhostPlayer`): each `cNetPlayerState`
@@ -116,6 +119,84 @@ living member has no position yet (between maps) it waits up to 15 s, then
 gives up to the death menu. Offline the code path is the original two
 lines — single-player is unchanged.
 
+## World snapshot (v14: late join, reconnect, host save/load)
+
+Before v14 the only "state" a joiner got was a body-pose snapshot sent at
+CONNECT time — before the guest had a world, so it was silently dropped —
+and nothing carried script vars, entity actives, door locks, taken/party
+items or timers. Now the guest asks once it has a world, and the host answers
+with everything a save game would carry for that map.
+
+**Trigger.** The guest sends `eNetPacketType_MapReady` (24, reliable ch0,
+`cNetMapReady`) at the moment its physics census is *paired* with the host's
+for the world it stands in (match or not). Two hooks, one `SendMapReady()`:
+(1) the frame the guest's own census is computed while the host's is already
+known (menu launch via beacon, a followed `MapChange`, the guest reloading its
+own save), and (2) a host census arriving while the guest already stands in
+a world (reconnect while in-game, host save/load or new game on the same
+map). Both run one frame after the load, i.e. after `OnStart`/`OnLoad`/
+`PreUpdate`, which is exactly what the host's state must overwrite. The host
+(`HandleMapReady`) refuses a stale generation or another map (the beacon
+already told the guest where to go; it asks again after following) and
+otherwise calls `SendWorldSnapshot(peer)`. The CONNECT-time body snapshot is
+gone; host save/load, new game and death-menu Continue need no extra hook
+because each one produces a new census generation.
+
+**Content** (`eNetPacketType_WorldSnapshot` = 25, host -> one guest,
+reliable ch0, chunked, `cNetSnapshotHdr` + entries, <= 1200 B payload per
+chunk; every section is sent as at least one chunk so "none" and "not sent"
+differ): local vars, global vars (`cNetSnapVar`); every non-enemy
+`iGameEntity` (`cNetSnapEntity`: name hash, type, Active/Locked/Lit flags,
+health); taken item hashes (whole session); party inventory names (host
+inventory + what other guests hold); the enemy roster (`cNetEnemyState`,
+same entries as the stream); the host's local timers (`cNetSnapTimer`).
+Body poses travel as ordinary reliable `ObjectState` chunks between `Begin`
+and `End` — same channel, so ordering is guaranteed. `Begin.mCount` =
+section chunks, `End.mCount` = body chunks (both informational).
+
+**Guest apply.** Chunks are buffered (gen guard `IsRemoteGen`, id guard, a
+new `Begin` discards a half snapshot, > 10 s without `End` drops it) and
+applied atomically on `End` under `gbNetScriptApplying` (RAII), so the
+world's `OnUpdate` never sees a half state and nothing echoes back. Order:
+vars -> entities (`SetActive`, `SetLocked`, `SetLit` with the lit-change
+callback silenced, health for alive breakables; then entities present here
+but absent on the host: Item/Object/Door/DoorPanel/SwingDoor/Lamp are
+deactivated — that is how the host's own picks and broken objects reach a
+joiner — other types are only logged) -> enemies (dead on the host: death
+callback cleared, ragdoll at the host's spot; alive: puppet + target +
+health) -> taken items + `ApplyTakenItems()`, party set replaced -> local
+timers replaced. Never creates entities, never touches the guest's own
+inventory, never applies while `mbLocalMapChangeArmed`.
+
+**Related fixes.** (5a) `NetOnScriptEvent(RemoveItem)` erases from the
+party set on the *consuming* machine too; `NetOnItemPicked` records our own
+picks in the taken set. (5b) `Add*Var` double-apply: the engine now fires
+the var callback *after* the increment; the host is the single authority —
+it broadcasts the resulting absolute `Set`; a guest applies its own add
+optimistically and forwards the delta only from a *player-driven* script
+context (`cNetScriptPlayerScope` around pick/interact/examine, player
+collide callbacks, inventory pickup/use/combine, message-box, numerical
+panel and lamp lit-change callbacks); symmetric scripts (`OnStart`,
+`OnLoad`, `OnUpdate`, timers, entity collide) stay silent on guests. The
+host does not blind-relay guest Adds and the guest never runs an enemy's
+death script (the host's copy did). (5c) The enemy stream is chunked
+(`kMaxEnemiesPerBatch` = 40, one seq per chunk), stamped with the map
+generation and gen-guarded on the guest, with a per-batch hash map instead
+of a roster scan; the seq guard resets on every new census generation /
+world change. Also new: `eNetScriptOp_LampLit` (9) replicates `SetLampLit`
+live (mlVal bit0 = lit, bit1 = fade).
+
+**Log lines** (hpl.log). Guest: `MapReady sent gen=N map '...' (census
+C/0xXXXXXXXX)`, `world snapshot begin id=I gen=N (S section chunk(s))`,
+`world snapshot end id=I: S section chunk(s), B body chunk(s) - applying`,
+`world snapshot id=I applied: vars L/G, entities E (A active changed, D
+deactivated: absent on host, U unknown here), doors D, lamps L, taken K,
+party P, enemies N (+X dead), timers T`. Host: `guest 2 ready on gen N
+(census C/0x... vs ours C/0x...)`, `world snapshot -> peer 2: C chunks, B
+bytes (id=I gen=N; vars L/G, entities E, taken K, party P, enemies N,
+timers T, bodies B chunks, skipped S)`. Record the chunks/bytes line on the
+largest level to replace the design estimate (~25 KB in ~45 chunks).
+
 ## Game glue (outside this folder — edit carefully)
 
 | Location | What |
@@ -126,6 +207,11 @@ lines — single-player is unchanged.
 | `../Inventory.cpp` / `.h` | `DrawParty()` — inventory party health list. |
 | `../GameEnemy.cpp`, `../TriggerHandler.cpp` | Host senses read `GetGhostHealth` (focus health, sight candidates, ghost footsteps). |
 | `../MainMenu.cpp` / `MainMenu.h` | Multiplayer menu states, host/join UI, IP typing widget (`#ifdef PENUMBRA_MULTIPLAYER`); v13 username screen (`eMainMenuState_MultiplayerName`, the typing widget's name mode, "Change name"). |
+| `../GameScripts.cpp` / `.h` | Script hooks (`NetOnScriptEvent`), `NetApplyScriptEvent`, `gbNetScriptApplying` / `gbNetScriptPlayerContext` + `cNetScriptPlayerScope` (v14). |
+| `../GameEntity.cpp`, `../Player.cpp`, `../Inventory.cpp`, `../GameMessageHandler.cpp`, `../NumericalPanel.cpp`, `../GameLamp.cpp` | `cNetScriptPlayerScope` around the player-driven `RunScriptCommand` sites (v14 Add*Var authority). |
+| `../GameSwingDoor.h`, `../GameLamp.h`, `../Inventory.h`, `../MapHandler.h` | `IsLocked()`, `IsLit()`/`GetLitChangeCallback()`, `friend class cNetworkManager` (party items, local timers) for the world snapshot. |
+| `../../HPL1Engine/sources/game/ScriptFuncs.cpp` | `gpScriptVarNetCallback` — fired for var writes; Add ops fire AFTER the increment (v14). |
+| `../MainMenu.cpp` / `MainMenu.h` | Multiplayer menu states, host/join UI, IP typing widget (`#ifdef PENUMBRA_MULTIPLAYER`). |
 | `../CMakeLists.txt` | Globs `multiplayer/*.cpp`, links ENet, defines `PENUMBRA_MULTIPLAYER`. |
 | `../vcpkg.json` | Declares `enet` (+ SDL/OpenAL audio deps). |
 

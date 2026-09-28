@@ -38,8 +38,15 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
     v13: player names — reliable cNetPlayerName (type 26): a guest sends
         its multiplayer.cfg player_name after PlayerJoin, the host keeps
         the table and re-broadcasts it (one packet per player) on every
-        name arrival / join / leave. Old builds do not speak it. */
-static const uint16_t kNetProtocolVersion = 13;
+        name arrival / join / leave. Old builds do not speak it.
+    v14: world snapshot — MapReady (24) + WorldSnapshot (25): a guest that
+        pairs its census with the host's asks for the host's world state and
+        the host answers with script vars, entity actives/locks/lit, taken +
+        party items, resting body poses, the enemy roster and local timers,
+        applied atomically. Also LampLit script op 9 and the enemy stream's
+        map-gen byte, which was reserved (0) until now. */
+static const uint16_t kNetProtocolVersion = 14;
+
 
 /** v13: cNetPlayerName::msName capacity. A name is at most this many
     printable ASCII characters; it is NOT required to be NUL-terminated on
@@ -121,7 +128,15 @@ enum eNetPacketType : uint8_t
 	                                    pickaxed door is broken for the whole
 	                                    party (was: broken for one player,
 	                                    intact wall for the other). */
-	/* 24 and 25 are reserved for the world-state snapshot (v14). */
+	/* v14 — WORLD SNAPSHOT (late join, reconnect, host save/load). */
+	eNetPacketType_MapReady = 24,      /* guest -> host, reliable ch0: my census
+	                                      is paired with yours for THIS world —
+	                                      send me its state (cNetMapReady) */
+	eNetPacketType_WorldSnapshot = 25, /* host -> ONE guest, reliable ch0,
+	                                      chunked (cNetSnapshotHdr + entries);
+	                                      Begin ... sections ... End, the body
+	                                      poses travel as ObjectState chunks
+	                                      in between */
 	eNetPacketType_PlayerName = 26,  /* v13, reliable ch0: guest -> host (my
 	                                    name, right after PlayerJoin), host ->
 	                                    every guest (the full table, one
@@ -138,7 +153,37 @@ enum eNetScriptOp : uint8_t
 	eNetScriptOp_EntityActive = 6, /* mlVal = 0/1 */
 	eNetScriptOp_DoorLocked = 7,   /* mlVal = 0/1 */
 	eNetScriptOp_RemoveItem = 8,   /* an item was CONSUMED (key used etc.) */
+	eNetScriptOp_LampLit = 9,      /* v14: SetLampLit — mlVal bit0 = lit,
+	                                  bit1 = fade */
 };
+
+/** v14: eNetPacketType_WorldSnapshot section ids (cNetSnapshotHdr::mSection).
+    Every section is sent as at least ONE chunk (possibly with mCount 0) so
+    the guest can tell "host has no timers" from "section never arrived". */
+enum eNetSnapSection : uint8_t
+{
+	eNetSnap_Begin = 0,     /* mCount = section chunks to follow (informational) */
+	eNetSnap_LocalVar = 1,  /* cNetSnapVar[]    */
+	eNetSnap_GlobalVar = 2, /* cNetSnapVar[]    */
+	eNetSnap_Entity = 3,    /* cNetSnapEntity[] — every non-enemy iGameEntity */
+	eNetSnap_TakenItem = 4, /* uint32_t qualified item hash[] (whole session) */
+	eNetSnap_PartyItem = 5, /* char name[32][] — inventory names the party holds */
+	eNetSnap_Enemy = 6,     /* cNetEnemyState[] */
+	eNetSnap_Timer = 7,     /* cNetSnapTimer[]  — the host's LOCAL timers */
+	eNetSnap_End = 255,     /* mCount = ObjectState body chunks that were sent
+	                           between Begin and End (informational) */
+};
+
+/** cNetSnapEntity::mFlags */
+static const uint8_t kNetSnapEntityFlag_Active = 1;
+static const uint8_t kNetSnapEntityFlag_Locked = 2; /* SwingDoor only */
+static const uint8_t kNetSnapEntityFlag_Lit = 4;    /* Lamp only */
+
+/** Snapshot chunk payload cap (entries after the header). ENet fragments
+    reliable packets above the MTU itself; staying under one datagram means
+    one lost datagram costs one small retransmit (same policy as
+    cBodySync::kMaxStatesPerBatch). */
+static const unsigned kNetSnapMaxChunkPayload = 1200;
 
 /** ENet connect data: sent inside the connection handshake itself, so a host
     can refuse an incompatible exe BEFORE any game packet flows. Old builds
@@ -478,6 +523,58 @@ struct cNetScriptEvent
 	char msName[48];
 	int32_t mlVal;
 };
+
+/** v14, guest -> host: our census is paired with the host's for the world
+    we are standing in (match or not) — the host answers with a
+    WorldSnapshot if the generation and map still agree. */
+struct cNetMapReady
+{
+	uint8_t mType;             /**< eNetPacketType_MapReady */
+	uint8_t mMapGen;           /**< HOST generation we just paired with (census) */
+	uint32_t mlMapNameHash;    /**< NetHashName(lowercase, ext-stripped current map) */
+	uint16_t mlLocalBodyCount; /**< our census, for the host-side log */
+	uint32_t mlLocalChecksum;
+};
+
+/** v14: header of every WorldSnapshot chunk. mMapGen = host generation (the
+    census/body-batch value); mSnapId = host counter per snapshot so a Begin
+    with a new id discards a half-buffered one and stray chunks of another
+    id are dropped. mCount = entries that follow (see eNetSnapSection). */
+struct cNetSnapshotHdr
+{
+	uint8_t mType;    /**< eNetPacketType_WorldSnapshot */
+	uint8_t mSection; /**< eNetSnapSection */
+	uint8_t mMapGen;
+	uint8_t mSnapId;
+	uint16_t mCount;
+};
+
+/** One script var (local or global). 48 matches cNetScriptEvent::msName. */
+struct cNetSnapVar
+{
+	char msName[48];
+	int32_t mlVal;
+};
+
+/** One game entity: identity = NetHashName(entity name), unqualified (the
+    generation guard scopes the map). mType = eGameEntityType. */
+struct cNetSnapEntity
+{
+	uint32_t mlNameHash;
+	uint8_t mType;
+	uint8_t mFlags; /**< kNetSnapEntityFlag_* */
+	float mfHealth;
+};
+
+/** One of the host's LOCAL script timers (global ones outlive the map and
+    are not part of a world's state). */
+struct cNetSnapTimer
+{
+	char msName[48];
+	char msCallback[48];
+	float mfTime;
+	uint8_t mbPaused;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(cNetPlayerJoin) == 2, "");
@@ -505,5 +602,10 @@ static_assert(sizeof(cNetEnemyDamage) == 10, "");
 static_assert(sizeof(cNetPlayerDamage) == 6, "");
 static_assert(sizeof(cNetScriptEvent) == 54, "");
 static_assert(sizeof(cNetEntityDamage) == 10, "");
+static_assert(sizeof(cNetMapReady) == 12, "");     /* v14 */
+static_assert(sizeof(cNetSnapshotHdr) == 6, "");   /* v14 */
+static_assert(sizeof(cNetSnapVar) == 52, "");      /* v14 */
+static_assert(sizeof(cNetSnapEntity) == 10, "");   /* v14 */
+static_assert(sizeof(cNetSnapTimer) == 101, "");   /* v14 */
 
 #endif /* NETWORK_PACKETS_H */

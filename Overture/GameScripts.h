@@ -38,4 +38,28 @@ public:
     script-function bodies with re-broadcast suppressed. */
 void NetApplyScriptEvent(int alOp, const hpl::tString &asName, int alVal);
 
+/** Penumbra co-op (v14). gbNetScriptApplying: true while a REPLICATED
+    mutation is applied (script hooks stay silent). gbNetScriptPlayerContext:
+    true while a script runs because of something only THIS player did
+    (pick/interact/examine, player collide, inventory use/pickup/combine, a
+    message-box callback, a numerical panel, a lamp lit-change) — the Add*Var
+    replication forwards a guest's Add to the host only from such a context;
+    symmetric scripts (OnStart/OnLoad/OnUpdate/timers/entity collide) run on
+    every machine and only the HOST's result is broadcast (as an absolute
+    Set), so a counter is never incremented twice. Both defined in
+    GameScripts.cpp; neither has any effect without a live session. */
+extern bool gbNetScriptApplying;
+extern bool gbNetScriptPlayerContext;
+
+/** RAII: marks the enclosed RunScriptCommand as player-driven (nests). */
+struct cNetScriptPlayerScope
+{
+	bool mbPrev;
+	cNetScriptPlayerScope() : mbPrev(gbNetScriptPlayerContext) { gbNetScriptPlayerContext = true; }
+	~cNetScriptPlayerScope() { gbNetScriptPlayerContext = mbPrev; }
+private:
+	cNetScriptPlayerScope(const cNetScriptPlayerScope &);
+	cNetScriptPlayerScope &operator=(const cNetScriptPlayerScope &);
+};
+
 #endif // GAME_SCRIPTS_H

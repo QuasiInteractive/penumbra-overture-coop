@@ -777,6 +777,7 @@ SCRIPT_DEFINE_FUNC_1(void,RemoveCombineCallback,string)
 /* Penumbra co-op: true while applying a REPLICATED script event, so the
    hooks below do not echo it back onto the wire. */
 bool gbNetScriptApplying = false;
+bool gbNetScriptPlayerContext = false; /* v14: see GameScripts.h */
 
 static bool __stdcall HasItem(std::string asName)
 {
@@ -1354,6 +1355,10 @@ SCRIPT_DEFINE_FUNC(void,AllowAttachment)
 
 static void __stdcall SetLampLit(std::string asName,bool abLit, bool abFade)
 {
+	/* co-op v14: a scripted lamp change reaches the whole party */
+	if(!gbNetScriptApplying && gpInit->mpNetworkManager)
+		gpInit->mpNetworkManager->NetOnScriptEvent(9, asName.c_str(), (abLit ? 1 : 0) | (abFade ? 2 : 0));
+
 	iGameEntity *pEntity = gpInit->mpMapHandler->GetGameEntity(asName);
 	if(pEntity==NULL || pEntity->GetType() != eGameEntityType_Lamp)
 	{
@@ -1947,6 +1952,7 @@ void NetApplyScriptEvent(int alOp, const hpl::tString &asName, int alVal)
 	case 6: SetGameEntityActive(std::string(asName.c_str()), alVal != 0); break;
 	case 7: SetDoorLocked(std::string(asName.c_str()), alVal != 0); break;
 	case 8: RemoveItem(std::string(asName.c_str())); break;
+	case 9: SetLampLit(std::string(asName.c_str()), (alVal & 1) != 0, (alVal & 2) != 0); break; /* v14 */
 	default: break;
 	}
 	gbNetScriptApplying = false;

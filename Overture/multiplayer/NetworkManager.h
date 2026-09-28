@@ -398,6 +398,40 @@ private:
 	/** Guest: our name to the host (after PlayerJoin, and on a rename). */
 	void SendLocalName();
 #endif
+	//---------------- v14: world snapshot — appended, impl at the file tail ----------------
+	/* Late join / reconnect / host save+load: the moment a guest has paired
+	   its physics census with the host's for the world it stands in, it
+	   sends MapReady; the host answers with one chunked, reliable
+	   WorldSnapshot (script vars, entity actives/locks/lit/health, taken +
+	   party items, resting body poses, enemy roster, local timers). The
+	   guest buffers the chunks and applies them ATOMICALLY on End under
+	   gbNetScriptApplying, so its world scripts never see a half state. */
+private:
+	std::vector<std::vector<uint8_t> > mvSnapChunks; /**< guest: buffered section chunks (header included) */
+	uint8_t mlSnapId;        /**< guest: id of the snapshot being buffered */
+	uint8_t mlSnapGen;       /**< guest: host generation it was sent for */
+	bool mbSnapBuffering;    /**< guest: a Begin arrived, End not yet */
+	float mfSnapAge;         /**< guest: seconds since Begin; > 10 s = dropped */
+	uint8_t mlSnapIdOut;     /**< host: per-snapshot counter */
+	/** Enemy stream chunking (5c): 5 + 40*29 = 1165 B per packet. */
+	enum { kMaxEnemiesPerBatch = 40 };
+#ifdef PENUMBRA_MULTIPLAYER
+	/** Guest: our census is paired with the host's — ask for the world state. */
+	void SendMapReady();
+	/** Host: a guest's MapReady (needs the peer to answer it). */
+	void HandleMapReady(struct _ENetPeer *apPeer, const void *apData, size_t alLen);
+	/** Host -> one guest: Begin, every section, body poses, End. */
+	void SendWorldSnapshot(struct _ENetPeer *apPeer);
+	/** Host -> one guest: every replicable body's pose, reliable ObjectState
+	    chunks (primes the delta path). Returns chunks sent, adds bytes. */
+	int SendBodySnapshot(struct _ENetPeer *apPeer, size_t *apBytesOut);
+	/** Guest: one WorldSnapshot chunk off the wire (buffer / apply on End). */
+	void HandleSnapshotChunk(const void *apData, size_t alLen);
+	/** Guest: apply the buffered snapshot to the current world, atomically. */
+	void ApplyWorldSnapshot();
+	/** Guest: forget any half-buffered snapshot. */
+	void ResetSnapshotBuffer();
+#endif
 };
 //-----------------------------------------------------------------------
 /** Pumps cNetworkManager from the GLOBAL updater state, so hosting and
