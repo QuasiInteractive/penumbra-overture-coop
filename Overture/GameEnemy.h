@@ -443,9 +443,9 @@ protected:
 	uint8_t mlFocusPlayerId;
 	bool mbFocusIsGhost;
 	bool mbNetMultiTarget; /* only enemy types whose states were CONVERTED to
-	    the focus accessors may hunt ghosts (dogs). Scripted set-pieces
-	    (worm, spider) keep vanilla single-player senses — a mid-cinematic
-	    ghost aggro breaks their scripted assumptions. */
+	    the focus accessors may hunt ghosts (dogs, spiders). The worm's
+	    scripted set-piece keeps vanilla single-player senses — a
+	    mid-cinematic ghost aggro breaks its scripted assumptions. */
 	cVector3f mvFocusCamPos;   /* ghost focus: its last KNOWN camera position
 	    (refreshed by every live accessor read; the fallback once it is gone) */
 	/* nearest-player hysteresis: a candidate that has been MEANINGFULLY

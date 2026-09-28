@@ -1384,6 +1384,11 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 		}
 	}
 
+	//A ghost focus that is gone (disconnected) is not a corpse to eat: fall
+	//back to the local player so Attack/Eat do not cycle on thin air.
+	if(lFocusIdx < 0 && mbFocusIsGhost)
+		NetFocusLocalPlayer();
+
 	//Hand-over sense (online with several players only): an ENGAGED enemy
 	//keeps turning toward its focus, so a nearer player beside or behind it
 	//never enters the sight cone and could never take over. Within a short
@@ -1391,10 +1396,12 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 	//cone. Never active with a single candidate — single-player is untouched.
 	const bool bEngaged = (lCands > 1) &&
 		(	mbCanSeePlayer ||
-			mlCurrentState == STATE_HUNT || mlCurrentState == STATE_ATTACK ||
-			mlCurrentState == STATE_FLEE || mlCurrentState == STATE_ATTENTION ||
-			mlCurrentState == STATE_CALLBACKUP);
-	const float fHandOverDist = 4.0f;
+			mlCurrentState == STATE_HUNT || mlCurrentState == STATE_ATTACK);
+	const float fHandOverDist = 3.0f;
+	//States that commit an animation finish it before any hand-over.
+	const bool bCommitted =	mlCurrentState == STATE_ATTACK ||
+							mlCurrentState == STATE_BREAKDOOR ||
+							mlCurrentState == STATE_KNOCKDOWN;
 
 	float fStartFOV = mfFOV;
 	float fStartMaxSeeDist = mfMaxSeeDist;
@@ -1456,7 +1463,10 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 		bool bSeen =
 			(fDist <= mfMaxSeeDist && LineOfSight(vCands[i].vPos, vCands[i].vSize)) ||
 			fDist <= fMinLength;
-		if(bSeen==false && bEngaged && fDist <= fHandOverDist)
+		//(the local player's own stealth still applies: a hidden host is not
+		//noticed by proximity either)
+		if(bSeen==false && bEngaged && fDist <= fHandOverDist &&
+			(vCands[i].bGhost || mpInit->mpPlayer->GetHidden()->IsHidden()==false))
 		{
 			//proximity sense: the same obstacle rays, no cone
 			const float fFOV = mfFOV;
@@ -1508,10 +1518,6 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 											(fBestDist < fFocusDist * 0.75f);
 				const bool bInJaws =	fBestDist <= mfMinAttackDist &&
 										fFocusDist > mfMinAttackDist * 2.0f;
-				const bool bCommitted =	mlCurrentState == STATE_ATTACK ||
-										mlCurrentState == STATE_BREAKDOOR ||
-										mlCurrentState == STATE_KNOCKDOWN;
-
 				if(bMeaningful)
 				{
 					if(mlFocusChallengerId == vCands[lBest].lId)
@@ -1530,6 +1536,11 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 
 				const bool bSwitch = (bInJaws || mlFocusChallengerTicks >= 2) && bCommitted==false;
 				if(bSwitch==false) lTarget = lFocusIdx;
+			}
+			else if(lFocusIdx >= 0 && lFocusIdx != lBest && bCommitted)
+			{
+				//focus briefly occluded mid-attack: finish the animation on it
+				lTarget = lFocusIdx;
 			}
 			if(lTarget == lBest)
 			{

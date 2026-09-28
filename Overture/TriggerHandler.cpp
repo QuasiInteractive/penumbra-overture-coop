@@ -171,12 +171,12 @@ namespace
 			//pushing into a wall in Walk makes no noise, like the host's
 			//head-bob driven steps).
 			tString sType;
-			float fRate, fStride, fEye;
+			float fRate, fStride;
 			switch(lMove)
 			{
-			case eNetMoveState_Walk:   sType = "walk";  fRate = 0.45f; fStride = 0.35f; fEye = 1.5f; break;
-			case eNetMoveState_Run:    sType = "run";   fRate = 0.30f; fStride = 0.50f; fEye = 1.5f; break;
-			case eNetMoveState_Crouch: sType = "sneak"; fRate = 0.60f; fStride = 0.25f; fEye = 1.1f; break;
+			case eNetMoveState_Walk:   sType = "walk";  fRate = 0.45f; fStride = 0.35f; break;
+			case eNetMoveState_Run:    sType = "run";   fRate = 0.30f; fStride = 0.50f; break;
+			case eNetMoveState_Crouch: sType = "sneak"; fRate = 0.60f; fStride = 0.25f; break;
 			default: /* Still, Jump, unknown: silent */
 				state.mfMoved = 0.0f;
 				continue;
@@ -192,13 +192,12 @@ namespace
 			const cVector3f vEnd = vStart - cVector3f(0, 2.0f, 0);
 			pWorld->GetPhysicsWorld()->CastRay(&rayCallback, vStart, vEnd, true, false, false);
 
-			tString sMatStepType = "";
-			cVector3f vFeet = vCam - cVector3f(0, fEye, 0);
-			if(rayCallback.mpMaterial)
-			{
-				sMatStepType = rayCallback.mpMaterial->GetSurfaceData()->GetStepType();
-				vFeet = vStart - cVector3f(0, rayCallback.mfMinDist, 0);
-			}
+			//No geometry under the ghost (map-transition window, mid-air): no
+			//step — exactly like cPlayer::FootStep with an empty step type.
+			if(rayCallback.mpMaterial==NULL) continue;
+			const tString sMatStepType = rayCallback.mpMaterial->GetSurfaceData()->GetStepType();
+			if(sMatStepType=="") continue;
+			const cVector3f vFeet = vStart - cVector3f(0, rayCallback.mfMinDist, 0);
 
 			cSoundEntityData *pSoundData = NetGhostStepSound(apInit, sType, sMatStepType);
 			if(pSoundData==NULL) continue;

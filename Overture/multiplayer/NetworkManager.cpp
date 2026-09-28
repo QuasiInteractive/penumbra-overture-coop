@@ -314,6 +314,7 @@ void cNetworkManager::Update(float /*afTimeStep*/)
 void cNetworkManager::ClearGhostsInternal()
 {
 	m_mapGhostSeq.clear(); /* new session, new counters */
+	m_mapGhostMoveState.clear();
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
@@ -331,6 +332,7 @@ void cNetworkManager::DispatchIncoming(const void *, size_t)
 void cNetworkManager::DropRemotePlayer(uint8_t id)
 {
 	m_mapGhostSeq.erase(id); /* a rejoiner restarts its counter */
+	m_mapGhostMoveState.erase(id);
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
 	if (it != m_mapGhosts.end())
 	{
@@ -1179,6 +1181,7 @@ void cNetworkManager::HandleBodyIntent(uint8_t alAuthor, const void *apData, siz
 void cNetworkManager::ClearGhostsInternal()
 {
 	m_mapGhostSeq.clear(); /* new session, new counters */
+	m_mapGhostMoveState.clear();
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
@@ -1188,6 +1191,7 @@ void cNetworkManager::ClearGhostsInternal()
 void cNetworkManager::DropRemotePlayer(uint8_t id)
 {
 	m_mapGhostSeq.erase(id); /* a rejoiner restarts its counter */
+	m_mapGhostMoveState.erase(id);
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
 	if (it != m_mapGhosts.end())
 	{
@@ -1437,7 +1441,8 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 	std::map<uint8_t, cGhostPlayer *>::iterator gi = m_mapGhosts.find(st->mPlayerID);
 	if (gi != m_mapGhosts.end())
 		gi->second->ApplyState(*st);
-	m_mapGhostMoveState[st->mPlayerID] = st->mMoveState; /* enemy senses: stealth + hearing (GetGhostSense) */
+	if (mbHosting)
+		m_mapGhostMoveState[st->mPlayerID] = st->mMoveState; /* enemy senses: stealth + hearing (GetGhostSense) */
 
 	/* Spawn-at-friend: the first HOST state after the census verifies (same
 	   map, same identities) teleports the joining guest to the host's side.
