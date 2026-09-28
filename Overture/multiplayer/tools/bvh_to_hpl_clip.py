@@ -498,9 +498,6 @@ class Retargeter(object):
         self.log = log
         _, self.src_rest_pos = bvh_rest.fk(None)
         self.src_joints = set(bvh_rest.joints)
-        inv_map = {}
-        for tj, sj in MAP.items():
-            inv_map[tj] = sj
         # active mapping: target joint present in base AND source joint present
         self.map = {tj: sj for tj, sj in MAP.items() if tj in tgt.joints and sj in self.src_joints}
         missing_tgt = sorted(k for k in MAP if k not in tgt.joints)
@@ -645,9 +642,6 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
     hipsL = list(src[last][1]["Hips"])
     span = float(last - s) if last > s else 1.0
 
-    # linear XZ drift (network position owns locomotion)
-    drift = [hipsL[0] - hips0[0], 0.0, hipsL[2] - hips0[2]]
-    drift_len = vlen(drift)
     # linear yaw drift (turn clips only)
     yaw_total = 0.0
     if cfg.get("remove_yaw"):
@@ -658,16 +652,29 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
             yaw_prev = y
         yaw_total = acc
 
-    def corrected(fi):
-        """Source world rots/positions of frame fi with drift/yaw removed."""
+    def unyawed(fi):
+        """Source world rots/positions of frame fi with the linear yaw drift
+        removed: the whole pose is rotated about the hips' START position."""
         W, P = src[fi]
-        a = (fi - s) / span
         if abs(yaw_total) > 1e-6:
-            R = rot_axis("y", -yaw_total * a)
+            R = rot_axis("y", -yaw_total * (fi - s) / span)
             W = {j: mat_mul(R, w) for j, w in W.items()}
             P = {j: vadd(hips0, mv(R, vsub(p, hips0))) for j, p in P.items()}
+        return W, P
+
+    # linear XZ drift (network position owns locomotion), measured on the
+    # yaw-corrected path so that the last frame's hips land exactly on the
+    # first frame's (measuring it on the raw path and rotating afterwards
+    # left the turn clips' hips ~18 cm off at the end).
+    hipsL_c = unyawed(last)[1]["Hips"]
+    drift = [hipsL_c[0] - hips0[0], 0.0, hipsL_c[2] - hips0[2]]
+    drift_len = vlen(drift)
+
+    def corrected(fi):
+        """Source world rots/positions of frame fi with yaw AND drift removed."""
+        W, P = unyawed(fi)
         if drift_len > 1e-6:
-            d = vscale(drift, a)
+            d = vscale(drift, (fi - s) / span)
             P = {j: vsub(p, d) for j, p in P.items()}
         return W, P
 

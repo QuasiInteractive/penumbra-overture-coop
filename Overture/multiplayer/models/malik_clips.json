@@ -751,8 +751,8 @@
    },
    "root_motion": {
     "xz_drift_removed_cm": [
-     -1.01,
-     13.93
+     -13.87,
+     -1.65
     ],
     "yaw_removed_deg": 92.67,
     "y_clamped_to_stand": false,
@@ -800,8 +800,8 @@
    },
    "root_motion": {
     "xz_drift_removed_cm": [
-     9.33,
-     -17.79
+     -18.39,
+     -8.09
     ],
     "yaw_removed_deg": -93.93,
     "y_clamped_to_stand": false,
