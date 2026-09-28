@@ -28,7 +28,8 @@
   .lbl{position:absolute;transform:translate(6px,-50%);font:11px monospace;color:#fff;background:rgba(0,0,0,.55);padding:1px 4px;border-radius:3px;white-space:nowrap}
   .lbl.hover{background:var(--accent);color:#000}
   #hud{position:absolute;left:10px;top:8px;font:12px/1.5 monospace;color:#e6e9ee;background:rgba(0,0,0,.45);padding:6px 8px;border-radius:5px;pointer-events:none;white-space:pre}
-  #hint{position:absolute;right:10px;top:8px;font:11px monospace;color:var(--muted);pointer-events:none;text-align:right}
+  #hint{position:absolute;right:10px;bottom:8px;font:11px monospace;color:var(--muted);pointer-events:none;text-align:right}
+  #clipInfo{max-height:54px;overflow:auto;font-size:11px}
   fieldset{border:1px solid var(--line);border-radius:6px;margin:0 0 10px;padding:8px 10px}
   legend{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding:0 4px}
   label{display:flex;align-items:center;gap:6px;margin:4px 0}
@@ -57,6 +58,8 @@
   .tag.base{border-color:#3d6f94}
   #status{font-size:11px;color:var(--muted);margin-top:6px;min-height:14px}
   pre{white-space:pre-wrap;word-break:break-all;background:var(--panel2);padding:6px;border-radius:4px;max-height:160px;overflow:auto;margin:4px 0;font-size:11px}
+  @media (max-width:1100px){ body{grid-template-columns:230px 1fr 260px} #top{gap:8px;padding:6px 10px} }
+  @media (max-width:820px){ body{grid-template-columns:1fr;grid-template-rows:auto 55vh auto auto;grid-template-areas:"top" "view" "left" "right";overflow:auto} #left,#right{border:0;border-top:1px solid var(--line)} }
 </style>
 </head>
 <body>
@@ -64,8 +67,7 @@
 <header id="top">
   <h1>HPL1 Anim Viewer</h1>
   <div id="drop" title="Click to choose files, or drop them here">
-    <b>Drop <code>phillip.dae</code> and <code>phillip_*.dae</code> here</b> (or click) — also <code>.bvh</code> pack clips, <code>phillip.tga</code>, <code>phillip_clips.json</code>.
-    Works offline from file://. A single clip file is enough (it embeds the mesh).
+    <b>Drop <code>phillip.dae</code> + <code>phillip_*.dae</code> here</b> (or click) — also <code>.bvh</code>, <code>.tga</code>, <code>_clips.json</code>. Offline, file:// OK; one clip file is enough.
     <input id="file" type="file" multiple accept=".dae,.bvh,.tga,.json,.xml">
   </div>
 </header>
@@ -83,7 +85,7 @@
     <label><span class="k">Clip A</span><select id="clipA"></select></label>
     <label><input type="checkbox" id="compare"> A/B compare (B drawn 1 m to the right)</label>
     <label><span class="k">Clip B</span><select id="clipB" disabled></select></label>
-    <div id="clipInfo" class="mono muted" style="margin-top:4px"></div>
+    <div id="clipInfo" class="mono muted" style="margin-top:4px" title="scalars from the _clips.json sidecar; full entry in the diagnostics panel"></div>
   </fieldset>
 
   <fieldset>
@@ -122,7 +124,7 @@
     <legend>Ghost camera markers</legend>
     <label><span class="k" style="color:var(--marker-stand)">Standing</span><input type="number" id="camStand" step="0.01" value="1.50"> m</label>
     <label><span class="k" style="color:var(--marker-crouch)">Crouched</span><input type="number" id="camCrouch" step="0.01" value="0.80"> m</label>
-    <div class="muted" style="font-size:11px">Marker = remote camera (eye) height above the mesh origin. With feet at y=0 this gives <span class="mono">ghost_body_y = -standing</span>, <span class="mono">ghost_body_y_crouch = -crouched</span> (GhostPlayer.cpp:797-814 adds the offset to the synced camera position).</div>
+    <div class="muted" style="font-size:11px">Marker = height of the remote player's camera above the mesh origin (feet at y=0). The ghost body is placed at <span class="mono">cameraY + offset</span> (GhostPlayer.cpp:797-814), so <span class="mono">ghost_body_y = -standing</span>, <span class="mono">ghost_body_y_crouch = -crouched</span> in multiplayer.cfg. Without cfg keys the mod uses <span class="mono">-(Player/Height·½ + CameraHeightAdd + 0.71)</span> from game.cfg (NetworkManager.cpp:1002-1024). Set the marker so the head/eyes of the posed mesh sit at it.</div>
   </fieldset>
 </aside>
 
@@ -637,6 +639,7 @@ function buildAnimation(colladaAnims, scene, skeleton, W, fileName) {
   var frameNumberDoc = (scene.endTime <= scene.startTime);            // MLCH:463
   var timeScale = frameNumberDoc ? (1 / FPS) : 1;                      // MLCH:464
   var noBone = 0, noNode = 0, skippedSids = [];
+  if (!skeleton) W.push({ level: 'bad', msg: 'library_animations without a skin controller/skeleton: CreateAnimTrack gets pBone==NULL, every track gets node index -1 and is skipped at runtime (MLC:1069-1072, ME:763-764) — the clip does nothing in-game. A clip file must embed the base mesh + skin + JOINT tree.' });
 
   colladaAnims.forEach(function (A) {
     var node = scene.getNode(A.targetNode);
@@ -892,6 +895,21 @@ function seamError(anim) {
   return { rotDeg: worstRot, rotBone: worstRotBone, trans: worstTr, transBone: worstTrBone, hips: hips };
 }
 
+/** Engine quirk: QuaternionSlerp returns key A unchanged when |dot(A,B)-1| <= kEpsilonf (Math.cpp:866-870),
+    i.e. adjacent keys closer than ~1.6 deg are NOT interpolated: the bone holds A for the whole interval
+    and steps to B only when t passes B's time (30 fps stepping on slow bones). Counts such intervals. */
+function slerpSnapStats(anim) {
+  var intervals = 0, snapped = 0, perTrack = [];
+  anim.tracks.forEach(function (t) {
+    if (t.synthetic || t.keys.length < 2) return;
+    var n = 0;
+    for (var i = 1; i < t.keys.length; i++) { intervals++; if (Math.abs(qDot(t.keys[i - 1].rot, t.keys[i].rot) - 1) <= kEpsilonf) { snapped++; n++; } }
+    if (n) perTrack.push({ name: t.name, snapped: n, of: t.keys.length - 1 });
+  });
+  perTrack.sort(function (a, b) { return b.snapped - a.snapped; });
+  return { intervals: intervals, snapped: snapped, perTrack: perTrack, thresholdDeg: 2 * Math.acos(1 - kEpsilonf) / DEG };
+}
+
 /* ======================================================================
    BVH (HIERARCHY + MOTION), cm -> m, Z/Y/X channel order per joint
    ====================================================================== */
@@ -905,22 +923,32 @@ function parseBvh(txt, fileName) {
     var tk = next();
     if (tk === 'ROOT' || tk === 'JOINT') {
       var j = { name: next(), offset: [0, 0, 0], channels: [], chanStart: nChan, parent: cur ? cur.index : -1, children: [], index: joints.length, endSite: null };
+      if (!/^[A-Za-z_]/.test(j.name || '')) W.push({ level: 'warn', msg: 'BVH: odd joint name "' + j.name + '"' });
       joints.push(j); if (cur) cur.children.push(j.index); stack.push(j); cur = j;
-    } else if (tk === 'End') { next(); /* Site */ next(); /* { */ next(); /* OFFSET */ cur.endSite = [+next(), +next(), +next()]; next(); /* } */ }
+    } else if (tk === 'End') {
+      next(); /* Site */ next(); /* { */ next(); /* OFFSET */
+      var off = [+next(), +next(), +next()]; next(); /* } */
+      if (cur) { var e = { name: cur.name + '_End', offset: off, channels: [], chanStart: nChan, parent: cur.index, children: [], index: joints.length, endSite: true }; joints.push(e); cur.children.push(e.index); cur.endSite = off; }
+    }
     else if (tk === 'OFFSET') { cur.offset = [+next(), +next(), +next()]; }
     else if (tk === 'CHANNELS') { var n = +next(); for (var i = 0; i < n; i++) cur.channels.push(next()); nChan += n; }
     else if (tk === '{') { }
     else if (tk === '}') { stack.pop(); cur = stack.length ? stack[stack.length - 1] : null; }
     else if (tk === 'MOTION') break;
   }
+  if (!joints.length) W.push({ level: 'bad', msg: 'BVH: no ROOT joint found' });
   var nFrames = 0, frameTime = 1 / FPS;
   while (p < toks.length) {
     var t2 = next();
     if (t2 === 'Frames:') nFrames = +next();
     else if (t2 === 'Frame') { next(); frameTime = +next(); break; }
   }
-  var data = new Float32Array(nFrames * nChan);
-  for (var f = 0; f < nFrames * nChan && p < toks.length; f++) data[f] = +toks[p++];
+  if (!(nFrames > 0) || !(frameTime > 0)) W.push({ level: 'bad', msg: 'BVH: missing/invalid Frames: or Frame Time:' });
+  if (!(nFrames > 0)) nFrames = 0;
+  if (!(frameTime > 0)) frameTime = 1 / FPS;
+  var data = new Float32Array(nFrames * nChan), have = 0;
+  for (var f = 0; f < nFrames * nChan && p < toks.length; f++) { data[f] = +toks[p++]; have++; }
+  if (have < nFrames * nChan) W.push({ level: 'bad', msg: 'BVH: MOTION has ' + have + ' numbers, expected ' + (nFrames * nChan) + ' (' + nFrames + ' frames x ' + nChan + ' channels); missing values read as 0.' });
   if (p < toks.length) W.push({ level: 'warn', msg: 'BVH: ' + (toks.length - p) + ' extra numbers after the declared frame count.' });
   if (Math.abs(frameTime - 1 / FPS) > 1e-4) W.push({ level: 'warn', msg: 'BVH frame time ' + frameTime + ' s (' + (1 / frameTime).toFixed(2) + ' fps) — the HPL pipeline assumes 30 fps frame numbers.' });
   var rootStart = joints.length ? joints[0].chanStart : 0, rootCh = joints.length ? joints[0].channels : [];
@@ -954,11 +982,52 @@ function bvhPose(bvh, t, rootMode) {
   return world;
 }
 
-return { DEG: DEG, FPS: FPS, mIdent: mIdent, mMul: mMul, mInv: mInv, mGetT: mGetT, mMulPoint: mMulPoint, mRotX: mRotX, mRotY: mRotY, mRotZ: mRotZ, mMaxAbsDiff: mMaxAbsDiff,
+/* ======================================================================
+   TGA decoder (types 2/10, 24/32 bpp, bottom-left or top-left origin;
+   TGA 2.0 footer ignored). Output: RGBA rows bottom-up (WebGL order).
+   ====================================================================== */
+function decodeTga(buf) {
+  var u8 = new Uint8Array(buf);
+  if (u8.length < 18) throw new Error('TGA: file too small');
+  var idLen = u8[0], cmapType = u8[1], type = u8[2];
+  var w = u8[12] | (u8[13] << 8), h = u8[14] | (u8[15] << 8), bpp = u8[16], desc = u8[17];
+  var topLeft = (desc & 0x20) !== 0, rightToLeft = (desc & 0x10) !== 0;
+  if (cmapType !== 0) throw new Error('TGA: color-mapped images are not supported');
+  if (!(type === 2 || type === 10)) throw new Error('TGA: image type ' + type + ' not supported (need 2 = uncompressed truecolor or 10 = RLE truecolor)');
+  if (!(bpp === 24 || bpp === 32)) throw new Error('TGA: ' + bpp + ' bpp not supported (need 24 or 32)');
+  if (!w || !h) throw new Error('TGA: zero size');
+  var p = 18 + idLen + (cmapType ? 0 : 0), bytes = bpp >> 3, n = w * h, out = new Uint8Array(n * 4), i = 0, truncated = false;
+  function put(o) {                       // BGR(A) -> RGBA
+    out[o*4] = u8[p+2]; out[o*4+1] = u8[p+1]; out[o*4+2] = u8[p]; out[o*4+3] = bytes === 4 ? u8[p+3] : 255;
+  }
+  if (type === 2) {
+    for (i = 0; i < n; i++) { if (p + bytes > u8.length) { truncated = true; break; } put(i); p += bytes; }
+  } else {
+    while (i < n) {
+      if (p >= u8.length) { truncated = true; break; }
+      var hdr = u8[p++], cnt = (hdr & 0x7f) + 1;
+      if (hdr & 0x80) { if (p + bytes > u8.length) { truncated = true; break; } for (var k = 0; k < cnt && i < n; k++, i++) put(i); p += bytes; }
+      else { for (var k2 = 0; k2 < cnt && i < n; k2++, i++) { if (p + bytes > u8.length) { truncated = true; break; } put(i); p += bytes; } if (truncated) break; }
+    }
+  }
+  if (topLeft) {                          // stored top row first -> flip so row 0 is the bottom
+    var row = w * 4, tmp = new Uint8Array(row);
+    for (var y = 0; y < (h >> 1); y++) { var a = y * row, b = (h - 1 - y) * row; tmp.set(out.subarray(a, a + row)); out.copyWithin(a, b, b + row); out.set(tmp, b); }
+  }
+  if (rightToLeft) {
+    for (var y2 = 0; y2 < h; y2++) for (var x = 0; x < (w >> 1); x++) {
+      var a2 = (y2 * w + x) * 4, b2 = (y2 * w + (w - 1 - x)) * 4;
+      for (var c = 0; c < 4; c++) { var t = out[a2 + c]; out[a2 + c] = out[b2 + c]; out[b2 + c] = t; }
+    }
+  }
+  return { width: w, height: h, data: out, type: type, bpp: bpp, topLeft: topLeft, truncated: truncated, hasAlpha: bytes === 4 };
+}
+
+return { DEG: DEG, FPS: FPS, kEpsilonf: kEpsilonf, mIdent: mIdent, mTranslate: mTranslate, mRot3: mRot3, qDot: qDot, mMul: mMul, mInv: mInv, mGetT: mGetT, mMulPoint: mMulPoint, mRotX: mRotX, mRotY: mRotY, mRotZ: mRotZ, mMaxAbsDiff: mMaxAbsDiff,
          qIdent: qIdent, qFromAngleAxis: qFromAngleAxis, qToMatrix: qToMatrix, qFromMatrix: qFromMatrix, qSlerp: qSlerp, qAngleDeg: qAngleDeg, wrap: wrap, clamp: clamp,
          parseDae: parseDae, parseBvh: parseBvh, bvhPose: bvhPose, buildAnimation: buildAnimation, interpKey: interpKey, computePose: computePose,
-         skinMatrices: skinMatrices, skinVertices: skinVertices, advanceState: advanceState, stateIsOver: stateIsOver, compareSkeletons: compareSkeletons, seamError: seamError,
-         fileStem: fileStem, floats: floats, slerpNaNCount: function () { return slerpNaNCount; } };
+         skinMatrices: skinMatrices, skinVertices: skinVertices, advanceState: advanceState, stateIsOver: stateIsOver, compareSkeletons: compareSkeletons, seamError: seamError, slerpSnapStats: slerpSnapStats,
+         fileStem: fileStem, floats: floats, decodeTga: decodeTga, slerpNaNCount: function () { return slerpNaNCount; } };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = HPL;
 </script>
@@ -970,35 +1039,22 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HPL;
 } }
 </script>
 
+<script>
+// Visible failure mode when the CDN is unreachable (offline / blocked): the module script below never runs.
+window.__viewerReady = false;
+setTimeout(function () {
+  if (window.__viewerReady) return;
+  var h = document.getElementById('hud');
+  h.textContent = 'three.js did not load from cdn.jsdelivr.net within 10 s.\nThe viewer needs network access to that CDN once (no local files are fetched).\nCheck the browser console / network tab.';
+  h.style.color = '#f2716f';
+  document.getElementById('status').textContent = 'renderer not loaded (CDN unreachable?)';
+}, 10000);
+window.addEventListener('unhandledrejection', function (e) { var st = document.getElementById('status'); if (st && e.reason) { st.textContent = 'error: ' + (e.reason.message || e.reason); st.className = 'bad'; } });
+</script>
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-
-/* ============================ TGA decoder ============================ */
-function decodeTga(buf) {
-  const d = new DataView(buf), u8 = new Uint8Array(buf);
-  const idLen = u8[0], cmapType = u8[1], type = u8[2];
-  const w = d.getUint16(12, true), h = d.getUint16(14, true), bpp = u8[16], desc = u8[17];
-  const topLeft = (desc & 0x20) !== 0;
-  if (cmapType !== 0) throw new Error('color-mapped TGA not supported');
-  if (!(type === 2 || type === 10) || !(bpp === 24 || bpp === 32)) throw new Error('TGA type ' + type + '/' + bpp + 'bpp not supported (need uncompressed/RLE 24/32-bit)');
-  let p = 18 + idLen; const bytes = bpp / 8, out = new Uint8Array(w * h * 4), n = w * h;
-  let i = 0;
-  const put = (o) => { const px = u8[p], py = u8[p+1], pz = u8[p+2]; out[o*4] = pz; out[o*4+1] = py; out[o*4+2] = px; out[o*4+3] = bytes === 4 ? u8[p+3] : 255; };
-  if (type === 2) { for (i = 0; i < n; i++) { put(i); p += bytes; } }
-  else {
-    while (i < n && p < u8.length) {
-      const hdr = u8[p++], cnt = (hdr & 0x7f) + 1;
-      if (hdr & 0x80) { for (let k = 0; k < cnt && i < n; k++, i++) put(i); p += bytes; }
-      else { for (let k = 0; k < cnt && i < n; k++, i++) { put(i); p += bytes; } }
-    }
-  }
-  if (topLeft) { // WebGL wants first row = bottom; flip
-    const row = w * 4, tmp = new Uint8Array(row);
-    for (let y = 0; y < h >> 1; y++) { const a = y * row, b = (h - 1 - y) * row; tmp.set(out.subarray(a, a + row)); out.copyWithin(a, b, b + row); out.set(tmp, b); }
-  }
-  return { width: w, height: h, data: out };
-}
+window.__viewerReady = true;
 
 /* ============================ three.js scene ============================ */
 const view = document.getElementById('view'), labelsEl = document.getElementById('labels'), hud = document.getElementById('hud');
@@ -1029,7 +1085,7 @@ const markStand = markerRect(0x6fd38a), markCrouch = markerRect(0xf0b35a);
 /* ---- one renderable "slot" (A or B): skinned mesh + skeleton overlay ---- */
 function makeSlot(xOffset) {
   const group = new THREE.Group(); group.position.x = xOffset; scene.add(group);
-  const s = { group, xOffset, mesh: null, model: null, clip: null, state: null, skelLines: null, skelPoints: null, jointWorld: [], jointNames: [], labelDivs: [], hoverIdx: -1, bvhWorld: null };
+  const s = { group, xOffset, mesh: null, model: null, clip: null, state: null, skelLines: null, skelPoints: null, jointWorld: [], jointNames: [], labelDivs: [], hoverIdx: -1, bvhWorld: null, serial: 0, lastPoseKey: '' };
   const lineMat = new THREE.LineBasicMaterial({ color: 0x5cc8ff, depthTest: false, transparent: true, opacity: 0.95 });
   const ptMat = new THREE.PointsMaterial({ color: 0xffd166, size: 7, sizeAttenuation: false, depthTest: false, transparent: true });
   s.skelLines = new THREE.LineSegments(new THREE.BufferGeometry(), lineMat); s.skelLines.renderOrder = 10; s.skelLines.frustumCulled = false; group.add(s.skelLines);
@@ -1046,7 +1102,7 @@ function buildMaterial() {
 }
 function setMesh(slot, model) {
   if (slot.mesh) { slot.group.remove(slot.mesh); slot.mesh.geometry.dispose(); slot.mesh.material.dispose(); slot.mesh = null; }
-  slot.model = model;
+  slot.model = model; slot.serial++;
   if (!model || !model.geometry) return;
   const g = model.geometry;
   const geom = new THREE.BufferGeometry();
@@ -1120,12 +1176,15 @@ async function loadDae(file) {
   try { model = HPL.parseDae(doc, file.name); } catch (e) { console.error(e); app.files.push({ name: file.name, kind: 'dae', error: 'parse exception: ' + e.message }); return; }
   model.parseMs = performance.now() - t0;
   const entry = { name: file.name, kind: 'dae', model, isBase: false, isClip: !!model.anim };
-  if (!app.base && model.skeleton && model.geometry && model.skinData) {
+  const usable = !!(model.skeleton && model.skeleton.bones.length && model.geometry && model.skinData);
+  // the first usable document becomes the base; a real base (no animations) later replaces a clip-derived one
+  if (usable && (!app.base || (app.base.anim && !model.anim))) {
+    for (const f of app.files) if (f.isBase) { f.isBase = false; f.note = 'was base; replaced by ' + file.name; }
     app.base = model; entry.isBase = true;
     model.baseName = model.anim ? (HPL.fileStem(file.name).split('_')[0]) : HPL.fileStem(file.name);
     setMesh(slotA, model); setMesh(slotB, model);
     fitCamera(model);
-  }
+  } else if (!usable && !model.anim) entry.error = 'no skin controller + JOINT tree + geometry: not usable as base';
   if (model.anim) {
     app.clips.push({ kind: 'dae', name: clipNameFor(file.name), fileName: file.name, model, anim: model.anim, warnings: model.warnings });
   } else if (!entry.isBase) entry.note = 'no <library_animations> (and a base is already loaded)';
@@ -1141,12 +1200,12 @@ async function loadBvh(file) {
 }
 async function loadTga(file) {
   try {
-    const img = decodeTga(await file.arrayBuffer());
+    const img = HPL.decodeTga(await file.arrayBuffer());
     if (texture) texture.dispose();
     texture = new THREE.DataTexture(img.data, img.width, img.height, THREE.RGBAFormat);
     texture.colorSpace = THREE.SRGBColorSpace; texture.magFilter = THREE.LinearFilter; texture.minFilter = THREE.LinearMipmapLinearFilter; texture.generateMipmaps = true; texture.needsUpdate = true;
     refreshMaterials();
-    app.files.push({ name: file.name, kind: 'tga', note: `${img.width}x${img.height}` });
+    app.files.push({ name: file.name, kind: 'tga', note: `${img.width}x${img.height} ${img.bpp}bpp${img.type === 10 ? ' RLE' : ''}${img.topLeft ? ' top-left' : ''}`, error: img.truncated ? 'truncated pixel data (rest left black)' : undefined });
   } catch (e) { app.files.push({ name: file.name, kind: 'tga', error: e.message }); }
 }
 
@@ -1178,7 +1237,7 @@ function refreshClipLists() {
 }
 
 function selectClip(slot, idx) {
-  const clip = app.clips[idx]; slot.clip = clip || null;
+  const clip = app.clips[idx]; slot.clip = clip || null; slot.serial++;
   if (!clip) { slot.state = null; return; }
   if (clip.kind === 'dae') slot.state = { anim: clip.anim, timePos: 0, prevTimePos: 0, weight: 1, active: true, loop: app.loop, speed: app.speed, baseSpeed: 1, paused: false };
   else slot.state = { anim: { length: clip.bvh.length }, timePos: 0, prevTimePos: 0, weight: 1, active: true, loop: app.loop, speed: app.speed, baseSpeed: 1, paused: false };
@@ -1210,6 +1269,9 @@ function updateSlot(slot, dt) {
     return;
   }
   const model = slot.model; if (!model) return;
+  const poseKey = `${slot.serial}|${st ? st.timePos : -1}|${ui.showBind.checked ? 1 : 0}|${ui.showMesh.checked ? 1 : 0}|${ui.showSkel.checked ? 1 : 0}`;
+  if (poseKey === slot.lastPoseKey) return;            // paused and nothing toggled: keep last skin/overlay
+  slot.lastPoseKey = poseKey;
   const states = (ui.showBind.checked || !st) ? [] : [st];
   const pose = HPL.computePose(model.skeleton, states);
   slot.jointWorld = pose.world.map(m => HPL.mGetT(m)); slot.jointNames = model.skeleton.bones.map(b => b.name);
@@ -1240,13 +1302,14 @@ function updateSkeletonOverlay(slot, parents) {
 function hipsAndFeet(slot) {
   const names = slot.jointNames, jw = slot.jointWorld; if (!names.length) return null;
   let hips = names.findIndex(n => /hips/i.test(n)); if (hips < 0) hips = 0;
-  let lowest = Infinity, lowName = '', footLow = Infinity, footName = '';
+  let lowest = Infinity, lowName = '', footLow = Infinity, footName = '', highest = -Infinity, highName = '';
   for (let i = 0; i < jw.length; i++) {
     if (jw[i][1] < lowest) { lowest = jw[i][1]; lowName = names[i]; }
+    if (jw[i][1] > highest) { highest = jw[i][1]; highName = names[i]; }
     if (/foot|toe|ankle/i.test(names[i]) && jw[i][1] < footLow) { footLow = jw[i][1]; footName = names[i]; }
   }
   if (footLow === Infinity) { footLow = lowest; footName = lowName; }
-  return { hipsY: jw[hips][1], hipsName: names[hips], footY: footLow, footName, lowestY: lowest, lowName };
+  return { hipsY: jw[hips][1], hipsName: names[hips], footY: footLow, footName, lowestY: lowest, lowName, highestY: highest, highName };
 }
 
 function updateLabels() {
@@ -1304,7 +1367,7 @@ function animate() {
     ui.timeV.textContent = `t = ${st.timePos.toFixed(3)} s / L = ${L.toFixed(3)} s` + (HPL.stateIsOver(st) ? '  (IsOver)' : '');
     const hf = hipsAndFeet(slotA);
     hudTxt = `A: ${clip.name}  frame ${fr.toFixed(2)}  t=${st.timePos.toFixed(3)}s`;
-    if (hf) hudTxt += `\n${hf.hipsName}: y=${hf.hipsY.toFixed(3)} m\nlowest foot (${hf.footName}): y=${hf.footY.toFixed(3)} m\nlowest joint (${hf.lowName}): y=${hf.lowestY.toFixed(3)} m`;
+    if (hf) hudTxt += `\n${hf.hipsName}: y=${hf.hipsY.toFixed(3)} m\nlowest foot (${hf.footName}): y=${hf.footY.toFixed(3)} m\nlowest joint (${hf.lowName}): y=${hf.lowestY.toFixed(3)} m\nhighest joint (${hf.highName}): y=${hf.highestY.toFixed(3)} m\nmarkers: stand ${(+ui.camStand.value || 0).toFixed(2)} / crouch ${(+ui.camCrouch.value || 0).toFixed(2)} m`;
     if (ui.compare.checked && slotB.clip && slotB.state) {
       const hb = hipsAndFeet(slotB);
       hudTxt += `\n\nB: ${slotB.clip.name}  t=${slotB.state.timePos.toFixed(3)}s` + (hb ? `\nhips y=${hb.hipsY.toFixed(3)}  foot y=${hb.footY.toFixed(3)}` : '');
@@ -1340,7 +1403,7 @@ function refreshDiagnostics() {
     if (clip.kind === 'dae') {
       const an = clip.anim, real = an.tracks.filter(t => !t.synthetic);
       let keyCounts = {}; real.forEach(t => { keyCounts[t.keys.length] = (keyCounts[t.keys.length] || 0) + 1; });
-      const seam = HPL.seamError(an);
+      const seam = HPL.seamError(an), snap = HPL.slerpSnapStats(an);
       const cmp = base ? HPL.compareSkeletons(base, clip.model) : null;
       const tracked = real.map(t => t.name), untracked = an.untracked;
       const nf = frameCount(clip);
@@ -1350,10 +1413,11 @@ function refreshDiagnostics() {
         <tr><td>tracks</td><td>${real.length} real + ${an.tracks.length - real.length} synthetic hold-bind (${Object.entries(keyCounts).map(([k, v]) => `${v}×${k} keys`).join(', ')})</td></tr>
         <tr><td>loop seam</td><td>max rot ${seam.rotDeg.toFixed(2)}° (${esc(seam.rotBone)}), max trans ${(seam.trans * 1000).toFixed(1)} mm (${esc(seam.transBone)})${seam.hips ? `; hips Δ ${seam.hips.rot.toFixed(2)}° / ${(seam.hips.trans * 1000).toFixed(1)} mm (Δy ${(seam.hips.dy * 1000).toFixed(1)} mm)` : ''}
           <div class="muted">first key vs last key; looping shows the last key at t=L then jumps to key 0 (Math.cpp:385) — author last==first for seamless loops.</div></td></tr>
+        <tr><td>slerp snap</td><td>${snap.snapped} of ${snap.intervals} key intervals (${snap.intervals ? (100 * snap.snapped / snap.intervals).toFixed(0) : 0}%) rotate &lt; ${snap.thresholdDeg.toFixed(2)}°: the engine holds the previous key instead of interpolating (QuaternionSlerp epsilon, Math.cpp:866-870)${snap.perTrack.length ? ` — most: ${esc(snap.perTrack.slice(0, 3).map(x => `${x.name.replace(/^mixamorigw/, '')} ${x.snapped}/${x.of}`).join(', '))}` : ''}</td></tr>
       </table>`);
       if (cmp) {
         const probs = [];
-        if (!cmp.sameCount) probs.push(`<li class="bad">bone count differs (base ${base.skeleton.bones.length} vs clip ${clip.model.skeleton.bones.length}) — tracks are applied BY INDEX (ME:766)</li>`);
+        if (!cmp.sameCount) probs.push(`<li class="bad">bone count differs (base ${base.skeleton.bones.length} vs clip ${clip.model.skeleton ? clip.model.skeleton.bones.length : 0}) — tracks are applied BY INDEX (ME:766)</li>`);
         if (cmp.orderMismatch.length) probs.push(`<li class="bad">joint order differs: ${esc(cmp.orderMismatch.slice(0, 5).join('; '))}${cmp.orderMismatch.length > 5 ? ' …' : ''}</li>`);
         if (cmp.missingInClip.length) probs.push(`<li class="warn">base joints missing in clip: ${esc(cmp.missingInClip.join(', '))}</li>`);
         if (cmp.extraInClip.length) probs.push(`<li class="warn">clip joints not in base: ${esc(cmp.extraInClip.join(', '))}</li>`);
@@ -1429,6 +1493,7 @@ window.addEventListener('keydown', e => {
   else if (e.code === 'ArrowRight') ui.stepFwd.click(); else if (e.code === 'ArrowLeft') ui.stepBack.click();
 });
 refreshDiagnostics();
+window.__viewer = { app, slotA, slotB, ui, handleFiles, setFrame, setPlaying, HPL, THREE, renderer };
 </script>
 </body>
 </html>
