@@ -38,6 +38,7 @@ enum eMainMenuState
 	eMainMenuState_Multiplayer,
 	eMainMenuState_MultiplayerHostLobby,
 	eMainMenuState_MultiplayerJoin,
+	eMainMenuState_MultiplayerName, /* v13: "What's your username?" */
 
 	eMainMenuState_LoadGameSpot,
 	eMainMenuState_LoadGameAuto,

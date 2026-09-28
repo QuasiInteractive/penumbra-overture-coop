@@ -15,9 +15,21 @@
 # numbers and converted (logged) — delete them from an old cfg.
 
 host=0
-# server_name=  — shown in the LAN server browser (spaces OK, 31 chars max)
+# ---- Username (v13) ----------------------------------------------------------
+# player_name=  — the name the other players see: over each friend's head,
+#                 in the inventory party list and in the top-left party panel
+#                 ("<name> joined / left / died / respawned"). Printable ASCII,
+#                 spaces OK, 24 characters max; anything else is stripped.
+#                 Leave it empty (or out) and the Multiplayer menu asks for it
+#                 the first time and writes it here ("Change name" edits it;
+#                 every other line of this file is kept). Friends without a
+#                 name show as "Player <id>".
+player_name=
+# server_name=  — shown in the LAN server browser (spaces OK, 31 chars max).
+#                 Empty / not set = "<player_name>'s game" ("Penumbra Server"
+#                 when there is no player_name either).
 # max_players=  — advertised in discovery pongs (2..31, default 4)
-server_name=Penumbra Server
+# server_name=Penumbra Server
 max_players=4
 port=7777
 # join=127.0.0.1:7777

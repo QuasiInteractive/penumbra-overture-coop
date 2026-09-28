@@ -51,6 +51,7 @@ static eMainMenuState gvMenuBackStates[] = {
 		eMainMenuState_Start,//eMainMenuState_Multiplayer,
 		eMainMenuState_Multiplayer,//eMainMenuState_MultiplayerHostLobby,
 		eMainMenuState_Multiplayer,//eMainMenuState_MultiplayerJoin,
+		eMainMenuState_Multiplayer,//eMainMenuState_MultiplayerName (v13)
 
 		eMainMenuState_Start,//eMainMenuState_LoadGameSpot,
 		eMainMenuState_Start,//eMainMenuState_LoadGameAuto,
@@ -81,6 +82,12 @@ static cMainMenuWidget_Text *gpMulHostFoot = NULL;
 
 static cMainMenuWidget_MultiIpLine *gpMulTypedIp = NULL;
 static bool gMulJoinAwaitHandshake = false;
+
+/* v13 username screen: the typing line (name mode), its status line and the
+   "Playing as ..." line on the Multiplayer screen. */
+static cMainMenuWidget_MultiIpLine *gpMulTypedName = NULL;
+static cMainMenuWidget_Text *gpMulNameFoot = NULL;
+static cMainMenuWidget_Text *gpMulNameShown = NULL;
 
 static tString MulTrimAscii(const tString &s)
 {
@@ -122,11 +129,15 @@ static int KeypadDigit(eKey mk)
 
 } 
 
+/** ASCII typing line. Address mode (default): IPv4/host:port characters,
+    220 max. Name mode (v13, abNameMode): any printable ASCII incl. spaces,
+    kNetPlayerNameMaxChars max, re-seeded from the current player name on
+    every activation; Enter is reported through TakeEnter(). */
 class cMainMenuWidget_MultiIpLine : public cMainMenuWidget_Text
 {
 public:
 	cMainMenuWidget_MultiIpLine(cInit *apInit, const cVector3f &avPos, const tString &asciiSeed,
-							   cVector2f avFontSize, eFontAlign aAlignment);
+							   cVector2f avFontSize, eFontAlign aAlignment, bool abNameMode = false);
 
 	void OnMouseDown(eMButton aButton);
 
@@ -142,9 +153,24 @@ public:
 
 	const tString &GetAscii() const { return msAscii; }
 
+	/** v13: Enter was pressed while focused since the last call (one-shot). */
+	bool TakeEnter()
+	{
+		const bool b = mbEnterPressed;
+		mbEnterPressed = false;
+		return b;
+	}
+
 	virtual void OnActivate()
 	{
 		mbTypingFocus = false;
+		mbEnterPressed = false;
+		if (mbNameMode && mpInit && mpInit->mpNetworkManager)
+		{
+			/* the screen always opens on the CURRENT name (renames included) */
+			msAscii = mpInit->mpNetworkManager->GetLocalPlayerName();
+			FlushToWide();
+		}
 		cMainMenuWidget::OnActivate();
 	}
 
@@ -154,15 +180,48 @@ private:
 	tString msAscii;
 	bool mbTypingFocus;
 	bool mbSelectAll;
+	bool mbNameMode;     /**< v13: username instead of an address */
+	bool mbEnterPressed; /**< v13: see TakeEnter */
 
 	void FlushToWide();
 
-	static bool CharOk(char c)
+	size_t MaxLen() const { return mbNameMode ? kNetPlayerNameMaxChars : 220; }
+
+	bool CharOk(char c) const
 	{
+		if (mbNameMode)
+			return c >= 32 && c < 127; /* printable ASCII, spaces included */
 		if (std::isalnum((unsigned char)c))
 			return true;
 		return c == '.' || c == ':' || c == '-' || c == '[' || c == ']';
 	}
+};
+
+//-----------------------------------------------------------------------
+
+/** v13: the Start screen's "Multiplayer" button — asks for a username
+    first when multiplayer.cfg has none. */
+class cMainMenuWidget_MultiEnter : public cMainMenuWidget_MainButton
+{
+public:
+	cMainMenuWidget_MultiEnter(cInit *apInit, const cVector3f &avPos, const tWString &asText)
+		: cMainMenuWidget_MainButton(apInit, avPos, asText, eMainMenuState_Multiplayer)
+	{
+	}
+
+	virtual void OnMouseDown(eMButton aButton);
+};
+
+/** v13: the username screen's save button (Enter does the same). */
+class cMainMenuWidget_MultiNameSave : public cMainMenuWidget_Button
+{
+public:
+	cMainMenuWidget_MultiNameSave(cInit *apInit, const cVector3f &avPos, const tWString &lbl)
+		: cMainMenuWidget_Button(apInit, avPos, lbl, eMainMenuState_LastEnum, 24, eFontAlign_Center)
+	{
+	}
+
+	virtual void OnMouseDown(eMButton aButton);
 };
 
 //-----------------------------------------------------------------------
@@ -230,8 +289,10 @@ private:
 
 cMainMenuWidget_MultiIpLine::cMainMenuWidget_MultiIpLine(cInit *apInit, const cVector3f &avPos,
 														 const tString &asciiSeed,
-														 cVector2f avFontSize, eFontAlign aAlignment)
+														 cVector2f avFontSize, eFontAlign aAlignment,
+														 bool abNameMode)
 	: cMainMenuWidget_Text(apInit, avPos, _W(""), avFontSize, aAlignment), mbTypingFocus(false), mbSelectAll(false)
+	, mbNameMode(abNameMode), mbEnterPressed(false)
 {
 	msAscii = asciiSeed;
 	FlushToWide();
@@ -240,7 +301,10 @@ cMainMenuWidget_MultiIpLine::cMainMenuWidget_MultiIpLine(cInit *apInit, const cV
 
 void cMainMenuWidget_MultiIpLine::FlushToWide()
 {
-	msText = msAscii.empty() ? _W("(type host)") : cString::To16Char(msAscii);
+	if (msAscii.empty())
+		msText = mbNameMode ? _W("(type name)") : _W("(type host)");
+	else
+		msText = cString::To16Char(msAscii);
 	UpdateSize();
 }
 
@@ -253,7 +317,7 @@ void cMainMenuWidget_MultiIpLine::OnDraw()
 
 	tWString sShow = _W("[ ");
 	if (msAscii.empty())
-		sShow += _W("type address here");
+		sShow += mbNameMode ? _W("type your name here") : _W("type address here");
 	else
 		sShow += cString::To16Char(msAscii);
 	if (mbTypingFocus && ((sBlink / 25) % 2) == 0)
@@ -287,6 +351,14 @@ void cMainMenuWidget_MultiIpLine::PollTyping()
 			continue;
 		}
 
+		if (kp.mKey == eKey_RETURN || kp.mKey == eKey_KP_ENTER)
+		{
+			/* v13: BEFORE the select-all clear — Enter on the seeded name
+			   keeps it (the username screen saves it). */
+			mbEnterPressed = true;
+			continue;
+		}
+
 		/* First edit after focus replaces the seeded address wholesale —
 		   nobody wants to backspace 127.0.0.1 nine times. */
 		if (mbSelectAll)
@@ -305,7 +377,7 @@ void cMainMenuWidget_MultiIpLine::PollTyping()
 		}
 
 		int kpd = KeypadDigit(kp.mKey);
-		if (kpd >= 0 && msAscii.size() < 220)
+		if (kpd >= 0 && msAscii.size() < MaxLen())
 		{
 			msAscii += (char)('0' + kpd);
 			FlushToWide();
@@ -318,7 +390,7 @@ void cMainMenuWidget_MultiIpLine::PollTyping()
 			   address a friend just sent, not a fragment to splice in. */
 			tString sClip = cNetworkManager::GetClipboardTextAscii();
 			tString sNew;
-			for (size_t ci = 0; ci < sClip.size() && sNew.size() < 220; ++ci)
+			for (size_t ci = 0; ci < sClip.size() && sNew.size() < MaxLen(); ++ci)
 			{
 				if (CharOk(sClip[ci]))
 					sNew += sClip[ci];
@@ -336,11 +408,14 @@ void cMainMenuWidget_MultiIpLine::PollTyping()
 			continue;
 
 		int uch = kp.mlUnicode;
-		if (uch >= 32 && uch < 127 && CharOk((char)uch) && msAscii.size() < 220)
+		if (uch >= 32 && uch < 127 && CharOk((char)uch) && msAscii.size() < MaxLen())
+		{
 			msAscii += (char)uch;
+			FlushToWide();
+		}
 		else if (kp.mKey == eKey_KP_PERIOD || kp.mKey == eKey_PERIOD)
 		{
-			if (msAscii.size() < 220)
+			if (msAscii.size() < MaxLen())
 			{
 				msAscii += '.';
 				FlushToWide();
@@ -348,19 +423,61 @@ void cMainMenuWidget_MultiIpLine::PollTyping()
 		}
 		else if (kp.mKey == eKey_KP_MINUS || kp.mKey == eKey_MINUS)
 		{
-			if (msAscii.size() < 220)
+			if (msAscii.size() < MaxLen())
 			{
 				msAscii += '-';
 				FlushToWide();
 			}
 		}
 
-		else if (kp.mKey == eKey_COLON && msAscii.size() < 220)
+		else if (kp.mKey == eKey_COLON && msAscii.size() < MaxLen())
 		{
 			msAscii += ':';
 			FlushToWide();
 		}
 	}
+}
+
+//-----------------------------------------------------------------------
+
+namespace {
+
+/* v13: the username screen's commit — the save button and Enter both land
+   here. Empty (after sanitising) = stay on the screen and say so. */
+static void MulSaveTypedName(cInit *apInit)
+{
+	if (!apInit || !apInit->mpNetworkManager || gpMulTypedName == NULL)
+		return;
+	const tString sName = cNetworkManager::SanitizePlayerName(gpMulTypedName->GetAscii());
+	if (sName.empty())
+	{
+		if (gpMulNameFoot)
+		{
+			gpMulNameFoot->msText = _W("Type a name first (letters, digits, spaces; 24 characters max).");
+			gpMulNameFoot->UpdateSize();
+		}
+		return;
+	}
+	apInit->mpNetworkManager->SetLocalPlayerName(sName); /* writes multiplayer.cfg */
+	apInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+	apInit->mpMainMenu->SetState(eMainMenuState_Multiplayer);
+}
+
+}
+
+void cMainMenuWidget_MultiEnter::OnMouseDown(eMButton aButton)
+{
+	(void)aButton;
+	const bool bNoName = mpInit->mpNetworkManager == NULL ||
+		mpInit->mpNetworkManager->GetLocalPlayerName().empty();
+	mpInit->mpMainMenu->SetState(bNoName ? eMainMenuState_MultiplayerName : eMainMenuState_Multiplayer);
+	mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+}
+
+void cMainMenuWidget_MultiNameSave::OnMouseDown(eMButton aButton)
+{
+	(void)aButton;
+	MulSaveTypedName(mpInit);
 }
 
 //-----------------------------------------------------------------------
@@ -2659,7 +2776,31 @@ void cMainMenu::Update(float afTimeStep)
 					gpMulTypedIp->FocusTyping();
 				gpMulTypedIp->PollTyping();
 			}
+			if (gpMulTypedName != NULL && mState == eMainMenuState_MultiplayerName)
+			{
+				/* v13 username screen: same focus-on-arrival; Enter saves */
+				if (sMulPrevState != eMainMenuState_MultiplayerName)
+					gpMulTypedName->FocusTyping();
+				gpMulTypedName->PollTyping();
+				if (gpMulTypedName->TakeEnter())
+					MulSaveTypedName(mpInit);
+			}
 			sMulPrevState = mState;
+		}
+
+		if (gpMulNameShown != NULL && mpInit->mpNetworkManager != NULL &&
+			mState == eMainMenuState_Multiplayer)
+		{
+			/* v13: reflects a rename the moment we come back from that screen */
+			const tString sName = mpInit->mpNetworkManager->GetLocalPlayerName();
+			const tWString wl = sName.empty()
+				? tWString(_W("No username yet - friends see you as 'Player <id>'. Pick one under 'Change name'."))
+				: (_W("Playing as: ") + cString::To16Char(sName));
+			if (gpMulNameShown->msText != wl)
+			{
+				gpMulNameShown->msText = wl;
+				gpMulNameShown->UpdateSize();
+			}
 		}
 
 		if (gpMulHostFoot != NULL && mpInit->mpNetworkManager != NULL &&
@@ -2868,6 +3009,12 @@ void cMainMenu::OnMouseDown(eMButton aButton)
 		!cMath::PointBoxCollision(mvMousePos, gpMulTypedIp->GetRect()))
 	{
 		gpMulTypedIp->BlurTyping();
+	}
+	if (gpMulTypedName && mState == eMainMenuState_MultiplayerName &&
+		gpMulTypedName->IsTypingFocused() &&
+		!cMath::PointBoxCollision(mvMousePos, gpMulTypedName->GetRect()))
+	{
+		gpMulTypedName->BlurTyping();
 	}
 #endif
 
@@ -3249,6 +3396,9 @@ void cMainMenu::CreateWidgets()
 	gpMulHostFoot = NULL;
 	gpMulTypedIp = NULL;
 	gMulJoinAwaitHandshake = false;
+	gpMulTypedName = NULL;
+	gpMulNameFoot = NULL;
+	gpMulNameShown = NULL;
 #endif
 	STLDeleteAll(mlstWidgets);
 	for(size_t i=0; i< eMainMenuState_LastEnum; ++i) mvState[i].clear();
@@ -3322,8 +3472,9 @@ void cMainMenu::CreateWidgets()
 	AddWidgetToState(eMainMenuState_Start,hplNew( cMainMenuWidget_MainButton,(mpInit,vPos,kTranslate("MainMenu","Load Game"),eMainMenuState_LoadGameSpot)) ); 
 	vPos.y += 51;
 #ifdef PENUMBRA_MULTIPLAYER
+	/* v13: asks for a username first when multiplayer.cfg has none */
 	AddWidgetToState(eMainMenuState_Start,hplNew(
-		cMainMenuWidget_MainButton,(mpInit, vPos, _W("Multiplayer"), eMainMenuState_Multiplayer)) );
+		cMainMenuWidget_MultiEnter,(mpInit, vPos, _W("Multiplayer"))) );
 	vPos.y += 51;
 #endif
 	AddWidgetToState(eMainMenuState_Start,hplNew( cMainMenuWidget_MainButton,(mpInit,vPos,kTranslate("MainMenu","Options"),eMainMenuState_Options)) ); 
@@ -3398,7 +3549,15 @@ void cMainMenu::CreateWidgets()
 		AddWidgetToState(
 			eMainMenuState_Multiplayer,
 			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, _W("Join game"), eMainMenuState_MultiplayerJoin)));
-		vPos.y += 44;
+		vPos.y += 40;
+		/* v13: username (multiplayer.cfg player_name) — shown to the party */
+		AddWidgetToState(
+			eMainMenuState_Multiplayer,
+			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, _W("Change name"), eMainMenuState_MultiplayerName)));
+		vPos.y += 40;
+		gpMulNameShown = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W(""), 13, eFontAlign_Center));
+		AddWidgetToState(eMainMenuState_Multiplayer, gpMulNameShown); /* text set in Update */
+		vPos.y += 24;
 
 		sprintf(sTempVec, "F11 toggles hosting | F10 joins 127.0.0.1:%s | Port %s", portBuf, portBuf);
 		AddWidgetToState(eMainMenuState_Multiplayer,
@@ -3508,6 +3667,39 @@ void cMainMenu::CreateWidgets()
 		AddWidgetToState(
 			eMainMenuState_MultiplayerJoin,
 			hplNew(cMainMenuWidget_MultiLobbyBack,(mpInit, vPos, _W("Cancel"))));
+
+		///////////////////////////////////
+		// Username (v13) — reached from the Start screen's Multiplayer
+		// button while no name is set, and from "Change name".
+		///////////////////////////////////
+		vPos = vTextStart;
+		AddWidgetToState(eMainMenuState_MultiplayerName,
+						 hplNew(cMainMenuWidget_Text,
+								(mpInit, vPos, _W("What's your username?"), 24, eFontAlign_Center)));
+		vPos.y += 42;
+		AddWidgetToState(eMainMenuState_MultiplayerName,
+						 hplNew(cMainMenuWidget_Text,
+								(mpInit, vPos,
+								 _W("Shown to the other players. Letters, digits and spaces, up to 24 characters. Saved to multiplayer.cfg."),
+								 13, eFontAlign_Center)));
+		vPos.y += 50;
+		gpMulTypedName = hplNew(cMainMenuWidget_MultiIpLine,
+								(mpInit, vPos, mpInit->mpNetworkManager->GetLocalPlayerName(), 20,
+								 eFontAlign_Center, true));
+		AddWidgetToState(eMainMenuState_MultiplayerName, gpMulTypedName);
+		vPos.y += 50;
+		gpMulNameFoot = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W("Press Enter or click Save."), 14,
+													  eFontAlign_Center));
+		AddWidgetToState(eMainMenuState_MultiplayerName, gpMulNameFoot);
+		vPos.y += 50;
+		AddWidgetToState(
+			eMainMenuState_MultiplayerName,
+			hplNew(cMainMenuWidget_MultiNameSave,(mpInit, vPos, _W("Save"))));
+		vPos.y += 40;
+		AddWidgetToState(
+			eMainMenuState_MultiplayerName,
+			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, kTranslate("MainMenu", "Back"),
+												eMainMenuState_Multiplayer)));
 	}
 #endif
 

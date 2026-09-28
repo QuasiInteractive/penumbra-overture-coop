@@ -7,7 +7,7 @@ All dedicated multiplayer source lives in this folder. Work here first; game glu
 | File | Role |
 |------|------|
 | `NetworkPackets.h` | Packed ENet payloads (player state, bodies, enemies, script/item events, join/leave) + discovery ping/pong, protocol magic/version (`kNetProtocolVersion`), `kNetSendPeriodSeconds`, `kNetDiscoveryPort`. |
-| `NetworkManager.h` / `.cpp` | Listen-server host, client join, 30 Hz state relay, LAN/Hamachi discovery (raw UDP broadcast), `multiplayer.cfg`, F9/F10/F11, per-frame ghost updates, the ghost preview mode. |
+| `NetworkManager.h` / `.cpp` | Listen-server host, client join, 30 Hz state relay, LAN/Hamachi discovery (raw UDP broadcast), `multiplayer.cfg` (read + the `player_name` writer), F9/F10/F11, per-frame ghost updates, the ghost preview mode, player names + the party event feed (v13). |
 | `BodySync.h` / `.cpp` | Shared physics: host-authoritative body replication. Name-hash identity, map-load census (host/guest verify), host state batches, guest apply. |
 | `GhostPlayer.h` / `.cpp` | Remote peer visuals (skinned mesh + marker light + flashlight). Interpolation buffer on the sender's clock, clip selection from the wire velocity/flags, weight-preserving crossfades, gait-scaled playback. Not a real `cPlayer`. |
 | `multiplayer.cfg.example` | Copy next to `overture.exe` as `multiplayer.cfg`. |
@@ -27,7 +27,7 @@ writes, entity activation, door locks, item pickups/drops/consumption and
 breakable damage are replicated as reliable events; map changes move the
 whole party). Player state, bodies and enemies stream at **30 Hz**
 (`kNetSendPeriodSeconds`); every wire layout change bumps
-`kNetProtocolVersion` (currently **12**), and the connect handshake refuses
+`kNetProtocolVersion` (currently **13**), and the connect handshake refuses
 mismatched builds.
 
 Remote players are drawn as **ghosts** (`cGhostPlayer`): each `cNetPlayerState`
@@ -62,11 +62,44 @@ leaves. Consumers:
   guest eats/idles instead of re-biting a corpse.
 - **HUD** — `cPlayer::DrawPartyHud()` (called from `cPlayer::OnDraw`, after
   the health filter) projects a point 2 m above each ghost's rendered feet
-  and draws a 60x6 bar (red..green) + `P<id>` (`P<id> dead`), hidden behind
-  the camera or beyond 25 m, fading from 15 m; not drawn over the inventory,
-  notebook, panel or death menu.
+  and draws a 60x6 bar (red..green) + the player's name (`<name> dead`),
+  hidden behind the camera or beyond 25 m, fading from 15 m; not drawn over
+  the inventory, notebook, panel or death menu.
 - **Inventory** — `cInventory::DrawParty()` lists every connected player
-  with health and a bar in the free column right of the slot grid.
+  (by name) with health and a bar in the free column right of the slot grid.
+
+### Player names + party panel (protocol v13)
+
+`multiplayer.cfg` `player_name=` (printable ASCII, 24 chars max, sanitised
+on load, on menu input and on every wire arrival —
+`cNetworkManager::SanitizePlayerName`). The Start screen's **Multiplayer**
+button opens a "What's your username?" screen when no name is set (Enter
+or **Save** writes the key with `UpdateMultiplayerCfgKey`, which rewrites
+only that line and keeps every other line of the file; **Change name** on
+the Multiplayer screen edits it later, live sessions included).
+
+Wire: reliable `cNetPlayerName` (type **26**: id + `char[24]`, NUL-padded,
+not necessarily NUL-terminated — receivers scan bounded). A guest sends its
+name right after `PlayerJoin` (it knows its id then, and sends even an
+empty one so the host can announce the join); the host stores names per
+peer id (the id BYTE from a guest is ignored, the peer it came from is the
+truth), sends the table to a new peer at connect and re-broadcasts the whole
+table (one packet per player, its own name as id 1) whenever a name arrives
+or a guest leaves. `DropRemotePlayer` erases. `GetPlayerName(id)` returns
+`"Player <id>"` for anyone without a name. The discovery pong's server name
+falls back to `"<player_name>'s game"` when `server_name` is empty.
+
+**Party panel** — `cPlayer::DrawPartyPanel()`, top-left of the HUD, only
+while hosting or in a live session (never in single-player), same screen
+guards as `DrawPartyHud`: one line per member (ourselves included, id
+order, `(host)` after id 1) with a 50x5 health bar, `dead` in red; below it
+the last 4 feed lines from `cNetworkManager::GetPartyEvents()`, each
+dropped after 6 s (fading over the last 1.5 s). Feed sources
+(`AddPartyEvent`): `<name> joined` when a name arrives for a new id (a
+guest lists the party it finds in its first 2 s silently), `<name> left`
+from `DropRemotePlayer` (only for announced ids), `<name> died` /
+`<name> respawned` from the mirrored-health transitions (100..1 -> 0 and
+0 -> >0) in the state handler, `<old> is now <new>` on a rename.
 
 ### Co-op death rule (`coop_respawn=1`, default)
 
@@ -88,11 +121,11 @@ lines — single-player is unchanged.
 | Location | What |
 |----------|------|
 | `../Init.cpp` / `Init.h` | Owns `mpNetworkManager`; `Startup()` after input exists; `Update()` each frame; config port load/save. |
-| `../Player.cpp` / `Player.h` | `DrawPartyHud()` — world-anchored party health bars in `OnDraw`. |
+| `../Player.cpp` / `Player.h` | `DrawPartyHud()` — world-anchored party health bars in `OnDraw`; `DrawPartyPanel()` — top-left names/health panel + event feed (v13). |
 | `../PlayerHelper.cpp` / `.h` | `cPlayerDeath` co-op respawn branch (`CoopRespawnApplies`, `UpdateCoopRespawn`). |
 | `../Inventory.cpp` / `.h` | `DrawParty()` — inventory party health list. |
 | `../GameEnemy.cpp`, `../TriggerHandler.cpp` | Host senses read `GetGhostHealth` (focus health, sight candidates, ghost footsteps). |
-| `../MainMenu.cpp` / `MainMenu.h` | Multiplayer menu states, host/join UI, IP typing widget (`#ifdef PENUMBRA_MULTIPLAYER`). |
+| `../MainMenu.cpp` / `MainMenu.h` | Multiplayer menu states, host/join UI, IP typing widget (`#ifdef PENUMBRA_MULTIPLAYER`); v13 username screen (`eMainMenuState_MultiplayerName`, the typing widget's name mode, "Change name"). |
 | `../CMakeLists.txt` | Globs `multiplayer/*.cpp`, links ENet, defines `PENUMBRA_MULTIPLAYER`. |
 | `../vcpkg.json` | Declares `enet` (+ SDL/OpenAL audio deps). |
 
@@ -101,8 +134,8 @@ lines — single-player is unchanged.
 - **F11** — toggle host on default port (7777).
 - **F10** — join `127.0.0.1:<port>`.
 - **F9** — LAN/Hamachi discovery scan (~1.5s window; results logged, feed the server browser).
-- **Menu** — Multiplayer → Host / Join.
-- **`multiplayer.cfg`** — `host=1`, `join=HOST:PORT`, `port=`, `server_name=`, `max_players=`, `ghost_models=a.dae,b.dae`, `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`. See `multiplayer.cfg.example`.
+- **Menu** — Multiplayer → Host / Join / Change name (asks for a username the first time).
+- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=`, `ghost_models=a.dae,b.dae`, `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`. See `multiplayer.cfg.example`.
 
 ### Ghost preview (offline animation check)
 

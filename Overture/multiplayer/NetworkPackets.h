@@ -11,6 +11,7 @@
 #ifndef NETWORK_PACKETS_H
 #define NETWORK_PACKETS_H
 
+#include <cstddef> /* v13: size_t for kNetPlayerNameMaxChars */
 #include <cstdint>
 
 /** 'PNMP' — filters random UDP noise on the discovery port. Same-endian peers,
@@ -33,8 +34,18 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
     v12: party health — cNetPlayerState carries the sender's health (0-100)
         and a Dead flag bit, so the host's enemy AI stops biting a corpse,
         friends see each other's health (world bars + inventory party
-        line) and the co-op respawn rule knows whether anybody is alive. */
-static const uint16_t kNetProtocolVersion = 12;
+        line) and the co-op respawn rule knows whether anybody is alive.
+    v13: player names — reliable cNetPlayerName (type 26): a guest sends
+        its multiplayer.cfg player_name after PlayerJoin, the host keeps
+        the table and re-broadcasts it (one packet per player) on every
+        name arrival / join / leave. Old builds do not speak it. */
+static const uint16_t kNetProtocolVersion = 13;
+
+/** v13: cNetPlayerName::msName capacity. A name is at most this many
+    printable ASCII characters; it is NOT required to be NUL-terminated on
+    the wire (a 24-char name fills the field), so receivers copy with a
+    bounded scan (cNetworkManager::SanitizePlayerName). */
+static const size_t kNetPlayerNameMaxChars = 24;
 
 /** Snapshot send period, every sender (cNetworkManager::kSendPeriodSeconds
     is this value). The receiver uses cNetPlayerState::mSeq * this period as
@@ -110,6 +121,11 @@ enum eNetPacketType : uint8_t
 	                                    pickaxed door is broken for the whole
 	                                    party (was: broken for one player,
 	                                    intact wall for the other). */
+	/* 24 and 25 are reserved for the world-state snapshot (v14). */
+	eNetPacketType_PlayerName = 26,  /* v13, reliable ch0: guest -> host (my
+	                                    name, right after PlayerJoin), host ->
+	                                    every guest (the full table, one
+	                                    packet per player; the host is id 1) */
 };
 
 /** eNetPacketType_ScriptEvent ops. */
@@ -204,6 +220,18 @@ struct cNetPlayerLeave
 {
 	uint8_t mType;
 	uint8_t mPlayerID;
+};
+
+/** v13: one player's display name. Guest -> host: mPlayerID is ignored
+    (the host trusts the peer it came from). Host -> guests: one per known
+    player. msName is NUL-padded, NOT necessarily NUL-terminated (see
+    kNetPlayerNameMaxChars); an empty name means "no name known" and the
+    receiver shows "Player <id>". */
+struct cNetPlayerName
+{
+	uint8_t mType; /**< eNetPacketType_PlayerName */
+	uint8_t mPlayerID;
+	char msName[kNetPlayerNameMaxChars];
 };
 
 /** A level transition happened; everyone follows. Fixed-size NUL-padded
@@ -454,6 +482,7 @@ struct cNetScriptEvent
 
 static_assert(sizeof(cNetPlayerJoin) == 2, "");
 static_assert(sizeof(cNetPlayerLeave) == 2, "");
+static_assert(sizeof(cNetPlayerName) == 26, ""); /* v13 */
 static_assert(sizeof(cNetPlayerState) == 30, ""); /* v7: +mSeq; v11: +vel/flags; v12: +mHealth */
 static_assert(sizeof(cNetDiscoveryPing) == 7, "");
 static_assert(sizeof(cNetDiscoveryPong) == 75, "");

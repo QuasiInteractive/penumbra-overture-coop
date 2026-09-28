@@ -1169,7 +1169,8 @@ void cInventory::OnDraw()
 //-----------------------------------------------------------------------
 
 /* v12 party health: right of the slot grid (x 680.., from the grid's top
-   at y 89), "Party" then "P<id>  <hp>" + a 100x8 bar per connected player,
+   at y 89), "Party" then "<name>  <hp>" (v13: the player's name, "Player
+   <id>" until one is known) + a 100x8 bar per connected player,
    coloured like cInventoryHealth (red..green), "dead" in red. */
 void cInventory::DrawParty()
 {
@@ -1195,15 +1196,17 @@ void cInventory::DrawParty()
 		const float fHealth = (m.mfHealth < 0) ? 0.0f : ((m.mfHealth > 100) ? 100.0f : m.mfHealth);
 		const float fPercent = fHealth / 100.0f;
 
+		//v13: the player's name ("Player <id>" until one is known)
+		const tWString sName = cString::To16Char(pNet->GetPlayerName(m.mlId));
 		if(fHealth > 0)
 		{
 			mpFont->Draw(cVector3f(fX, fY, fZ),cVector2f(13,13),cColor(1,1,1,mfAlpha),eFontAlign_Left,
-							_W("P%d  %.0f"),(int)m.mlId, fHealth);
+							_W("%ls  %.0f"),sName.c_str(), fHealth);
 		}
 		else
 		{
 			mpFont->Draw(cVector3f(fX, fY, fZ),cVector2f(13,13),cColor(1,0.3f,0.3f,mfAlpha),eFontAlign_Left,
-							_W("P%d  dead"),(int)m.mlId);
+							_W("%ls  dead"),sName.c_str());
 		}
 		fY += 15;
 

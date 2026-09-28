@@ -277,10 +277,15 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mvDiscovered()
 	  , mbDiscoveryActive(false)
 	  , mfDiscoveryTimeLeft(0)
-	  , msServerName("Penumbra Server")
+	  , msServerName("") /* v13: empty = "<player_name>'s game" in the pong */
 	  , mlMaxPlayers(4)
 	  , mpBodySync(new cBodySync())
 	  , mbCoopRespawn(true) /* v12: multiplayer.cfg coop_respawn */
+	  , msPlayerName()      /* v13: multiplayer.cfg player_name */
+	  , m_mapPlayerNames()
+	  , mvPartyEvents()
+	  , m_setJoinAnnounced()
+	  , mfSinceJoinSeconds(0)
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -332,8 +337,9 @@ void cNetworkManager::Disconnect()
 	msDeferredJoinAddress = "";
 }
 
-void cNetworkManager::Update(float /*afTimeStep*/)
+void cNetworkManager::Update(float afTimeStep)
 {
+	UpdatePartyEvents(afTimeStep); /* v13: the feed ages out even here */
 }
 
 void cNetworkManager::ClearGhostsInternal()
@@ -341,6 +347,8 @@ void cNetworkManager::ClearGhostsInternal()
 	m_mapGhostSeq.clear(); /* new session, new counters */
 	m_mapGhostMoveState.clear();
 	m_mapGhostHealth.clear();
+	m_mapPlayerNames.clear(); /* v13: names + "joined" bookkeeping are per session */
+	m_setJoinAnnounced.clear();
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
@@ -360,6 +368,7 @@ void cNetworkManager::DropRemotePlayer(uint8_t id)
 	m_mapGhostSeq.erase(id); /* a rejoiner restarts its counter */
 	m_mapGhostMoveState.erase(id);
 	m_mapGhostHealth.erase(id); /* v12: gone = not alive for the respawn rule */
+	ForgetPlayerName(id);       /* v13: "<name> left" + name table entry */
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
 	if (it != m_mapGhosts.end())
 	{
@@ -735,10 +744,15 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mvDiscovered()
 	  , mbDiscoveryActive(false)
 	  , mfDiscoveryTimeLeft(0)
-	  , msServerName("Penumbra Server")
+	  , msServerName("") /* v13: empty = "<player_name>'s game" in the pong */
 	  , mlMaxPlayers(4)
 	  , mpBodySync(new cBodySync())
 	  , mbCoopRespawn(true) /* v12: multiplayer.cfg coop_respawn */
+	  , msPlayerName()      /* v13: multiplayer.cfg player_name */
+	  , m_mapPlayerNames()
+	  , mvPartyEvents()
+	  , m_setJoinAnnounced()
+	  , mfSinceJoinSeconds(0)
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -809,22 +823,32 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 		/* server_name may contain spaces, which %255s would cut — take the raw
 		   remainder of the line instead of going through sscanf. */
 		char rawKey[64];
-		if (sscanf(buf, " %63[^=]", rawKey) == 1 && strcmp(rawKey, "server_name") == 0)
+		rawKey[0] = '\0';
+		const bool bHaveKey = (sscanf(buf, " %63[^=]", rawKey) == 1);
+		const bool bServerName = bHaveKey && strcmp(rawKey, "server_name") == 0;
+		const bool bPlayerName = bHaveKey && strcmp(rawKey, "player_name") == 0; /* v13 */
+		if (bServerName || bPlayerName)
 		{
 			char *eq = strchr(buf, '=');
-			if (eq && eq[1])
+			size_t ln = 0;
+			char *nm = buf;
+			if (eq)
 			{
-				char *nm = eq + 1;
+				nm = eq + 1;
 				while (*nm == ' ' || *nm == '\t')
 					++nm;
-				size_t ln = strlen(nm);
+				ln = strlen(nm);
 				while (ln > 0 && (nm[ln - 1] == '\n' || nm[ln - 1] == '\r' ||
 								  nm[ln - 1] == ' ' || nm[ln - 1] == '\t'))
 					--ln;
+			}
+			if (bPlayerName)
+				msPlayerName = SanitizePlayerName(hpl::tString(nm, ln)); /* "" = ask in the menu */
+			else
+			{
 				if (ln > 31)
 					ln = 31; /* wire field is char[32] */
-				if (ln > 0)
-					msServerName = hpl::tString(nm, ln);
+				msServerName = hpl::tString(nm, ln); /* "" = "<player_name>'s game" */
 			}
 			continue;
 		}
@@ -1217,6 +1241,8 @@ void cNetworkManager::ClearGhostsInternal()
 	m_mapGhostSeq.clear(); /* new session, new counters */
 	m_mapGhostMoveState.clear();
 	m_mapGhostHealth.clear();
+	m_mapPlayerNames.clear(); /* v13: names + "joined" bookkeeping are per session */
+	m_setJoinAnnounced.clear();
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
@@ -1228,6 +1254,7 @@ void cNetworkManager::DropRemotePlayer(uint8_t id)
 	m_mapGhostSeq.erase(id); /* a rejoiner restarts its counter */
 	m_mapGhostMoveState.erase(id);
 	m_mapGhostHealth.erase(id); /* v12: gone = not alive for the respawn rule */
+	ForgetPlayerName(id);       /* v13: "<name> left" + name table entry */
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
 	if (it != m_mapGhosts.end())
 	{
@@ -1289,6 +1316,20 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		mlLocalPlayerId = pj->mPlayerID;
 		mbHadJoinPacket = true;
 		Log(" multiplayer: local PlayerID=%u\n", (unsigned)mlLocalPlayerId);
+		mfSinceJoinSeconds = 0; /* v13: the table that follows is the existing party */
+		SendLocalName();        /* v13: we know our id now — tell the host who we are */
+		return;
+	}
+
+	if (t == eNetPacketType_PlayerName)
+	{
+		/* v13, guest side: one entry of the host's table. (The host takes a
+		   guest's name in Service with the PEER's id, never from here.) */
+		if (!mbHosting && len >= sizeof(cNetPlayerName))
+		{
+			const cNetPlayerName *pn = (const cNetPlayerName *)data;
+			OnPlayerNameReceived(pn->mPlayerID, pn->msName, sizeof(pn->msName));
+		}
 		return;
 	}
 
@@ -1475,9 +1516,13 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 	}
 	/* v12: mirrored health per id (both roles) — kept outside the ghost
 	   entity so it survives our own map change (ghosts are rebuilt). */
-	m_mapGhostHealth[st->mPlayerID] =
-		(st->mFlags & eNetPlayerFlag_Dead) ? (uint8_t)0 :
-		((st->mHealth > 100) ? (uint8_t)100 : st->mHealth);
+	{
+		const uint8_t lHealth =
+			(st->mFlags & eNetPlayerFlag_Dead) ? (uint8_t)0 :
+			((st->mHealth > 100) ? (uint8_t)100 : st->mHealth);
+		NotePartyHealth(st->mPlayerID, lHealth); /* v13: "died" / "respawned" feed lines */
+		m_mapGhostHealth[st->mPlayerID] = lHealth;
+	}
 	EnsureGhost(st->mPlayerID);
 	std::map<uint8_t, cGhostPlayer *>::iterator gi = m_mapGhosts.find(st->mPlayerID);
 	if (gi != m_mapGhosts.end())
@@ -1658,6 +1703,7 @@ void cNetworkManager::Service(int timeoutMs)
 				SendCensus(ev.peer); /* late joiner gets the map-load census now */
 				SendMapBeacon(ev.peer); /* ...and where the party is, so a guest
 				    sitting in the menu launches straight into our map */
+				SendNameTable(ev.peer); /* v13: who is already here (listed silently) */
 				/* ...and one reliable full snapshot, so a mid-game joiner
 				   starts from the host's exact current poses instead of the
 				   map defaults (rung 2). Chunked to stay under MTU. */
@@ -1708,6 +1754,7 @@ void cNetworkManager::Service(int timeoutMs)
 				{
 					BlastLeaves(mpImpl->mpHost, gone, ev.peer);
 					DropRemotePlayer(gone);
+					SendNameTable(NULL); /* v13: table without the leaver */
 					/* rung 3: a vanished guest drops whatever it held */
 					int lFreed = mpBodySync->ReleaseAllHeldBy(gone);
 					if (lFreed > 0)
@@ -1750,6 +1797,15 @@ void cNetworkManager::Service(int timeoutMs)
 							enet_peer_send(dst, 1, rp);
 					}
 					DispatchIncoming(&relay, sizeof(relay));
+				}
+				else if (author >= 2 && lFirst == eNetPacketType_PlayerName &&
+					(size_t)pk->dataLength >= sizeof(cNetPlayerName))
+				{
+					/* v13: a guest's name — trusted by PEER id, not by the
+					   id byte in the packet; then the whole table goes out */
+					const cNetPlayerName *pn = (const cNetPlayerName *)pk->data;
+					OnPlayerNameReceived(author, pn->msName, sizeof(pn->msName));
+					SendNameTable(NULL);
 				}
 				else if (author >= 2 && (lFirst == eNetPacketType_MapChange ||
 					lFirst == eNetPacketType_ItemPickup ||
@@ -2415,6 +2471,8 @@ void cNetworkManager::Update(float afTimeStep)
 	if (!mpInit || !mpInit->mpGame)
 		return;
 
+	UpdatePartyEvents(afTimeStep); /* v13: feed line ages + join grace timer */
+
 	/* Track the CURRENT world only — never a stale one. Keeping the old
 	   pointer across a map change/unload meant EnsureGhost built ghosts in a
 	   destroyed cWorld3D. The dying world already tore the ghost entities
@@ -2973,7 +3031,13 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 			pong.mlGamePort = mlListenPort;
 			pong.mlPlayerCount = (uint8_t)(m_mapGhosts.size() + 1); /* guests + me */
 			pong.mlMaxPlayers = mlMaxPlayers;
-			CopyPacketString(pong.msServerName, sizeof(pong.msServerName), msServerName.c_str());
+			{
+				/* v13: no server_name -> "<player_name>'s game" (or the old default) */
+				hpl::tString sAdvertised = msServerName;
+				if (sAdvertised.empty())
+					sAdvertised = msPlayerName.empty() ? hpl::tString("Penumbra Server") : msPlayerName + "'s game";
+				CopyPacketString(pong.msServerName, sizeof(pong.msServerName), sAdvertised.c_str());
+			}
 			const char *mapName = "";
 			if (mpInit && mpInit->mpMapHandler)
 				mapName = mpInit->mpMapHandler->GetCurrentMapName().c_str();
@@ -3124,6 +3188,262 @@ bool cNetworkManager::IsSessionLive() const
 	if (mbHosting)
 		return GetConnectedGuestCount() > 0;
 	return mbClientConnected && mbHadJoinPacket;
+}
+
+#endif /* PENUMBRA_MULTIPLAYER */
+
+//======================================================================
+// v13: player names + party event feed — APPENDED, shared by the real and
+// the stub build (see the NetworkManager.h tail). Only SendNameTable /
+// SendLocalName touch ENet and live under PENUMBRA_MULTIPLAYER.
+//======================================================================
+
+const float cNetworkManager::kPartyEventLifeSeconds = 6.0f;
+const float cNetworkManager::kPartyJoinGraceSeconds = 2.0f;
+
+hpl::tString cNetworkManager::SanitizePlayerName(const hpl::tString &asName)
+{
+	hpl::tString sOut;
+	sOut.reserve(asName.size() < kNetPlayerNameMaxChars ? asName.size() : kNetPlayerNameMaxChars);
+	for (size_t i = 0; i < asName.size(); ++i)
+	{
+		const unsigned char c = (unsigned char)asName[i];
+		if (c < 32 || c > 126)
+			continue; /* control chars, DEL, anything non-ASCII */
+		if (c == ' ' && sOut.empty())
+			continue; /* leading blanks */
+		if (sOut.size() >= kNetPlayerNameMaxChars)
+			break;
+		sOut += (char)c;
+	}
+	while (!sOut.empty() && sOut[sOut.size() - 1] == ' ')
+		sOut.erase(sOut.size() - 1); /* trailing blanks (also after truncation) */
+	return sOut;
+}
+
+/* One key of the plain key=value file, other lines untouched. The file is
+   small (a few dozen lines) so it is read whole, patched in memory and
+   written back through a temp file + rename. */
+bool cNetworkManager::UpdateMultiplayerCfgKey(const char *asKey, const hpl::tString &asValue)
+{
+	if (!asKey || !asKey[0])
+		return false;
+	const size_t lKeyLen = strlen(asKey);
+
+	std::vector<hpl::tString> vLines;
+	{
+		FILE *fp = fopen("multiplayer.cfg", "r");
+		if (fp)
+		{
+			char buf[1024];
+			while (fgets(buf, sizeof(buf), fp))
+				vLines.push_back(hpl::tString(buf));
+			fclose(fp);
+		}
+	}
+
+	bool bReplaced = false;
+	for (size_t i = 0; i < vLines.size() && !bReplaced; ++i)
+	{
+		const hpl::tString &sLine = vLines[i];
+		size_t p = 0;
+		while (p < sLine.size() && (sLine[p] == ' ' || sLine[p] == '\t'))
+			++p;
+		if (sLine.compare(p, lKeyLen, asKey) != 0)
+			continue; /* different key, comment ("# key=") or blank line */
+		p += lKeyLen;
+		while (p < sLine.size() && (sLine[p] == ' ' || sLine[p] == '\t'))
+			++p;
+		if (p >= sLine.size() || sLine[p] != '=')
+			continue; /* "player_name_x=" or no '=' at all: not our key */
+		const bool bCrLf = sLine.size() >= 2 && sLine[sLine.size() - 2] == '\r';
+		vLines[i] = hpl::tString(asKey) + "=" + asValue + (bCrLf ? "\r\n" : "\n");
+		bReplaced = true;
+	}
+	if (!bReplaced)
+	{
+		if (!vLines.empty())
+		{
+			hpl::tString &sLast = vLines[vLines.size() - 1];
+			if (sLast.empty() || sLast[sLast.size() - 1] != '\n')
+				sLast += "\n"; /* a file that ends mid-line */
+		}
+		vLines.push_back(hpl::tString(asKey) + "=" + asValue + "\n");
+	}
+
+	const char *szTmp = "multiplayer.cfg.tmp";
+	FILE *fo = fopen(szTmp, "w");
+	if (!fo)
+	{
+		Log(" multiplayer: cannot write %s\n", szTmp);
+		return false;
+	}
+	bool bOk = true;
+	for (size_t i = 0; i < vLines.size() && bOk; ++i)
+		bOk = fwrite(vLines[i].data(), 1, vLines[i].size(), fo) == vLines[i].size();
+	if (fclose(fo) != 0)
+		bOk = false;
+	if (!bOk)
+	{
+		Log(" multiplayer: writing %s failed - multiplayer.cfg left untouched\n", szTmp);
+		remove(szTmp);
+		return false;
+	}
+	remove("multiplayer.cfg"); /* Windows rename() refuses to overwrite */
+	if (rename(szTmp, "multiplayer.cfg") != 0)
+	{
+		Log(" multiplayer: rename %s -> multiplayer.cfg failed\n", szTmp);
+		return false;
+	}
+	Log(" multiplayer: multiplayer.cfg %s=%s\n", asKey, asValue.c_str());
+	return true;
+}
+
+void cNetworkManager::SetLocalPlayerName(const hpl::tString &asName)
+{
+	msPlayerName = SanitizePlayerName(asName);
+	UpdateMultiplayerCfgKey("player_name", msPlayerName);
+#ifdef PENUMBRA_MULTIPLAYER
+	if (mbHosting)
+		SendNameTable(NULL); /* guests see "<old> is now <new>" */
+	else if (mbClientConnected && mbHadJoinPacket)
+		SendLocalName();
+#endif
+}
+
+hpl::tString cNetworkManager::GetPlayerName(uint8_t alId) const
+{
+	if (alId != 0 && alId == mlLocalPlayerId && !msPlayerName.empty())
+		return msPlayerName;
+	std::map<uint8_t, hpl::tString>::const_iterator it = m_mapPlayerNames.find(alId);
+	if (it != m_mapPlayerNames.end() && !it->second.empty())
+		return it->second;
+	return "Player " + hpl::cString::ToString((int)alId);
+}
+
+void cNetworkManager::AddPartyEvent(const hpl::tString &asText)
+{
+	if (asText.empty())
+		return;
+	while (mvPartyEvents.size() >= kPartyEventMax)
+		mvPartyEvents.erase(mvPartyEvents.begin()); /* oldest first */
+	cNetPartyEvent ev;
+	ev.msText = asText;
+	ev.mfAge = 0.0f;
+	mvPartyEvents.push_back(ev);
+	Log(" multiplayer: party: %s\n", asText.c_str());
+}
+
+void cNetworkManager::UpdatePartyEvents(float afTimeStep)
+{
+	if (afTimeStep < 0.0f)
+		afTimeStep = 0.0f;
+	if (mfSinceJoinSeconds < 1000.0f)
+		mfSinceJoinSeconds += afTimeStep; /* saturates: only "< grace" matters */
+	for (size_t i = 0; i < mvPartyEvents.size(); ++i)
+		mvPartyEvents[i].mfAge += afTimeStep;
+	/* appended in time order, so the expired ones are always at the front */
+	while (!mvPartyEvents.empty() && mvPartyEvents[0].mfAge >= kPartyEventLifeSeconds)
+		mvPartyEvents.erase(mvPartyEvents.begin());
+}
+
+void cNetworkManager::OnPlayerNameReceived(uint8_t alId, const char *apName, size_t alLen)
+{
+	if (alId == 0 || alId == mlLocalPlayerId || alId == kPreviewGhostId || !apName)
+		return; /* unknown / our own / the preview: ignored */
+	/* bounded scan — the wire field need not be NUL-terminated */
+	size_t n = 0;
+	while (n < alLen && n < kNetPlayerNameMaxChars && apName[n] != '\0')
+		++n;
+	const hpl::tString sNew = SanitizePlayerName(hpl::tString(apName, n));
+
+	const bool bAnnounced = m_setJoinAnnounced.find(alId) != m_setJoinAnnounced.end();
+	const hpl::tString sOld = GetPlayerName(alId);
+
+	if (sNew.empty())
+		m_mapPlayerNames.erase(alId); /* shows as "Player <id>" */
+	else
+		m_mapPlayerNames[alId] = sNew;
+
+	if (!bAnnounced)
+	{
+		m_setJoinAnnounced.insert(alId);
+		/* A guest gets the whole existing party right after its own join:
+		   those are listed silently; anything later really joined. The host
+		   only ever hears a name from a peer that just connected. */
+		const bool bExisting = !mbHosting && mfSinceJoinSeconds < kPartyJoinGraceSeconds;
+		if (!bExisting)
+			AddPartyEvent(GetPlayerName(alId) + " joined");
+	}
+	else if (!sNew.empty() && sNew != sOld)
+		AddPartyEvent(sOld + " is now " + sNew);
+}
+
+void cNetworkManager::NotePartyHealth(uint8_t alId, uint8_t alNewHealth)
+{
+	if (alId == 0 || alId == mlLocalPlayerId || alId == kPreviewGhostId)
+		return;
+	std::map<uint8_t, uint8_t>::const_iterator it = m_mapGhostHealth.find(alId);
+	if (it == m_mapGhostHealth.end())
+		return; /* first value we hear: no transition to report */
+	if (it->second > 0 && alNewHealth == 0)
+		AddPartyEvent(GetPlayerName(alId) + " died");
+	else if (it->second == 0 && alNewHealth > 0)
+		AddPartyEvent(GetPlayerName(alId) + " respawned");
+}
+
+void cNetworkManager::ForgetPlayerName(uint8_t alId)
+{
+	const hpl::tString sName = GetPlayerName(alId); /* before the erase */
+	m_mapPlayerNames.erase(alId);
+	if (m_setJoinAnnounced.erase(alId) > 0)
+		AddPartyEvent(sName + " left");
+}
+
+#ifdef PENUMBRA_MULTIPLAYER
+
+void cNetworkManager::SendNameTable(ENetPeer *apOnlyTo)
+{
+	if (!mbHosting || !mpImpl || !mpImpl->mpHost)
+		return;
+	/* our own entry first (id 1, may be empty = "Player 1"), then every guest */
+	std::vector<std::pair<uint8_t, hpl::tString> > vTable;
+	vTable.push_back(std::make_pair(mlLocalPlayerId, msPlayerName));
+	for (std::map<uint8_t, hpl::tString>::const_iterator it = m_mapPlayerNames.begin();
+		it != m_mapPlayerNames.end(); ++it)
+		vTable.push_back(*it);
+
+	for (size_t i = 0; i < vTable.size(); ++i)
+	{
+		cNetPlayerName pkt;
+		memset(&pkt, 0, sizeof(pkt)); /* NUL padding; a full name has no NUL */
+		pkt.mType = eNetPacketType_PlayerName;
+		pkt.mPlayerID = vTable[i].first;
+		const hpl::tString &sName = vTable[i].second;
+		const size_t n = sName.size() < sizeof(pkt.msName) ? sName.size() : sizeof(pkt.msName);
+		if (n > 0)
+			memcpy(pkt.msName, sName.data(), n);
+		if (apOnlyTo)
+			SendStructToPeer(apOnlyTo, &pkt, sizeof(pkt), true);
+		else
+			SendReliableEvent(&pkt, sizeof(pkt));
+	}
+}
+
+void cNetworkManager::SendLocalName()
+{
+	if (mbHosting)
+		return;
+	/* Sent even when empty: the host announces the join on THIS packet
+	   ("Player <id> joined" when we have no name) */
+	cNetPlayerName pkt;
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.mType = eNetPacketType_PlayerName;
+	pkt.mPlayerID = mlLocalPlayerId; /* the host uses the peer id anyway */
+	const size_t n = msPlayerName.size() < sizeof(pkt.msName) ? msPlayerName.size() : sizeof(pkt.msName);
+	if (n > 0)
+		memcpy(pkt.msName, msPlayerName.data(), n);
+	SendReliableEvent(&pkt, sizeof(pkt)); /* no-op until connected + joined */
 }
 
 #endif /* PENUMBRA_MULTIPLAYER */

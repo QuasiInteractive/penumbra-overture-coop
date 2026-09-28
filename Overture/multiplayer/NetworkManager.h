@@ -337,6 +337,67 @@ public:
 private:
 	std::map<uint8_t, uint8_t> m_mapGhostHealth; /**< both roles: newest health per remote id, 0 = dead */
 	bool mbCoopRespawn;
+
+	//---------------- v13: player names + party event feed — appended, impl at the file tail ----------------
+public:
+	/** One line of the HUD party feed ("<name> joined" ...). mfAge counts up
+	    in seconds; the line is dropped at kPartyEventLifeSeconds. */
+	struct cNetPartyEvent
+	{
+		hpl::tString msText;
+		float mfAge;
+		cNetPartyEvent() : msText(), mfAge(0.0f) {}
+	};
+	static const size_t kPartyEventMax = 4;       /**< feed depth (oldest drops first) */
+	static const float kPartyEventLifeSeconds;    /**< 6 s, then the line is gone */
+	static const float kPartyJoinGraceSeconds;    /**< 2 s after our join: table
+	    entries are the EXISTING party (listed silently), later ones "joined" */
+
+	/** multiplayer.cfg player_name (sanitised, "" = not set). */
+	const hpl::tString &GetLocalPlayerName() const { return msPlayerName; }
+	/** Sanitises + stores the name, rewrites player_name= in multiplayer.cfg
+	    (every other line kept) and, in a live session, announces it (host:
+	    the table to every guest; guest: to the host). */
+	void SetLocalPlayerName(const hpl::tString &asName);
+	/** Display name for ANY id, ours included: the known name, else
+	    "Player <id>". Never empty. */
+	hpl::tString GetPlayerName(uint8_t alId) const;
+	/** Feed for cPlayer::DrawPartyPanel, oldest first. Empty offline. */
+	const std::vector<cNetPartyEvent> &GetPartyEvents() const { return mvPartyEvents; }
+	/** Push one feed line (bounded to kPartyEventMax, oldest dropped). */
+	void AddPartyEvent(const hpl::tString &asText);
+	/** Printable ASCII (32..126) only, leading/trailing blanks trimmed,
+	    at most kNetPlayerNameMaxChars characters. Applied on cfg load, on
+	    menu input and on every name that arrives from the wire. */
+	static hpl::tString SanitizePlayerName(const hpl::tString &asName);
+	/** Sets `asKey=asValue` in multiplayer.cfg: the first matching line is
+	    replaced in place (commented "# key=" lines are left alone), a missing
+	    key is appended, every other line is copied verbatim. Creates the
+	    file when there is none. false = could not write. */
+	static bool UpdateMultiplayerCfgKey(const char *asKey, const hpl::tString &asValue);
+private:
+	hpl::tString msPlayerName;                       /**< ours (cfg player_name) */
+	std::map<uint8_t, hpl::tString> m_mapPlayerNames; /**< REMOTE ids -> name (never ours, never empty) */
+	std::vector<cNetPartyEvent> mvPartyEvents;
+	std::set<uint8_t> m_setJoinAnnounced; /**< ids whose "joined" line went out (so "left" is only shown for them) */
+	float mfSinceJoinSeconds;             /**< guest: seconds since our PlayerJoin (kPartyJoinGraceSeconds) */
+	/** Ages the feed, drops dead lines. Called from Update (both builds). */
+	void UpdatePartyEvents(float afTimeStep);
+	/** A name for a remote id arrived (host: from the peer itself; guest:
+	    from the host's table). Stores/erases, emits the "joined" line the
+	    first time the id is seen (outside the join grace window). */
+	void OnPlayerNameReceived(uint8_t alId, const char *apName, size_t alLen);
+	/** Health transition -> "died" / "respawned" feed lines. Call BEFORE the
+	    m_mapGhostHealth write with the value about to be stored. */
+	void NotePartyHealth(uint8_t alId, uint8_t alNewHealth);
+	/** Forget a remote id's name; "<name> left" if it had been announced. */
+	void ForgetPlayerName(uint8_t alId);
+#ifdef PENUMBRA_MULTIPLAYER
+	/** Host: every known name, one cNetPlayerName each, to one peer or (NULL) to all. */
+	void SendNameTable(struct _ENetPeer *apOnlyTo);
+	/** Guest: our name to the host (after PlayerJoin, and on a rename). */
+	void SendLocalName();
+#endif
 };
 //-----------------------------------------------------------------------
 /** Pumps cNetworkManager from the GLOBAL updater state, so hosting and

@@ -1461,6 +1461,8 @@ void cPlayer::OnDraw()
 	////////////////////////////////
 	//v12: party health bars above the ghosts (no-op offline)
 	DrawPartyHud();
+	//v13: top-left party panel + event feed (only hosting / live session)
+	DrawPartyPanel();
 	
 	////////////////////////////////
 	//Cross hair
@@ -1810,16 +1812,110 @@ void cPlayer::DrawPartyHud()
 										cVector2f(kBarW * fPercent, kBarH),
 										cColor(1.0f-fPercent, fPercent, 0, fAlpha));
 		}
+		//v13: the player's name ("Player <id>" until one is known)
+		const tWString sName = cString::To16Char(pNet->GetPlayerName(m.mlId));
 		if(fHealth > 0)
 		{
 			mpFont->Draw(cVector3f(vPos.x, vPos.y - kBarH*0.5f - 15, fZ+2),cVector2f(12,12),
-							cColor(1,1,1,fAlpha),eFontAlign_Center,_W("P%d"),(int)m.mlId);
+							cColor(1,1,1,fAlpha),eFontAlign_Center,_W("%ls"),sName.c_str());
 		}
 		else
 		{
 			mpFont->Draw(cVector3f(vPos.x, vPos.y - kBarH*0.5f - 15, fZ+2),cVector2f(12,12),
-							cColor(1,0.3f,0.3f,fAlpha),eFontAlign_Center,_W("P%d dead"),(int)m.mlId);
+							cColor(1,0.3f,0.3f,fAlpha),eFontAlign_Center,_W("%ls dead"),sName.c_str());
 		}
+	}
+}
+
+//-----------------------------------------------------------------------
+
+/* v13 party panel, top-left of the HUD: one line per party member, us
+   included and in id order (the host, id 1, first with a "(host)" tag) —
+   name + a 50x5 health bar (red..green), "dead" in red — then the last
+   cNetworkManager::kPartyEventMax feed lines ("<name> joined / left /
+   died / respawned"), each fading out over its final 1.5 s of the 6 s
+   life. Drawn only while hosting or in a live session, under the same
+   screen guards as DrawPartyHud, so single-player never sees it. */
+void cPlayer::DrawPartyPanel()
+{
+	cNetworkManager *pNet = mpInit->mpNetworkManager;
+	if(pNet==NULL || mpGfxPartyBar==NULL || mpFont==NULL) return;
+	if(pNet->IsHosting()==false && pNet->IsSessionLive()==false) return;
+	if(IsDead()) return;
+	if(	(mpInit->mpInventory && mpInit->mpInventory->IsActive()) ||
+		(mpInit->mpNotebook && mpInit->mpNotebook->IsActive()) ||
+		(mpInit->mpNumericalPanel && mpInit->mpNumericalPanel->IsActive()) ||
+		(mpInit->mpDeathMenu && mpInit->mpDeathMenu->IsActive()))
+	{
+		return;
+	}
+
+	std::vector<cNetPartyMember> vParty;
+	pNet->GetPartyStatus(vParty); /* remote members, id ascending */
+
+	//Merge ourselves in at our id (the party vector is already sorted).
+	std::vector<std::pair<int,float> > vLines;
+	const int lLocalId = (int)pNet->GetLocalPlayerID();
+	bool bLocalPlaced = false;
+	for(size_t i=0; i<vParty.size(); ++i)
+	{
+		const int lId = (int)vParty[i].mlId;
+		if(bLocalPlaced==false && lLocalId < lId)
+		{
+			vLines.push_back(std::make_pair(lLocalId, GetHealth()));
+			bLocalPlaced = true;
+		}
+		vLines.push_back(std::make_pair(lId, vParty[i].mfHealth));
+	}
+	if(bLocalPlaced==false) vLines.push_back(std::make_pair(lLocalId, GetHealth()));
+
+	const float fX = 12.0f;
+	float fY = 12.0f;
+	const float fZ = 90.0f;
+	const float kBarX = 150.0f;     /* bar column, right of the names */
+	const float kBarW = 50.0f, kBarH = 5.0f;
+	const float kLineH = 16.0f;
+	const cVector2f vFontSize(12,12);
+
+	for(size_t i=0; i<vLines.size(); ++i)
+	{
+		const int lId = vLines[i].first;
+		const float fHealth = (vLines[i].second < 0) ? 0.0f : ((vLines[i].second > 100) ? 100.0f : vLines[i].second);
+		const float fPercent = fHealth / 100.0f;
+
+		tWString sName = cString::To16Char(pNet->GetPlayerName((uint8_t)lId));
+		if(lId == 1) sName += _W(" (host)");
+		if(fHealth <= 0) sName += _W("  dead");
+		const cColor col = (fHealth > 0) ? cColor(1,1,1,0.9f) : cColor(1,0.3f,0.3f,0.9f);
+
+		mpFont->Draw(cVector3f(fX+1, fY+1, fZ+1),vFontSize,cColor(0,0,0,0.7f),eFontAlign_Left,_W("%ls"),sName.c_str());
+		mpFont->Draw(cVector3f(fX, fY, fZ+2),vFontSize,col,eFontAlign_Left,_W("%ls"),sName.c_str());
+
+		mpGfxDrawer->DrawGfxObject(mpGfxPartyBar,
+									cVector3f(fX + kBarX - 1, fY + 4 - 1, fZ),
+									cVector2f(kBarW + 2, kBarH + 2), cColor(0,0,0,0.6f));
+		if(fPercent > 0)
+		{
+			mpGfxDrawer->DrawGfxObject(mpGfxPartyBar,
+										cVector3f(fX + kBarX, fY + 4, fZ+1),
+										cVector2f(kBarW * fPercent, kBarH),
+										cColor(1.0f-fPercent, fPercent, 0, 0.9f));
+		}
+		fY += kLineH;
+	}
+
+	//Event feed: oldest first, fading out over the last 1.5 s.
+	const std::vector<cNetworkManager::cNetPartyEvent> &vEvents = pNet->GetPartyEvents();
+	if(vEvents.empty()==false) fY += 4;
+	for(size_t i=0; i<vEvents.size(); ++i)
+	{
+		float fAlpha = (cNetworkManager::kPartyEventLifeSeconds - vEvents[i].mfAge) / 1.5f;
+		if(fAlpha > 1) fAlpha = 1;
+		if(fAlpha <= 0.02f) continue;
+		const tWString sText = cString::To16Char(vEvents[i].msText);
+		mpFont->Draw(cVector3f(fX+1, fY+1, fZ+1),vFontSize,cColor(0,0,0,0.7f*fAlpha),eFontAlign_Left,_W("%ls"),sText.c_str());
+		mpFont->Draw(cVector3f(fX, fY, fZ+2),vFontSize,cColor(0.85f,0.85f,1,0.9f*fAlpha),eFontAlign_Left,_W("%ls"),sText.c_str());
+		fY += 14;
 	}
 }
 
