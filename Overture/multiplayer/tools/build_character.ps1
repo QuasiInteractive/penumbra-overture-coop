@@ -18,6 +18,10 @@
     .\build_character.ps1 -Fbx C:\Art\ella.fbx -Name ella -BvhDir C:\Art\motifect\BVH
 
 .EXAMPLE
+    .\build_character.ps1 -Fbx C:\Art\meshy_biped.fbx -Name red -BvhDir C:\Art\motifect\BVH `
+        -Texture C:\Art\meshy_biped_texture_0.png -DecimateTo 12000 -Scale 1.06
+
+.EXAMPLE
     .\build_character.ps1 -Fbx C:\Art\malik_v2.fbx -Name malik -BvhDir C:\Art\motifect\BVH `
         -Redist 'D:\SteamLibrary\steamapps\common\Penumbra Overture\redist',
                 'D:\SteamLibrary\steamapps\common\Penumbra Overture\redist_guest'
@@ -34,12 +38,16 @@ param(
     [string]$Blender = 'C:\Program Files\Blender Foundation\Blender 4.2\blender.exe',
     # Game folder(s) to install into (each gets multiplayer\models\...).
     [string[]]$Redist = @(),
-    # Size factor on top of the FBX's own size (0.95 = the shipped characters).
+    # Size factor on top of the FBX's own size (0.95 for a Mixamo FBX; the
+    # shipped Meshy characters use 1.06: Meshy exports 1.70 m tall).
     [double]$Scale = 0.95,
     # Diffuse image to use instead of the one inside the FBX (png/jpg/tga).
     [string]$Texture,
     # Largest texture edge in pixels (power of two).
     [int]$MaxTex = 2048,
+    # Decimate the mesh to at most this many triangles before export
+    # (Blender Decimate, collapse; 0 = off). 12000 is the recommended budget.
+    [int]$DecimateTo = 0,
     # Output folder (default: the repository's multiplayer\models).
     [string]$Out,
     # Python 3 executable (default: python, then 'py -3').
@@ -89,6 +97,7 @@ if ($Name -cnotmatch '^[a-z0-9]+$') {
     Fail "-Name '$Name': use lowercase letters and digits only (no '_', no spaces), e.g. 'ella'"
 }
 if (-not (Test-Path -LiteralPath $Fbx -PathType Leaf)) { Fail "FBX not found: $Fbx" }
+if ($DecimateTo -lt 0) { Fail "-DecimateTo must be a triangle count (e.g. 12000) or 0 for off" }
 $Fbx = (Resolve-Path -LiteralPath $Fbx).Path
 
 if (-not (Test-Path -LiteralPath $Blender -PathType Leaf)) {
@@ -161,6 +170,7 @@ $bargs = @('--background', '--factory-startup', '--python-exit-code', '1',
            $Fbx, $Out, $Name, $Scale.ToString('R', $inv), '--no-clips',
            '--max-tex', $MaxTex.ToString($inv))
 if ($Texture) { $bargs += @('--texture', $Texture) }
+if ($DecimateTo -gt 0) { $bargs += @('--decimate-to', $DecimateTo.ToString($inv)) }
 $r = Invoke-Native $Blender $bargs
 $blenderCode = $r[0]
 $report = @($r[1] | Where-Object { $_.StartsWith('[hpl]') })

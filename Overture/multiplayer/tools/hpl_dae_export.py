@@ -46,6 +46,13 @@
 #                       sizes are resampled to the nearest power of two
 #   --unit <m>          metres per armature unit (default: auto — Mixamo cm
 #                       FBX = 0.01; otherwise the armature object's scale)
+#   --decimate-to <n>   reduce the joined mesh to at most n triangles first
+#                       (Decimate modifier, COLLAPSE, triangulated; weights
+#                       and UVs are interpolated). Default off.
+#
+# Rigs: Mixamo names (any prefix variant) or a Meshy AI biped (Spine02/
+# Spine01/Spine counted from the top, lowercase neck): the latter is detected
+# and renamed to the Mixamo layout (MESHY_RENAME).
 #
 # Source conventions: Mixamo FBX in Blender ARMATURE space is Y-up, facing +Z,
 # the character's left = +X, units cm. The script checks that from the joints
@@ -136,11 +143,36 @@ def find_armature(objs):
     return None
 
 
+# Meshy AI biped rigs (meshy.ai auto-rigger): 24 bones, Mixamo names for the
+# limbs but the spine counted from the TOP (Spine02 is the lowest, child of
+# Hips; Spine the chest) and lowercase neck / head leaves. Applied as ONE
+# simultaneous mapping on the original bone name, before the Mixamo prefix
+# normalisation (a sequential rename would turn Spine02 -> Spine -> Spine2).
+MESHY_RENAME = {
+    "Spine02": "Spine", "Spine01": "Spine1", "Spine": "Spine2",
+    "neck": "Neck", "head_end": "HeadTop_End", "headfront": "HeadFront",
+}
+# the active rename table (set by main() when a Meshy rig is detected)
+BONE_RENAME = {}
+
+
+def detect_meshy(arm_obj):
+    """True for a Meshy biped rig: Spine02 + Spine01 + Spine bones and no
+    mixamorig-prefixed bone."""
+    names = set(b.name for b in arm_obj.data.bones)
+    if any(n.lower().startswith("mixamorig") for n in names):
+        return False
+    return {"Spine02", "Spine01", "Spine"} <= names
+
+
 def joint_name(bone_name):
     """Blender bone name -> DAE joint id. Mixamo names in any of their
     variants ('mixamorig:Hips', 'mixamorig1:Hips', 'mixamorig_Hips', bare
     'Hips') all become 'mixamorigwHips', the spelling the converter's MAP and
-    the shipped models use; anything else is only made XML-id safe."""
+    the shipped models use; Meshy rigs go through BONE_RENAME first; anything
+    else is only made XML-id safe."""
+    if bone_name in BONE_RENAME:
+        return PFX + BONE_RENAME[bone_name]
     m = re.match(r"^mixamorig\d*[:_]?(.+)$", bone_name)
     tail = m.group(1) if m else bone_name
     if tail in MIXAMO_JOINTS:
@@ -288,7 +320,7 @@ class Rig(object):
         self.tris = []  # flat loop data
         # validation stats (per unique vertex, before the 4-weight cap)
         self.stats = dict(unique_verts=0, max_raw_wpv=0, capped_verts=0,
-                          max_dropped_weight=0.0, unweighted_verts=0, has_uv=False,
+                          max_dropped_weight=0.0, heavy_capped_verts=0, unweighted_verts=0, has_uv=False,
                           uv_layers=0, material_tris={})
         if mesh_obj is not None:
             depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -326,6 +358,8 @@ class Rig(object):
                     st["capped_verts"] += 1
                     dropped = sum(w for _, w in ws[MAX_WEIGHTS:]) / (raw_tot or 1.0)
                     st["max_dropped_weight"] = max(st["max_dropped_weight"], dropped)
+                    if dropped > 0.15:
+                        st["heavy_capped_verts"] += 1
                 if not ws:
                     st["unweighted_verts"] += 1
                 ws = ws[:MAX_WEIGHTS]
@@ -780,9 +814,9 @@ def validate(rig, rep, mesh, base_path):
              (" (largest dropped share %.1f%%, renormalized)" % (100.0 * st["max_dropped_weight"]))
              if st["capped_verts"] else ""))
     if st["capped_verts"] and st["max_dropped_weight"] > 0.15:
-        rep.w("some vertices lose more than 15%% of their skin weight to the %d-weight cap; "
+        rep.w("%d vertices lose more than 15%% of their skin weight to the %d-weight cap; "
               "in Blender run Weights > Limit Total (4) + Normalize All and re-check the deformation"
-              % MAX_WEIGHTS)
+              % (st["heavy_capped_verts"], MAX_WEIGHTS))
     if st["unweighted_verts"]:
         rep.w("%d vertices have NO bone weight: they stay frozen at the rest pose while the body "
               "moves (weight-paint them, or parent that part to a bone before exporting)"
@@ -865,8 +899,9 @@ def validate(rig, rep, mesh, base_path):
         rep.w("height %.2f m is outside 1.3..2.2 m: check the scale argument / --unit" % span)
     if os.path.exists(base_path):
         mb = os.path.getsize(base_path) / 1048576.0
-        rep.i("files: %s %.1f MB; each of the 15 clip files embeds it (~%.0f MB for the whole set)"
-              % (os.path.basename(base_path), mb, 16 * mb + 15 * 0.2))
+        rep.i("files: %s %.1f MB; bvh_to_hpl_clip.py's clip files carry only the skeleton + skin "
+              "binds and a one-triangle stub (--stub-mesh, ~0.1-0.25 MB each)"
+              % (os.path.basename(base_path), mb))
 
 
 def weight_bone_parented(meshes, arm):
@@ -880,8 +915,81 @@ def weight_bone_parented(meshes, arm):
             print("[hpl] note: '%s' is parented to bone '%s'; weighted 100%% to it" % (m.name, m.parent_bone))
 
 
+def mesh_triangles(me):
+    """Triangle count of a mesh datablock (what the exporter writes)."""
+    me.calc_loop_triangles()
+    return len(me.loop_triangles)
+
+
+def decimate_mesh(mesh_obj, target, rep):
+    """--decimate-to: Blender's Decimate modifier (COLLAPSE, triangulated)
+    applied to the joined mesh BEFORE the exporter reads positions and
+    weights. Edge collapse interpolates the vertex data, so the vertex groups
+    (skin weights) and UVs follow the surviving vertices; the ratio is refined
+    on the evaluated result (other modifiers muted) so the applied mesh lands
+    at or just under the target."""
+    me = mesh_obj.data
+    before = mesh_triangles(me)
+    if target <= 0 or before <= target:
+        rep.i("decimate: %d triangles already <= target %d, left as is" % (before, target))
+        return before
+    if me.shape_keys is not None:
+        rep.w("decimate skipped: the mesh has shape keys (Blender cannot apply a modifier then); "
+              "remove them in Blender (Object Data > Shape Keys) or decimate there")
+        return before
+    muted = []
+    for md in mesh_obj.modifiers:
+        if md.show_viewport:
+            muted.append(md)
+            md.show_viewport = False
+    dec = mesh_obj.modifiers.new("hpl_decimate", "DECIMATE")
+    dec.decimate_type = "COLLAPSE"
+    dec.use_collapse_triangulate = True
+    dec.use_symmetry = False
+
+    def evaluated(ratio):
+        dec.ratio = ratio
+        bpy.context.view_layer.update()
+        dg = bpy.context.evaluated_depsgraph_get()
+        ev = mesh_obj.evaluated_get(dg)
+        tmp = ev.to_mesh()
+        n = mesh_triangles(tmp)
+        ev.to_mesh_clear()
+        return n
+
+    ratio = target / float(before)
+    best = None  # (count, ratio) with count <= target, the largest count
+    for _ in range(8):
+        got = evaluated(ratio)
+        if got <= target and (best is None or got > best[0]):
+            best = (got, ratio)
+        if got <= target and got >= target * 0.995:
+            break
+        ratio = max(1e-4, min(1.0, ratio * target / float(max(1, got))))
+        if got > target:
+            ratio *= 0.999
+    if best is None:
+        best = (evaluated(ratio * 0.98), ratio * 0.98)
+    dec.ratio = best[1]
+    for md in muted:
+        md.show_viewport = True
+    bpy.ops.object.select_all(action="DESELECT")
+    mesh_obj.select_set(True)
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.object.modifier_move_to_index(modifier=dec.name, index=0)
+    bpy.ops.object.modifier_apply(modifier=dec.name)
+    after = mesh_triangles(mesh_obj.data)
+    rep.i("decimate: %d -> %d triangles (target %d, Decimate COLLAPSE ratio %.4f, "
+          "triangulated; vertex groups + UVs interpolated by the collapse)"
+          % (before, after, target, best[1]))
+    if after > target:
+        rep.w("decimate: %d triangles after applying, above the target %d" % (after, target))
+    return after
+
+
 def parse_args(argv):
-    flags = dict(no_clips=False, texture=None, no_texture=False, max_tex=DEFAULT_MAX_TEX, unit=None)
+    flags = dict(no_clips=False, texture=None, no_texture=False, max_tex=DEFAULT_MAX_TEX, unit=None,
+                 decimate_to=0)
     pos = []
     i = 0
     while i < len(argv):
@@ -890,7 +998,7 @@ def parse_args(argv):
             flags["no_clips"] = True
         elif a == "--no-texture":
             flags["no_texture"] = True
-        elif a in ("--texture", "--max-tex", "--unit"):
+        elif a in ("--texture", "--max-tex", "--unit", "--decimate-to"):
             if i + 1 >= len(argv):
                 raise SystemExit("%s needs a value" % a)
             v = argv[i + 1]
@@ -899,6 +1007,8 @@ def parse_args(argv):
                 flags["texture"] = v
             elif a == "--max-tex":
                 flags["max_tex"] = int(v)
+            elif a == "--decimate-to":
+                flags["decimate_to"] = int(v)
             else:
                 flags["unit"] = float(v)
         else:
@@ -914,7 +1024,7 @@ def parse_args(argv):
 
     usage = ("usage: blender --background --python hpl_dae_export.py -- "
              "<base_fbx> <clips_fbx_dir|-> <out_dir> <name> [scale] [--no-clips] "
-             "[--texture f] [--no-texture] [--max-tex px] [--unit m]")
+             "[--texture f] [--no-texture] [--max-tex px] [--unit m] [--decimate-to tris]")
     # short form: <fbx> <out> <name> [scale] --no-clips
     if flags["no_clips"] and (len(pos) == 3 or (len(pos) == 4 and isfloat(pos[3]))) \
             and pos[1] != "-":
@@ -954,6 +1064,11 @@ def main():
         raise SystemExit("%s has no mesh" % base_fbx)
     rep.i("source: %s (Blender %s), %d mesh object(s) joined into one"
           % (os.path.basename(base_fbx), bpy.app.version_string.split()[0], len(meshes)))
+    if detect_meshy(arm):
+        BONE_RENAME.update(MESHY_RENAME)
+        rep.i("Meshy biped rig detected: bones renamed %s"
+              % ", ".join("%s->%s" % (k, v) for k, v in MESHY_RENAME.items()
+                          if arm.data.bones.get(k) is not None))
     weight_bone_parented(meshes, arm)
     if len(meshes) > 1:  # single geometry like the proven package
         # the skinned mesh (Armature modifier) stays the active object
@@ -965,6 +1080,8 @@ def main():
         bpy.ops.object.join()
         meshes = [meshes[0]]
     mesh = meshes[0]
+    if flags["decimate_to"]:
+        decimate_mesh(mesh, flags["decimate_to"], rep)
 
     # units: Mixamo FBX = cm armature space (object scale 0.01) -> exactly UNIT
     if flags["unit"] is not None:

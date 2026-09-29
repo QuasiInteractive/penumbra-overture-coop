@@ -1176,7 +1176,10 @@ async function loadDae(file) {
   try { model = HPL.parseDae(doc, file.name); } catch (e) { console.error(e); app.files.push({ name: file.name, kind: 'dae', error: 'parse exception: ' + e.message }); return; }
   model.parseMs = performance.now() - t0;
   const entry = { name: file.name, kind: 'dae', model, isBase: false, isClip: !!model.anim };
-  const usable = !!(model.skeleton && model.skeleton.bones.length && model.geometry && model.skinData);
+  // bvh_to_hpl_clip.py --stub-mesh clips carry a one-triangle stub instead of the mesh: never a base
+  const stubClip = !!(model.anim && model.geometry && model.geometry.triangleCount <= 1);
+  if (stubClip) entry.note = 'stub-mesh clip (skeleton + animation only; drop the base <name>.dae for the mesh)';
+  const usable = !stubClip && !!(model.skeleton && model.skeleton.bones.length && model.geometry && model.skinData);
   // the first usable document becomes the base; a real base (no animations) later replaces a clip-derived one
   if (usable && (!app.base || (app.base.anim && !model.anim))) {
     for (const f of app.files) if (f.isBase) { f.isBase = false; f.note = 'was base; replaced by ' + file.name; }
@@ -1493,7 +1496,7 @@ window.addEventListener('keydown', e => {
   else if (e.code === 'ArrowRight') ui.stepFwd.click(); else if (e.code === 'ArrowLeft') ui.stepBack.click();
 });
 refreshDiagnostics();
-window.__viewer = { app, slotA, slotB, ui, handleFiles, setFrame, setPlaying, HPL, THREE, renderer };
+window.__viewer = { app, slotA, slotB, ui, handleFiles, setFrame, setPlaying, HPL, THREE, renderer, camera, controls };
 </script>
 </body>
 </html>

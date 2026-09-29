@@ -26,17 +26,15 @@ folder (45 files, 30 fps, 77 joints).
 
 ```sh
 cd <repo>
-python3 Overture/multiplayer/tools/bvh_to_hpl_clip.py \
-    --base Overture/multiplayer/models/phillip.dae \
-    --bvh-dir <motifect_pack>/BVH \
-    --out Overture/multiplayer/models --name phillip
-python3 Overture/multiplayer/tools/bvh_to_hpl_clip.py \
-    --base Overture/multiplayer/models/malik.dae \
-    --bvh-dir <motifect_pack>/BVH \
-    --out Overture/multiplayer/models --name malik
+for n in phillip malik fisherman red; do
+  python3 Overture/multiplayer/tools/bvh_to_hpl_clip.py \
+      --base Overture/multiplayer/models/$n.dae \
+      --bvh-dir <motifect_pack>/BVH \
+      --out Overture/multiplayer/models --name $n
+done
 ```
 
-Each run takes about 6 s, overwrites the 15 `<name>_<slot>.dae` files and
+Each run takes about 3 s, overwrites the 15 `<name>_<slot>.dae` files and
 `<name>_clips.json`, and exits non-zero if its self-validation fails. The
 output is deterministic (a second run into another directory is byte-identical),
 so a regenerate is safe to diff. `--only walk,run` limits the slots (the
@@ -60,31 +58,35 @@ Gait = hips XZ drift removed over the range / duration, scaled to the model
 (see "Hips translation"); 0 = not a locomotion clip. The runtime plays a
 locomotion clip at `measured_speed / gait`.
 
-| slot | pack clip | frames | keys | loop | hip_sway | phillip gait m/s | malik gait m/s | notes |
-|---|---|---|---|---|---|---|---|---|
-| idle | idle_neutral | [125,217) | 93 | yes | 1 | 0 | 0 | only pack idle without body yaw drift |
-| walk | walk_forward | [79,113) | 35 | yes | 0.45 | 1.28 | 1.45 | one gait cycle (T = 35 f) |
-| run | run_sprint | [68,86) | 19 | yes | 0.6 | see sidecar | see sidecar | steady sprint stride with pumping arms; run_jog 137-159 had elbows locked at 44-65 deg (hands at the chest) |
-| walk_back | walk_backward | [99,138) | 40 | yes | 0.5 | 0.72 | 0.81 | |
-| strafe_walk_l | walk_strafe_left | [78,179) | 102 | yes | 0.5 | 0.54 | 0.61 | two cycles (speed pulses inside one) |
-| strafe_walk_r | walk_strafe_right | [116,153) | 38 | yes | 0.5 | 0.77 | 0.88 | |
-| strafe_run_l | run_strafe_left | [117,139) | 23 | yes | 0.6 | 2.10 | 2.39 | frames 0-60 of the source are a standing start |
-| strafe_run_r | run_strafe_right | [133,157) | 25 | yes | 0.6 | 1.84 | 2.09 | frames 0-35 are a standing start |
-| crouch_idle | crouch_rise_up | [10,14) x11.25, pingpong | 89 | yes | 1 | 0 | 0 | hold of the transitions' shared frame 10 (hips 0.50 m) breathing up 6 cm to f13 and back: 45 keys up + 43 down, 2.93 s. Replaces the pack's crouch_idle.bvh (`loop:auto:75:105` -> [192,283), 92 keys: a deep kneel, hips 0.42 m, knees on the floor, head 0.59 m), kept as a commented alternative in `SLOTS` |
-| crouch_walk | crouch_walk_forward | [82,136) | 55 | yes | 0.5 | 0.76 | 0.87 | hips 0.55-0.69 m |
-| jump | jump_standing | [44,84) | 40 | no | 1 | 0 | 0 | airborne 47-59 + landing; `airborne="flat"` |
-| stand_to_crouch | crouch_rise_up, reversed | [10,42) | 32 | no | 1 | 0 | 0 | frames 0-9 of the source are a heel-sit squat |
-| crouch_to_stand | crouch_rise_up | [10,42) | 32 | no | 1 | 0 | 0 | same length as stand_to_crouch (runtime lerps the Y offset over it) |
-| turn_l | turn_left_90 | [0,40) | 40 | no | 1 | 0 | 0 | linear yaw drift (+92.7 deg) removed |
-| turn_r | turn_right_90 | [0,60) | 60 | no | 1 | 0 | 0 | linear yaw drift (-93.9 deg) removed |
+| slot | pack clip | frames | keys | loop | hip_sway | gait m/s phillip / malik / fisherman / red | notes |
+|---|---|---|---|---|---|---|---|
+| idle | idle_neutral | [125,217) | 93 | yes | 1 | 0 | only pack idle without body yaw drift |
+| walk | walk_forward | [79,113) | 35 | yes | 0.45 | 1.22 / 1.23 / 1.18 / 1.21 | one gait cycle (T = 35 f) |
+| run | run_sprint | [68,86) | 19 | yes | 0.6 | 4.00 / 4.03 / 3.84 / 3.94 | steady sprint stride with pumping arms; run_jog 137-159 had elbows locked at 44-65 deg (hands at the chest) |
+| walk_back | walk_backward | [99,138) | 40 | yes | 0.5 | 0.69 / 0.69 / 0.66 / 0.68 | |
+| strafe_walk_l | walk_strafe_left | [78,179) | 102 | yes | 0.5 | 0.51 / 0.52 / 0.49 / 0.51 | two cycles (speed pulses inside one) |
+| strafe_walk_r | walk_strafe_right | [116,153) | 38 | yes | 0.5 | 0.74 / 0.74 / 0.71 / 0.73 | |
+| strafe_run_l | run_strafe_left | [117,139) | 23 | yes | 0.6 | 2.02 / 2.03 / 1.94 / 1.99 | frames 0-60 of the source are a standing start |
+| strafe_run_r | run_strafe_right | [133,157) | 25 | yes | 0.6 | 1.76 / 1.77 / 1.69 / 1.74 | frames 0-35 are a standing start |
+| crouch_idle | crouch_rise_up | [10,14) x11.25, pingpong | 89 | yes | 1 | 0 | hold of the transitions' shared frame 10 (hips 0.50 m) breathing up 6 cm to f13 and back: 45 keys up + 43 down, 2.93 s. Replaces the pack's crouch_idle.bvh (`loop:auto:75:105` -> [192,283), 92 keys: a deep kneel, hips 0.42 m, knees on the floor, head 0.59 m), kept as a commented alternative in `SLOTS` |
+| crouch_walk | crouch_walk_forward | [82,136) | 55 | yes | 0.5 | 0.73 / 0.73 / 0.70 / 0.72 | hips 0.53-0.71 m |
+| jump | jump_standing | [44,84) | 40 | no | 1 | 0 | airborne 47-59 + landing; `airborne="flat"` |
+| stand_to_crouch | crouch_rise_up, reversed | [10,42) | 32 | no | 1 | 0 | frames 0-9 of the source are a heel-sit squat |
+| crouch_to_stand | crouch_rise_up | [10,42) | 32 | no | 1 | 0 | same length as stand_to_crouch (runtime lerps the Y offset over it) |
+| turn_l | turn_left_90 | [0,40) | 40 | no | 1 | 0 | linear yaw drift (+92.7 deg) removed |
+| turn_r | turn_right_90 | [0,60) | 60 | no | 1 | 0 | linear yaw drift (-93.9 deg) removed |
 
-Resulting hips heights (phillip / malik, m): standing clips 0.91-1.03 /
-0.93-1.10, crouch_idle 0.50-0.55 / 0.49-0.56, crouch_walk 0.55-0.69 /
-0.56-0.72, jump dips to 0.71 / 0.75 on landing. Lowest foot joint on ground clips stays within
-about +/-2 cm of the base rest floor (toe base at 0.018 / 0.015 m); the
-exceptions are walk_back (-1.8 / -2.6 cm, the actor's foot sinks 4 cm in the
-source) and the jump take-off/landing frames (down to -8.6 / -9.1 cm, see
-"Jump" below).
+Resulting hips heights (phillip / malik / fisherman / red, m; the Meshy
+characters of 2026-09): standing clips 0.84-0.96 / 0.86-0.98 / 0.82-0.93 /
+0.83-0.96, crouch_idle 0.49-0.55 / 0.51-0.57 / 0.49-0.54 / 0.49-0.54,
+crouch_walk 0.54-0.69 / 0.56-0.71 / 0.53-0.68 / 0.53-0.68, jump dips to
+0.71 / 0.74 / 0.70 / 0.71 on landing. Lowest foot joint on ground clips
+stays within about +/-2 cm of the base rest floor (toe base at 0.044 / 0.042
+/ 0.044 / 0.039 m); the exceptions are walk_back (-3.4 to -3.5 cm, the
+actor's foot sinks 4 cm in the source), crouch_walk (-1.7 to -1.8 cm) and the
+jump take-off/landing frames (down to -5 to -6.6 cm, see "Jump" below). The
+skinned mesh's lowest vertex (the sole) stays within 0.3 cm of y 0 in idle
+and dips to -2 cm (walk) / -5 cm (run, crouch_walk) at toe-off.
 
 The table lives in `SLOTS` at the top of the converter: `bvh`, `frames`
 (a tuple or `"loop:auto:MIN:MAX"`), `loop`, `reverse`, `remove_yaw`,
@@ -92,13 +94,33 @@ The table lives in `SLOTS` at the top of the converter: `bvh`, `frames`
 
 ## Output format (what the engine needs)
 
-A clip file is the whole base document (images, effects, material, geometry,
-skin controller, JOINT tree) with one `<library_animations>` block inserted
-before `<scene>`. The base part is byte-identical to `<name>.dae`, so the
-clip's skin bind equals the base's by construction: `CreateAnimTrack` stores
-`inv(clip_bind_rot) * key_rot` and the runtime renders
-`base_bind_rot * stored`, which only reproduces the authored pose when the two
-binds match. Per joint, in document order:
+A clip file is the base document (asset, images, effects, material, skin
+controller, JOINT tree) with one `<library_animations>` block inserted
+before `<scene>`, and by default (`--stub-mesh`) **without the mesh**: the
+geometry is a one-triangle stub (3 vertices near the hips, with normals and
+texcoords, since the loader drops geometry without them,
+`MeshLoaderColladaHelpers.cpp` ~1523) and the controller's
+weights / `vertex_weights` weight those 3 vertices 1.0 to joint 0. The
+engine loads a clip as a mesh (`cAnimationManager::CreateAnimation` ->
+`LoadMesh`), builds its skeleton from the visual scene's JOINT tree plus
+the controller's joint `Name_array` and inverse binds
+(`MeshLoaderCollada.cpp` ~313-356), keeps the animation and throws the
+mesh away, so those parts stay **byte-identical** to `<name>.dae` (same
+joint order, same `bind_shape_matrix`, same inverse-bind text, same visual
+scene) and the clip's skin bind equals the base's by construction:
+`CreateAnimTrack` stores `inv(clip_bind_rot) * key_rot` and the runtime
+renders `base_bind_rot * stored`, which only reproduces the authored pose
+when the two binds match. The converter re-parses every written clip and
+fails unless the asset, visual scene, joint list, `bind_shape_matrix` and
+inverse binds are text-identical to the base (and the parsed joint order /
+inverse binds equal), the stub has VERTEX/NORMAL/TEXCOORD inputs and 3
+vertices weighted to joint 0, and every track has the same key count.
+
+Size: a clip is 0.1-0.25 MB (the keys: 24 joints x N keys x 7 numbers), all
+15 about 2.1 MB per character, instead of 15 copies of a 5 MB base.
+`--full-mesh` writes the former layout (the whole base mesh + weights in
+every clip, byte-identical to the base apart from the animations).
+Per joint, in document order:
 
 ```
 <animation id="hpl_<joint>">
@@ -129,9 +151,10 @@ W_tgt(j,t) = W_src(s,t) * A(j) * W_tgt_rest(j)
 `W_tgt_rest(j)` is the base's world bind rotation `rot3(inv(IB_j))`, the frame
 the engine skins with (it agrees with the node rest angles to 0.001 deg in
 these files, but the binds are used). `A(j)` is a constant per-joint
-correction: the two rests are both T-poses but not the same one (phillip's
-arms droop 10 deg and his feet pitch 19 deg differently; malik is an A-pose,
-arms 39 deg down). Without `A(j)` the source T-pose would map onto the
+correction: the two rests are not the same pose (the Meshy phillip / malik /
+fisherman arms hang 11-13 deg below horizontal, red is an A-pose with the
+arms 44 deg down; `A(j)` on the upper arms is 13-14 deg and 46-48 deg,
+Neck ~20 deg, the spine 1-5 deg). Without `A(j)` the source T-pose would map onto the
 target's own rest and those differences would be baked into every frame.
 `A(j)` is the minimal rotation taking the target's rest bone direction
 (joint -> `ALIGN_CHILD[j]`, from the bind positions) onto the source's rest
@@ -139,7 +162,7 @@ bone direction, so the target bone points exactly where the source bone
 points, every frame. It is applied to the torso, neck, shoulders, arms, hands
 and legs only. It is deliberately not applied to the feet, toes, head and
 fingers: their target directions are defined by leaf markers or by a
-differently placed ankle (phillip's ankle sits 14 cm above the floor, the
+differently placed ankle (a rig's ankle joint can sit twice as high as the
 BVH actor's 7 cm), so aligning them would tilt the head and lift the toes; the
 plain delta keeps "source rest = target rest = flat on the floor" for the
 feet. Twist about the bone axis is not corrected (both rigs use Y-along-bone,
@@ -157,10 +180,12 @@ metacarpals, middle/ring/pinky fingers, eyes, jaw) fold automatically because
 the mapped child's world rotation already contains them.
 
 Joint mapping (`MAP`): Hips, Spine1->Spine, Spine2->Spine1, Chest->Spine2,
-Neck1->Neck, Head, Left/RightShoulder, Arm, ForeArm, Hand, Thumb1-3 (phillip
-only), Index2/3/4 -> Index1/2/3 (the BVH index has an extra metacarpal),
+Neck1->Neck, Head, Left/RightShoulder, Arm, ForeArm, Hand, Thumb1-3,
+Index2/3/4 -> Index1/2/3 (the BVH index has an extra metacarpal),
 Leg->UpLeg, Shin->Leg, Foot, ToeBase. The mapping is filtered to the joints the
-base actually has (malik has no thumbs), so the same table serves both models.
+base actually has (the Meshy characters have no fingers: 22 of their 24
+joints are driven, HeadTop_End and HeadFront follow the head), so the same
+table serves every model.
 
 ## Hip sway damping (`hip_sway`)
 
@@ -228,7 +253,8 @@ hips.xz = base_bind_hips.xz + (bvh_xz_dedrifted - bvh_xz_undamped[first]) * k
 two are the same and the first key's hips sit exactly on the rest XZ).
 
 `k` (metres per BVH cm, `--scale`, default `auto`) is the leg-length ratio
-(base thigh+shin / BVH thigh+shin: phillip 0.00894, malik 0.01018), not the
+(base thigh+shin / BVH thigh+shin: phillip 0.00858, malik 0.00864, fisherman
+0.00824, red 0.00845), not the
 raw 0.01 or the hips-height ratio: a knee bend that lowers the BVH hips by
 51 cm lowers a shorter-legged phillip by what his legs produce when bent by
 the same angles, so the feet stay on the floor in crouches. A BVH frame at the
@@ -298,7 +324,8 @@ yaw-corrected path so the hips end exactly where they started.
    re-parses every written file and fails on joint order / skin / inverse-bind
    / key-count / time-array mismatches against the base. Sanity expectations:
    feet within a few cm of the floor on ground clips, standing hips near the
-   base rest (0.967 phillip, 1.034 malik), seam under ~5 cm rms for gait
+   base rest (0.953 phillip, 0.969 malik, 0.930 fisherman, 0.946 red),
+   seam under ~5 cm rms for gait
    loops, `all clips validated`.
 2. `anim_viewer.html` (same folder, works from `file://`): drop `<name>.dae`,
    the `<name>_*.dae` clips, `<name>.tga`, `<name>_clips.json` and the source
@@ -331,8 +358,9 @@ yaw-corrected path so the hips end exactly where they started.
   0.42 m, torso pitched ~76 deg, head at 0.59 m; kept as a commented
   alternative in `SLOTS`). The resampling is linear, so the turnaround at
   frame 13 flips the hips velocity (about 4 cm/s): a soft kink, not a pop.
-- Gait loop seams (run 5 cm rms / 22 deg, strafe_run_l 7 cm) are inherent in
+- Gait loop seams (run 7.5-7.8 cm rms / 23 deg, crouch_walk 3.4 cm, strafe_run_l 3.7 cm
+  on the Meshy characters) are inherent in
   the source cycles; the runtime crossfades over them.
-- The feet's 19 deg (phillip) / 15 deg (malik) rest-pitch difference from the
-  BVH foot is intentional (no `A(j)` on feet), so a source frame with a flat
+- The feet's rest-pitch difference from the BVH foot (15-19 deg on the
+  former Mixamo characters) is intentional (no `A(j)` on feet), so a source frame with a flat
   foot renders the target's own flat foot.

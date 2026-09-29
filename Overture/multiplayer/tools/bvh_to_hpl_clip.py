@@ -12,18 +12,26 @@ retarget_clip_dae.py (same directory).
 
 OUTPUT FORMAT (byte-compatible with the proven hpl_dae_export.py clips)
 ------------------------------------------------------------------------
-Each clip file is the WHOLE base document (images, effects, material,
-geometry, skin controller, visual scene = base skeleton rest) with a
-<library_animations> block inserted before <scene>. Per joint j, in the
-base document's node order:
+Each clip file is the base document (asset, images, effects, material, skin
+controller, visual scene = base skeleton rest) with a <library_animations>
+block inserted before <scene>. By default (--stub-mesh) the mesh is replaced
+by a one-triangle stub: the geometry holds 3 vertices near the hips (with
+normals and texcoords, which the loader requires) and the controller's
+weights / vertex_weights weight them 1.0 to joint 0, while the joint
+Name_array, bind_shape_matrix, inverse-bind source and the whole JOINT tree
+stay byte-identical to the base (the engine builds the clip's skeleton from
+exactly those and discards the clip's geometry), so a clip is ~tens of KB
+instead of a copy of the base mesh. --full-mesh keeps the whole base
+geometry + weights (the former layout). Per joint j, in the base document's
+node order:
     <animation id="hpl_j">
       sources hpl_j-time (frame numbers 0..N-1), hpl_j-trans (N*3 metres),
               hpl_j-rotz / -roty / -rotx (N degrees)
       4 samplers + channels  j/translate, j/rotateZ.ANGLE, j/rotateY.ANGLE,
                              j/rotateX.ANGLE
     </animation>
-Because the clip embeds the base skin, the clip's skin bind == the base's
-by construction, which is what HPL's CreateAnimTrack needs (it stores
+Because the clip carries the base's joint list and inverse binds verbatim,
+the clip's skin bind == the base's by construction, which is what HPL's CreateAnimTrack needs (it stores
 inv(clip_bind_rot)*full_rot and the runtime re-applies base_bind_rot*stored;
 see retarget_clip_dae.py's docstring and MeshLoaderColladaHelpers.cpp:445-513).
 The keys written here are FULL local node transforms (translate in metres,
@@ -187,7 +195,7 @@ transitions and the turns stay at 1.0 (their files are byte-identical).
 Usage:
   python3 bvh_to_hpl_clip.py --base <models>/<name>.dae --bvh-dir <pack>/BVH \
       --out <models> --name <name> [--scale auto|<m_per_cm>] [--only slot,slot] \
-      [--stand-hips-cm 99.8] [--dry-run]
+      [--stand-hips-cm 99.8] [--dry-run] [--full-mesh]
 """
 import argparse
 import json
@@ -685,6 +693,109 @@ def write_clip(base_txt, out_path, order, count, data):
         f.write(txt)
 
 
+# ------------------------------------------------------------ stub mesh
+def _element(txt, tag, id_value):
+    """(start, end) of the first <tag ... id="id_value" ...>...</tag> element
+    (not nested in itself: true for source / geometry in these documents)."""
+    m = re.search(r'<%s\b[^>]*\bid="%s"[^>]*>' % (tag, re.escape(id_value)), txt)
+    if not m:
+        return None
+    e = txt.find('</%s>' % tag, m.end())
+    if e < 0:
+        return None
+    return m.start(), e + len('</%s>' % tag)
+
+
+def make_stub_base(base_txt, hips_pos):
+    """The base document with its mesh replaced by a one-triangle stub, for the
+    clip files (--stub-mesh). The engine loads a clip file as a mesh and keeps
+    only its animation: the skeleton comes from the visual scene's JOINT tree +
+    the skin controller's joint list and inverse binds (MeshLoaderCollada.cpp
+    ~313-356), which stay byte-identical to the base, and the geometry is
+    thrown away. The controller must still target a geometry with normals and
+    texcoords (the loader drops geometry without them, MeshLoaderColladaHelpers
+    ~1523), so the stub is a real triangle near the hips (positions, normals,
+    texcoords) whose 3 vertices are weighted 1.0 to joint 0.
+    Everything else (asset, images/effects/materials, joint list,
+    bind_shape_matrix, inverse binds, visual scene) is kept verbatim."""
+    fail = "base document is not in hpl_dae_export.py's layout (%s); use --full-mesh"
+    skin = re.search(r'<skin\b[^>]*\bsource="#([^"]+)"', base_txt)
+    if not skin:
+        raise SystemExit(fail % "no <skin source=...>")
+    gid = skin.group(1)
+    g = _element(base_txt, "geometry", gid)
+    if g is None:
+        raise SystemExit(fail % ("skin source #%s names no geometry" % gid))
+    gtxt = base_txt[g[0]:g[1]]
+    gname = re.search(r'\bname="([^"]*)"', gtxt[:gtxt.find('>')])
+    gname = gname.group(1) if gname else gid
+    mat = re.search(r'<(?:triangles|polylist)\b[^>]*\bmaterial="([^"]*)"', gtxt)
+    mat_attr = ' material="%s"' % mat.group(1) if mat else ""
+    hx, hy, hz = hips_pos
+    pos = [(hx, hy, hz), (hx + 0.05, hy, hz), (hx, hy + 0.05, hz)]
+    xyz = ('<param name="X" type="float" /><param name="Y" type="float" />'
+           '<param name="Z" type="float" />')
+    stub = [
+        '<geometry id="%s" name="%s"><mesh>' % (gid, gname),
+        '      <source id="%s-vpos"><float_array id="%s-vpos-array" count="9">%s</float_array>'
+        '<technique_common><accessor source="#%s-vpos-array" count="3" stride="3">%s'
+        '</accessor></technique_common></source>'
+        % (gid, gid, " ".join(fmt(c) for p in pos for c in p), gid, xyz),
+        '      <source id="%s-vnrm"><float_array id="%s-vnrm-array" count="9">0 0 1 0 0 1 0 0 1</float_array>'
+        '<technique_common><accessor source="#%s-vnrm-array" count="3" stride="3">%s'
+        '</accessor></technique_common></source>' % (gid, gid, gid, xyz),
+        '      <source id="%s-vuv"><float_array id="%s-vuv-array" count="6">0 0 1 0 0 1</float_array>'
+        '<technique_common><accessor source="#%s-vuv-array" count="3" stride="2">'
+        '<param name="S" type="float" /><param name="T" type="float" /></accessor>'
+        '</technique_common></source>' % (gid, gid, gid),
+        '      <vertices id="%s-vertices"><input semantic="POSITION" source="#%s-vpos" /></vertices>'
+        % (gid, gid),
+        '      <triangles count="1"%s><input semantic="VERTEX" source="#%s-vertices" offset="0" />'
+        '<input semantic="NORMAL" source="#%s-vnrm" offset="1" />'
+        '<input semantic="TEXCOORD" source="#%s-vuv" offset="2" />'
+        '<p>0 0 0 1 1 1 2 2 2</p></triangles>' % (mat_attr, gid, gid, gid),
+        '    </mesh></geometry>',
+    ]
+    txt = base_txt[:g[0]] + "\n".join(stub) + base_txt[g[1]:]
+
+    # skin weights: one weight value 1.0; vertex_weights: 3 x (joint 0, weight 0)
+    vw = re.search(r'<vertex_weights\b[^>]*>(.*?)</vertex_weights>', txt, re.S)
+    if not vw:
+        raise SystemExit(fail % "no <vertex_weights>")
+    wsrc = re.search(r'<input semantic="WEIGHT" source="#([^"]+)" offset="(\d+)"', vw.group(1))
+    jin = re.search(r'<input semantic="JOINT" source="#[^"]+" offset="(\d+)"', vw.group(1))
+    if not wsrc or not jin:
+        raise SystemExit(fail % "vertex_weights without JOINT/WEIGHT inputs")
+    inputs = "".join(re.findall(r'<input\b[^>]*/>', vw.group(1)))
+    stride = 1 + max(int(x) for x in re.findall(r'offset="(\d+)"', inputs))
+    pair = ["0"] * stride
+    pair[int(wsrc.group(2))] = "0"   # weight index 0 -> 1.0
+    pair[int(jin.group(1))] = "0"    # joint 0 (the root, Hips)
+    new_vw = ('<vertex_weights count="3">%s<vcount>1 1 1</vcount><v>%s</v></vertex_weights>'
+              % (inputs, " ".join(" ".join(pair) for _ in range(3))))
+    txt = txt[:vw.start()] + new_vw + txt[vw.end():]
+    w = _element(txt, "source", wsrc.group(1))
+    if w is None:
+        raise SystemExit(fail % ("weight source #%s missing" % wsrc.group(1)))
+    wtxt = txt[w[0]:w[1]]
+    wtxt2 = re.sub(r'(<float_array\b[^>]*\bcount=")\d+("[^>]*>)[^<]*(</float_array>)',
+                   r'\g<1>1\g<2>1\g<3>', wtxt, count=1)
+    wtxt2 = re.sub(r'(<accessor\b[^>]*\bcount=")\d+(")', r'\g<1>1\g<2>', wtxt2, count=1)
+    if wtxt2 == wtxt:
+        raise SystemExit(fail % "weight source not rewritable")
+    return txt[:w[0]] + wtxt2 + txt[w[1]:]
+
+
+# blocks of a clip that must be byte-identical to the base (text regexes)
+IDENTICAL_BLOCKS = [
+    ("asset", r'<asset>.*?</asset>'),
+    ("visual scene (JOINT tree)", r'<library_visual_scenes>.*?</library_visual_scenes>'),
+    ("skin joint Name_array", r'<Name_array id="[^"]*skin-joints-array"[^>]*>[^<]*</Name_array>'),
+    ("bind_shape_matrix", r'<bind_shape_matrix>[^<]*</bind_shape_matrix>'),
+    ("inverse bind matrices", r'<float_array id="[^"]*skin-bind_poses-array"[^>]*>[^<]*</float_array>'),
+]
+
+
 def strip_animations(txt):
     """Base document text without any library_animations (in case a clip is
     passed as --base by mistake)."""
@@ -1081,9 +1192,37 @@ def build_slot(slot, cfg, tgt, rt, bvh_dir, k, stand_cm, floor_lock, log):
 
 
 # ----------------------------------------------------------------- validate
-def validate(base, out_path, log):
+def validate(base, out_path, log, stub=False):
+    """Re-parse a written clip and check it against the base document: joint
+    order, skin joint list + inverse binds (parsed AND byte-identical text),
+    visual scene / asset / bind_shape_matrix text, key counts, time arrays;
+    with stub=True also the one-triangle stub mesh and its skin weights."""
     clip = Doc(out_path)
     ok = True
+    for what, rx in IDENTICAL_BLOCKS:
+        a = re.search(rx, clip.txt, re.S)
+        b = re.search(rx, base.txt, re.S)
+        if not a or not b or a.group(0) != b.group(0):
+            log("  FAIL %s: %s is not byte-identical to the base" % (out_path, what))
+            ok = False
+    if stub:
+        g = re.search(r'<library_geometries>(.*?)</library_geometries>', clip.txt, re.S)
+        gt = g.group(1) if g else ""
+        skin = re.search(r'<skin\b[^>]*\bsource="#([^"]+)"', clip.txt)
+        if not skin or ('<geometry id="%s"' % skin.group(1)) not in gt:
+            log("  FAIL %s: skin controller does not target the stub geometry" % out_path)
+            ok = False
+        for sem in ("VERTEX", "NORMAL", "TEXCOORD"):
+            if '<input semantic="%s"' % sem not in gt:
+                log("  FAIL %s: stub geometry has no %s input (the engine drops it)" % (out_path, sem))
+                ok = False
+        vp = re.search(r'-vpos-array" count="(\d+)"', gt)
+        vw = re.search(r'<vertex_weights count="(\d+)">.*?<vcount>([^<]*)</vcount><v>([^<]*)</v>',
+                       clip.txt, re.S)
+        if not vp or not vw or int(vp.group(1)) != 9 or int(vw.group(1)) != 3 \
+                or vw.group(2).split() != ["1", "1", "1"] or set(vw.group(3).split()) != {"0"}:
+            log("  FAIL %s: stub mesh is not 3 vertices weighted 1.0 to joint 0" % out_path)
+            ok = False
     if list(clip.parent) != list(base.parent):
         log("  FAIL %s: joint order differs from base" % out_path)
         ok = False
@@ -1132,6 +1271,11 @@ def main():
     ap.add_argument("--no-floor-lock", action="store_true",
                     help="raw hips formula only; do not re-seat the lowest contact joint per frame")
     ap.add_argument("--dry-run", action="store_true", help="compute and check, write nothing")
+    ap.add_argument("--stub-mesh", dest="stub_mesh", action="store_true", default=True,
+                    help="(default) clip files carry a one-triangle stub instead of the base mesh; "
+                         "skeleton, joint list and inverse binds stay byte-identical to the base")
+    ap.add_argument("--full-mesh", dest="stub_mesh", action="store_false",
+                    help="embed the whole base mesh in every clip file (the old, large layout)")
     args = ap.parse_args()
 
     def log(msg):
@@ -1140,6 +1284,11 @@ def main():
 
     tgt = Target(args.base)
     base_txt = strip_animations(tgt.doc.txt)
+    if args.stub_mesh:
+        base_txt = make_stub_base(base_txt, tgt.world_pos[HIPS])
+        log("  clip mesh: one-triangle stub (--stub-mesh; --full-mesh embeds the base mesh)")
+    else:
+        log("  clip mesh: full base mesh (--full-mesh)")
     log("base %s: %d joints, hips rest %s m" % (args.base, len(tgt.joints),
                                                 "(%s)" % " ".join("%.4f" % v for v in tgt.local_trans[HIPS])))
     node_vs_bind = max(rot_angle_deg(mat_mul(mat_t(tgt.local_rot[j]), normalize_rot(tgt.doc.node_rest_rot[j])))
@@ -1172,6 +1321,7 @@ def main():
                    stand_hips_cm=args.stand_hips_cm,
                    base_hips_rest_m=[round(v, 5) for v in tgt.local_trans[HIPS]],
                    floor_lock=not args.no_floor_lock, target_floor_m=round(tgt.floor(), 5),
+                   clip_mesh="stub" if args.stub_mesh else "full",
                    joint_order=tgt.joints, clips={})
     all_ok = True
     probe = {}
@@ -1181,7 +1331,7 @@ def main():
         out_path = os.path.join(args.out, "%s_%s.dae" % (args.name, slot))
         if not args.dry_run:
             write_clip(base_txt, out_path, tgt.joints, count, data)
-            ok, n = validate(tgt.doc, out_path, log)
+            ok, n = validate(tgt.doc, out_path, log, stub=args.stub_mesh)
             all_ok = all_ok and ok and n == count
             meta["file"] = os.path.basename(out_path)
             meta["validated"] = bool(ok and n == count)
