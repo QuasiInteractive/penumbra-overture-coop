@@ -731,4 +731,144 @@ static_assert(sizeof(cNetSnapTimer) == 101, "");   /* v14 */
 static_assert(sizeof(cNetChallenge) == 17, "");    /* v15 */
 static_assert(sizeof(cNetAuth) == 43, "");         /* v15 */
 
+//-----------------------------------------------------------------------
+// MASTER SERVER protocol (internet server browser). Raw UDP like discovery,
+// NOT ENet, and a protocol of its own: its own magic, its own version, its own
+// type enum. It never touches kNetProtocolVersion — a host advertises the game
+// protocol it speaks inside the packet, and browsers grey out mismatches.
+//
+//   host    -> master   Register     every kNetMasterRegisterSeconds while
+//                                    hosting with public=1 (+ master_server=)
+//   host    -> master   Unregister   on stop hosting (best effort)
+//   browser -> master   List
+//   master  -> browser  Entries      one or more datagrams, up to
+//                                    kNetMasterMaxEntriesPerDatagram each
+//
+// The master records the SOURCE IP of a Register plus the game port GIVEN in
+// it (the host cannot know its public address; the source port is whatever
+// the NAT picked for the discovery socket and is useless). Entries therefore
+// carry the public IPv4 as 4 raw bytes in network order, a.b.c.d — no
+// htonl/ntohl question on either side, and the Python master packs it with
+// inet_aton. Everything else is little-endian (same-endian x86 peers, exactly
+// like the ENet payloads; the master uses '<' formats).
+//
+// Reference implementation: tools/master_server.py (Python 3, stdlib only).
+//-----------------------------------------------------------------------
+
+/** 'PNMS' as a plain little-endian uint32 (bytes 53 4D 4E 50 on the wire). */
+static const uint32_t kNetMasterMagic = 0x504E4D53u;
+
+/** Bump when any cNetMaster* struct changes layout. */
+static const uint16_t kNetMasterProtocolVersion = 1;
+
+/** Default master listen port (udp). */
+static const uint16_t kNetMasterDefaultPort = 7779;
+
+/** Hosts re-register at this interval; the master expires an entry after
+    kNetMasterExpirySeconds without one (3 missed beacons). */
+static const float kNetMasterRegisterSeconds = 20.0f;
+static const uint16_t kNetMasterExpirySeconds = 60;
+
+/** Entries per reply datagram: 8 + 10*77 = 778 bytes, safely under any MTU. */
+static const uint8_t kNetMasterMaxEntriesPerDatagram = 10;
+
+/** The browser collects Entries datagrams for this long after a List. */
+static const float kNetMasterListWindowSeconds = 3.0f;
+
+/** Placeholder default master for `public=1` WITHOUT `master_server=`: it is
+    an RFC 2606 reserved name that resolves to nothing, so nobody registers
+    anywhere they did not explicitly opt into. Replace it with your own
+    master's host:port (see README 'Public servers'), or set master_server=. */
+static const char *const kNetMasterDefaultHost = "master.example.invalid:7779";
+
+enum eNetMasterPacketType : uint8_t
+{
+	eNetMasterPacketType_Register = 1,   /* host -> master */
+	eNetMasterPacketType_Unregister = 2, /* host -> master */
+	eNetMasterPacketType_List = 3,       /* browser -> master */
+	eNetMasterPacketType_Entries = 4,    /* master -> browser, header + N entries */
+};
+
+/** cNetMasterRegister::mFlags / cNetMasterEntry::mFlags */
+static const uint8_t kNetMasterFlag_Password = 1; /* host requires a join password */
+
+#pragma pack(push, 1)
+/** Common 7-byte prefix of every master packet: type, magic, master version.
+    The master drops anything shorter than this or with another magic. */
+struct cNetMasterHeader
+{
+	uint8_t mType;       /**< eNetMasterPacketType */
+	uint32_t mlMagic;    /**< kNetMasterMagic */
+	uint16_t mlMasterVer;/**< kNetMasterProtocolVersion */
+};
+
+/** Host -> master, periodic. Source IP + mlGamePort is the server's key. */
+struct cNetMasterRegister
+{
+	uint8_t mType;       /**< eNetMasterPacketType_Register */
+	uint32_t mlMagic;
+	uint16_t mlMasterVer;
+	uint16_t mlGamePort;    /**< ENet port guests connect to (the one to forward) */
+	uint8_t mlPlayerCount;
+	uint8_t mlMaxPlayers;
+	uint8_t mFlags;         /**< kNetMasterFlag_* */
+	uint16_t mlProtocolVer; /**< kNetProtocolVersion this host speaks */
+	char msServerName[32];  /**< NUL-terminated, truncated */
+	char msMapName[32];
+};
+
+/** Host -> master when it stops hosting. Same key as Register. */
+struct cNetMasterUnregister
+{
+	uint8_t mType;       /**< eNetMasterPacketType_Unregister */
+	uint32_t mlMagic;
+	uint16_t mlMasterVer;
+	uint16_t mlGamePort;
+};
+
+/** Browser -> master. The browser's game protocol version travels along so a
+    master can log/filter; the reference master returns every live server and
+    lets the browser grey out mismatches. */
+struct cNetMasterList
+{
+	uint8_t mType;       /**< eNetMasterPacketType_List */
+	uint32_t mlMagic;
+	uint16_t mlMasterVer;
+	uint16_t mlProtocolVer;
+};
+
+/** Master -> browser: header, then mCount cNetMasterEntry records back to
+    back. A master with more than kNetMasterMaxEntriesPerDatagram live
+    servers sends several datagrams; a browser merges them by (ip, port). */
+struct cNetMasterEntries
+{
+	uint8_t mType;       /**< eNetMasterPacketType_Entries */
+	uint32_t mlMagic;
+	uint16_t mlMasterVer;
+	uint8_t mCount;      /**< 0..kNetMasterMaxEntriesPerDatagram */
+};
+
+struct cNetMasterEntry
+{
+	uint8_t mIp4[4];        /**< public IPv4, network order (a.b.c.d) */
+	uint16_t mlGamePort;
+	uint8_t mlPlayerCount;
+	uint8_t mlMaxPlayers;
+	uint8_t mFlags;         /**< kNetMasterFlag_* */
+	uint16_t mlProtocolVer; /**< the HOST's kNetProtocolVersion */
+	uint16_t mlAgeSeconds;  /**< seconds since the host's last Register */
+	char msServerName[32];
+	char msMapName[32];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(cNetMasterHeader) == 7, "");
+static_assert(sizeof(cNetMasterRegister) == 78, "");
+static_assert(sizeof(cNetMasterUnregister) == 9, "");
+static_assert(sizeof(cNetMasterList) == 9, "");
+static_assert(sizeof(cNetMasterEntries) == 8, "");
+static_assert(sizeof(cNetMasterEntry) == 77, "");
+static_assert(sizeof(cNetMasterEntries) + kNetMasterMaxEntriesPerDatagram * sizeof(cNetMasterEntry) <= 1024,
+	"master reply must fit the browser's receive buffer");
+
 #endif /* NETWORK_PACKETS_H */

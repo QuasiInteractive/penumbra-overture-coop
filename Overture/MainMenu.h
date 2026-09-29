@@ -39,6 +39,8 @@ enum eMainMenuState
 	eMainMenuState_MultiplayerHostLobby,
 	eMainMenuState_MultiplayerJoin,
 	eMainMenuState_MultiplayerName, /* v13: "What's your username?" */
+	eMainMenuState_MultiplayerBrowser,  /* Internet / LAN server list */
+	eMainMenuState_MultiplayerPassword, /* password prompt for a [pw] row */
 
 	eMainMenuState_LoadGameSpot,
 	eMainMenuState_LoadGameAuto,

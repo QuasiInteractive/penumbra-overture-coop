@@ -28,7 +28,7 @@ player_name=
 # server_name=  — shown in the LAN server browser (spaces OK, 31 chars max).
 #                 Empty / not set = "<player_name>'s game" ("Penumbra Server"
 #                 when there is no player_name either).
-# max_players=  — advertised in discovery pongs AND enforced at connect
+# max_players=  — advertised in discovery pongs / master listing AND enforced at connect
 #                 (2..31, default 4): the (max_players)th player and later
 #                 are refused with "server full".
 # server_name=Penumbra Server
@@ -48,6 +48,19 @@ port=7777
 server_password=
 join_password=
 # join=127.0.0.1:7777
+
+# ---- Internet server browser (README.md 'Public servers') ----
+# master_server=HOST:PORT — a running tools/master_server.py (udp, default port
+#   7779). Hosts register here while hosting; the Internet tab lists from here.
+#   Setting it implies public=1 unless public=0 is given. Empty = LAN only.
+# public=1 — register this host with the master while hosting (the host lobby
+#   has a 'Public' checkbox for the same switch; a value here pins it).
+#   With public=1 and NO master_server=, a placeholder that resolves to
+#   nothing is used, so nothing is ever listed without opting in.
+#   A host with server_password= (above) is listed with a [pw] mark; the
+#   browser asks for the password when such a row is clicked.
+# master_server=
+public=0
 # Host (id 1) appears as malik.dae to others; client (id 2) phillip — more peers rotate.
 ghost_models=malik.dae,phillip.dae
 # Alternative: single mesh — ghost_model=foo.dae

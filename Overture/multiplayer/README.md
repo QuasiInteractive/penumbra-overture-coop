@@ -8,8 +8,9 @@ All dedicated multiplayer source lives in this folder. Work here first; game glu
 |------|------|
 | `NetworkPackets.h` | Packed ENet payloads (player state, bodies, enemies, script/item events, join/leave) + discovery ping/pong, protocol magic/version (`kNetProtocolVersion`), `kNetSendPeriodSeconds`, `kNetDiscoveryPort`. |
 | `NetworkManager.h` / `.cpp` | Listen-server host, client join, 30 Hz state relay, LAN/Hamachi discovery (raw UDP broadcast), `multiplayer.cfg` (read + the `player_name` writer), F9/F10/F11, per-frame ghost updates, the ghost preview mode, player names + the party event feed (v13). |
-| `NetworkPackets.h` | Packed ENet payloads (player state, bodies, enemies, script/item events, join/leave, v14 MapReady + WorldSnapshot sections, v15 Challenge/Auth + `NetAuthDigest`) + discovery ping/pong, protocol magic/version (`kNetProtocolVersion`), `kNetSendPeriodSeconds`, `kNetDiscoveryPort`, disconnect reasons. |
-| `NetworkManager.h` / `.cpp` | Listen-server host, client join, 30 Hz state relay, LAN/Hamachi discovery (raw UDP broadcast), `multiplayer.cfg`, F9/F10/F11, per-frame ghost updates, the ghost preview mode; v15 join authentication, role gating (`IsAllowedFrom`), payload validation, strikes, rate limits (see Security). |
+| `NetworkPackets.h` | Packed ENet payloads (player state, bodies, enemies, script/item events, join/leave, v14 MapReady + WorldSnapshot sections, v15 Challenge/Auth + `NetAuthDigest`) + discovery ping/pong, protocol magic/version (`kNetProtocolVersion`), `kNetSendPeriodSeconds`, `kNetDiscoveryPort`, disconnect reasons; master-server protocol (`cNetMaster*`, magic `PNMS`). |
+| `NetworkManager.h` / `.cpp` | Listen-server host, client join, 30 Hz state relay, LAN/Hamachi discovery (raw UDP broadcast), master-server register/list (internet browser), `multiplayer.cfg`, F9/F10/F11, per-frame ghost updates, the ghost preview mode; v15 join authentication, role gating (`IsAllowedFrom`), payload validation, strikes, rate limits (see Security). |
+| `tools/master_server.py` | Reference master server (Python 3, stdlib only) for the Internet tab — see 'Public servers'. |
 | `BodySync.h` / `.cpp` | Shared physics: host-authoritative body replication. Name-hash identity, map-load census (host/guest verify), host state batches, guest apply. |
 | `GhostPlayer.h` / `.cpp` | Remote peer visuals (skinned mesh + marker light + flashlight). Interpolation buffer on the sender's clock, clip selection from the wire velocity/flags, weight-preserving crossfades, gait-scaled playback. Not a real `cPlayer`. |
 | `multiplayer.cfg.example` | Copy next to `overture.exe` as `multiplayer.cfg`. |
@@ -311,8 +312,8 @@ one attempt per connection are the only throttle.
 - **F11** — toggle host on default port (7777).
 - **F10** — join `127.0.0.1:<port>`.
 - **F9** — LAN/Hamachi discovery scan (~1.5s window; results logged, feed the server browser).
-- **Menu** — Multiplayer → Host / Join / Change name (asks for a username the first time).
-- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=` (enforced at CONNECT since v15), `server_password=` / `join_password=` (v15, see Security), `ghost_models=a.dae,b.dae`, `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`. See `multiplayer.cfg.example`.
+- **Menu** — Multiplayer → Host / Server browser (Internet · LAN) / Direct connect / Change name (asks for a username the first time).
+- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=` (enforced at CONNECT since v15), `server_password=` / `join_password=` (v15, see Security), `ghost_models=a.dae,b.dae`, `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`, `master_server=HOST:PORT`, `public=0|1` (internet browser, see 'Public servers'). See `multiplayer.cfg.example`.
 
 ### Ghost preview (offline animation check)
 
@@ -343,6 +344,60 @@ answer with name / map / players / real game port. Since v15 a host answers
 only pings of its own protocol version (`mbVersionMatch` on the browser
 side is kept for pongs from older hosts) and rate-limits its pongs per
 source address and in total (see Security).
+
+## Public servers (internet server browser)
+
+LAN discovery cannot cross the internet, so the **Internet** tab of the
+server browser asks a tiny *master server* instead. There is no default
+public master: nothing is listed anywhere unless a host opts in with a
+`master_server=` line (the built-in default `master.example.invalid:7779`
+is an RFC 2606 name that resolves to nothing — replace it in
+`NetworkPackets.h` / `kNetMasterDefaultHost` if you run a community master).
+
+**Run a master** — `tools/master_server.py` is one Python 3 file, stdlib
+only. Run it on any VPS, or on your own PC with **udp/7779** forwarded:
+
+```
+python3 master_server.py                       # udp/7779, logs to stdout
+python3 master_server.py --port 7779 -v        # log every beacon / list
+python3 master_server.py --dump --host 1.2.3.4 # print a running master's table
+```
+
+It keeps servers keyed by (source IP, game port), expires them 60 s after
+the last beacon, answers List requests with the live set (newest first, at
+most 100, 10 per datagram), rate-limits List replies to 5/s per source IP,
+and silently drops anything malformed. A systemd unit is in the file's
+docstring. The master never relays game traffic — it only hands out
+addresses.
+
+**Host a public game** — in `multiplayer.cfg`:
+
+```
+master_server=1.2.3.4:7779     # your master (implies public=1)
+public=1                       # or use the 'Public' checkbox in the host lobby
+server_password=secret         # optional; the browser shows [pw]
+```
+
+and **forward your game port** (default **udp/7777**, key `port=`) on your
+router to the PC that hosts. The host lobby shows the port to forward and
+whether the server is currently listed. While hosting the game beacons a
+`Register` every 20 s from the discovery socket (game port, players, max,
+name, map, password flag, protocol version) and sends `Unregister` when you
+stop. The master records the beacon's *source* IP, so the host never needs
+to know its own public address.
+
+**Join** — Multiplayer → Server browser → Internet → Refresh. Rows show
+name, map, players/max, `[pw]` for password servers and how many seconds ago
+the host last beaconed; rows from another mod version are greyed out.
+Clicking a `[pw]` row asks for the password first (that sets the join
+password for that attempt; `join_password=` in the cfg covers Direct
+connect). **Direct connect** (type `ip:port`) still works exactly as before
+for friends who share an address over chat, Hamachi or Radmin.
+
+**Wire format** — `NetworkPackets.h` 'MASTER SERVER protocol' (magic
+`PNMS`, version 1, little-endian, IPv4 as 4 raw bytes). It is separate from
+the game protocol: `kNetProtocolVersion` is *carried* in the packets, never
+changed by them. `master_server.py` is the reference implementation.
 
 ## Explicit non-goals
 

@@ -228,6 +228,18 @@ void cNetworkManager::DestroyPreviewGhost(bool abOrphan)
 }
 
 //======================================================================
+// Both builds: master-server address (no sockets involved).
+
+hpl::tString cNetworkManager::GetMasterServer() const
+{
+	if (!msMasterServer.empty())
+		return msMasterServer;
+	if (mbPublic)
+		return kNetMasterDefaultHost;
+	return "";
+}
+
+//======================================================================
 
 #ifndef PENUMBRA_MULTIPLAYER
 
@@ -284,6 +296,15 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mfDiscoveryTimeLeft(0)
 	  , msServerName("") /* v13: empty = "<player_name>'s game" in the pong */
 	  , mlMaxPlayers(4)
+	  , msMasterServer("")
+	  , mbPublic(false)
+	  , mbPublicExplicit(false)
+	  , mvInternet()
+	  , mbInternetActive(false)
+	  , mfInternetTimeLeft(0)
+	  , msInternetFailReason("")
+	  , mfMasterRegisterAccum(0)
+	  , mbMasterRegistered(false)
 	  , mpBodySync(new cBodySync())
 	  , mbCoopRespawn(true) /* v12: multiplayer.cfg coop_respawn */
 	  , msPlayerName()      /* v13: multiplayer.cfg player_name */
@@ -341,6 +362,21 @@ void cNetworkManager::StartDiscovery()
 
 void cNetworkManager::StopDiscovery()
 {
+}
+
+void cNetworkManager::RefreshInternetServers()
+{
+	msInternetFailReason = "rebuild with PENUMBRA_MULTIPLAYER";
+	Log(" Multiplayer: rebuild with PENUMBRA_MULTIPLAYER + vcpkg enet.\n");
+}
+
+void cNetworkManager::StopInternetRefresh()
+{
+}
+
+void cNetworkManager::SetPublic(bool abPublic)
+{
+	mbPublic = abPublic;
 }
 
 void cNetworkManager::Disconnect()
@@ -467,6 +503,14 @@ struct cNetworkManager::Impl
 	SOCKET mDiscoveryBrowseSock;
 	bool mbBrowseHoldsNetRef; /* StartDiscovery can run with no ENet host alive */
 
+	/* Master server address (internet browser). Resolved ONCE per distinct
+	   cfg string by ResolveMasterAddress — blocking DNS belongs in a button
+	   click / HostGame, never in Update. */
+	sockaddr_in mMasterAddr;
+	bool mbMasterResolved;
+	hpl::tString msMasterResolvedFor; /* the host:port mMasterAddr stands for */
+	bool mbMasterWarned;              /* log the "cannot resolve" line once */
+
 	/* Rung 3, guest side: pending forwarded intent, flushed at the send tick.
 	   Begin/End go out immediately (reliable); these are the streams. */
 	uint32_t mlHeldHash;   /* forwarded grab in progress (0 = none) */
@@ -528,6 +572,9 @@ struct cNetworkManager::Impl
 		  , mDiscoveryListenSock(INVALID_SOCKET)
 		  , mDiscoveryBrowseSock(INVALID_SOCKET)
 		  , mbBrowseHoldsNetRef(false)
+		  , mbMasterResolved(false)
+		  , msMasterResolvedFor("")
+		  , mbMasterWarned(false)
 		  , mlHeldHash(0)
 		  , mvGrabTarget(0, 0, 0)
 		  , mbHaveGrabTarget(false)
@@ -542,6 +589,7 @@ struct cNetworkManager::Impl
 		  , mlPongGlobalCount(0)
 	{
 		memset(mPong, 0, sizeof(mPong));
+		memset(&mMasterAddr, 0, sizeof(mMasterAddr));
 	}
 
 	void ResetIntent()
@@ -828,6 +876,15 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mfDiscoveryTimeLeft(0)
 	  , msServerName("") /* v13: empty = "<player_name>'s game" in the pong */
 	  , mlMaxPlayers(4)
+	  , msMasterServer("")
+	  , mbPublic(false)
+	  , mbPublicExplicit(false)
+	  , mvInternet()
+	  , mbInternetActive(false)
+	  , mfInternetTimeLeft(0)
+	  , msInternetFailReason("")
+	  , mfMasterRegisterAccum(0)
+	  , mbMasterRegistered(false)
 	  , mpBodySync(new cBodySync())
 	  , mbCoopRespawn(true) /* v12: multiplayer.cfg coop_respawn */
 	  , msPlayerName()      /* v13: multiplayer.cfg player_name */
@@ -897,6 +954,11 @@ void cNetworkManager::RegisterInputActions()
    ghost_body_y=-1.65
    Optional single mesh replaces the list:
    ghost_model=mine_barrel.dae
+   Internet server browser (README 'Public servers'):
+   master_server=1.2.3.4:7779    (host:port of a master_server.py; implies public=1)
+   public=0                      (1 = register with the master while hosting)
+   server_password=secret        (guests must know it; listed with [pw])
+   join_password=secret          (presented on join; the browser prompts too)
 
    Peer PlayerID picks mesh as index (id-1) modulo list length — id 1 => first .dae, id 2 => second.
 */
@@ -1038,6 +1100,19 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 				mp = 31;
 			mlMaxPlayers = (uint8_t)mp;
 		}
+		/* Internet server browser (master server) — README 'Public servers'. */
+		else if (strcmp(key, "master_server") == 0)
+		{
+			msMasterServer = val;
+			if (!mbPublicExplicit)
+				mbPublic = true; /* naming a master is opting in, unless public=0 says otherwise */
+		}
+		else if (strcmp(key, "public") == 0)
+		{
+			mbPublic = atoi(val) != 0;
+			mbPublicExplicit = true;
+		}
+		/* server_password= / join_password= are raw-line keys handled above (v15) */
 	}
 	fclose(fp);
 
@@ -2134,6 +2209,14 @@ void cNetworkManager::HostGame(uint16_t alPort)
 	Log(" multiplayer: HOST udp/%u\n", (unsigned)alPort);
 
 	OpenHostDiscovery();
+
+	/* Internet listing: resolve the master NOW (blocking DNS is acceptable
+	   here — a button click or the cfg auto-host, never a frame) and beacon
+	   at once; Update repeats every kNetMasterRegisterSeconds. */
+	mbMasterRegistered = false;
+	mfMasterRegisterAccum = 0;
+	if (mbPublic && ResolveMasterAddress())
+		SendMasterRegister();
 }
 
 hpl::tString cNetworkManager::GetClipboardTextAscii()
@@ -2754,8 +2837,11 @@ void cNetworkManager::JoinGame(const char *aszHostPort)
 void cNetworkManager::Disconnect()
 {
 	ClearGhostsInternal();
+	if (mbHosting)
+		SendMasterUnregister(); /* before the discovery socket goes away */
 	CloseHostDiscovery();
 	StopDiscovery(); /* keeps results; frees the browse socket + its net ref */
+	StopInternetRefresh();
 
 	if (mpImpl && mpImpl->mpHost)
 	{
@@ -2926,6 +3012,19 @@ void cNetworkManager::Update(float afTimeStep)
 	}
 
 	PollDiscovery(afTimeStep);
+
+	/* Public host: keep the master's entry alive (it expires after
+	   kNetMasterExpirySeconds). No DNS here — the address was resolved in
+	   HostGame / SetPublic; an unresolved master simply never beacons. */
+	if (mbHosting && mbPublic)
+	{
+		mfMasterRegisterAccum += afTimeStep;
+		if (mfMasterRegisterAccum >= kNetMasterRegisterSeconds)
+		{
+			mfMasterRegisterAccum = 0;
+			SendMasterRegister();
+		}
+	}
 
 	Service(0);
 	const bool ticking = mbHosting || (mbClientConnected && mbHadJoinPacket && !mbHosting);
@@ -3218,25 +3317,27 @@ void cNetworkManager::CloseHostDiscovery()
 		CloseUdpSocket(mpImpl->mDiscoveryListenSock);
 }
 
-void cNetworkManager::StartDiscovery()
+/** The browser-side socket is shared by the LAN scan and the master List so
+    the two can overlap (Internet tab refresh while a LAN scan is running):
+    PollDiscovery tells the replies apart by their type byte. It stays open
+    while EITHER window is active and holds one ENet/WSA ref meanwhile. */
+bool cNetworkManager::OpenBrowseSocket()
 {
 	if (!mpImpl)
-		return;
-
-	/* Refresh semantics: drop the previous scan (socket + results) and re-ping. */
-	StopDiscovery();
-	mvDiscovered.clear();
+		return false;
+	if (mpImpl->mDiscoveryBrowseSock != INVALID_SOCKET)
+		return true;
 
 	if (!NetAcquire()) /* WSAStartup may not be up yet — browsing can start from the menu */
-		return;
+		return false;
 	mpImpl->mbBrowseHoldsNetRef = true;
 
 	SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (s == INVALID_SOCKET)
 	{
 		Log(" multiplayer: discovery browse socket failed (err %d)\n", WSAGetLastError());
-		StopDiscovery();
-		return;
+		CloseBrowseSocketIfIdle();
+		return false;
 	}
 
 	BOOL yes = TRUE;
@@ -3252,12 +3353,40 @@ void cNetworkManager::StartDiscovery()
 	{
 		Log(" multiplayer: discovery browse bind failed (err %d)\n", WSAGetLastError());
 		closesocket(s);
-		StopDiscovery();
-		return;
+		CloseBrowseSocketIfIdle();
+		return false;
 	}
 
 	TameUdpSocket(s);
 	mpImpl->mDiscoveryBrowseSock = s;
+	return true;
+}
+
+void cNetworkManager::CloseBrowseSocketIfIdle()
+{
+	if (!mpImpl)
+		return;
+	if (mbDiscoveryActive || mbInternetActive)
+		return; /* the other window still needs it */
+	CloseUdpSocket(mpImpl->mDiscoveryBrowseSock);
+	if (mpImpl->mbBrowseHoldsNetRef)
+	{
+		mpImpl->mbBrowseHoldsNetRef = false;
+		NetRelease();
+	}
+}
+
+void cNetworkManager::StartDiscovery()
+{
+	if (!mpImpl)
+		return;
+
+	/* Refresh semantics: drop the previous scan's results and re-ping. */
+	StopDiscovery();
+	mvDiscovered.clear();
+
+	if (!OpenBrowseSocket())
+		return;
 	mbDiscoveryActive = true;
 	mfDiscoveryTimeLeft = kDiscoveryWindowSeconds;
 
@@ -3268,13 +3397,279 @@ void cNetworkManager::StopDiscovery()
 {
 	mbDiscoveryActive = false;
 	mfDiscoveryTimeLeft = 0;
+	CloseBrowseSocketIfIdle();
+}
+
+//-----------------------------------------------------------------------
+// Internet browser: master server List / Entries + host Register beacons.
+// Wire structs: NetworkPackets.h 'MASTER SERVER protocol'.
+//-----------------------------------------------------------------------
+
+/** Turns cfg `master_server=host:port` into mpImpl->mMasterAddr. Blocking
+    (DNS) — callers are HostGame, SetPublic and RefreshInternetServers, all
+    user actions; the result is cached until the cfg string changes.
+    Resolution goes through enet_address_set_host (the same resolver the
+    direct-IP join uses; ENet needs to be initialised, which every caller
+    guarantees). ENetAddress::host is already in network byte order. */
+bool cNetworkManager::ResolveMasterAddress()
+{
+	if (!mpImpl)
+		return false;
+
+	const hpl::tString sMaster = GetMasterServer();
+	if (sMaster.empty())
+	{
+		mpImpl->mbMasterResolved = false;
+		mpImpl->msMasterResolvedFor = "";
+		return false;
+	}
+	if (mpImpl->mbMasterResolved && mpImpl->msMasterResolvedFor == sMaster)
+		return true;
+
+	mpImpl->mbMasterResolved = false;
+	mpImpl->msMasterResolvedFor = sMaster;
+
+	/* "host" alone means kNetMasterDefaultPort; "host:port" must carry a
+	   real port (SplitHostPort would silently fall back to the GAME port). */
+	char hbuf[260];
+	uint16_t port = kNetMasterDefaultPort;
+	const char *pColon = strrchr(sMaster.c_str(), ':');
+	if (pColon)
+	{
+		const int pv = atoi(pColon + 1);
+		if (pv <= 0 || pv > 65535)
+		{
+			Log(" multiplayer: bad master_server '%s' (want host:port)\n", sMaster.c_str());
+			return false;
+		}
+		port = (uint16_t)pv;
+	}
+	if (!SplitHostPort(sMaster.c_str(), hbuf, sizeof(hbuf), port))
+	{
+		Log(" multiplayer: bad master_server '%s' (want host:port)\n", sMaster.c_str());
+		return false;
+	}
+
+	ENetAddress ea;
+	memset(&ea, 0, sizeof(ea));
+	if (enet_address_set_host(&ea, hbuf) != 0 || ea.host == 0)
+	{
+		if (!mpImpl->mbMasterWarned)
+		{
+			mpImpl->mbMasterWarned = true;
+			Log(" multiplayer: master server '%s' does not resolve — set master_server=host:port in multiplayer.cfg (README 'Public servers')\n",
+				sMaster.c_str());
+		}
+		return false;
+	}
+
+	memset(&mpImpl->mMasterAddr, 0, sizeof(mpImpl->mMasterAddr));
+	mpImpl->mMasterAddr.sin_family = AF_INET;
+	mpImpl->mMasterAddr.sin_addr.s_addr = ea.host; /* network order, as ENet keeps it */
+	mpImpl->mMasterAddr.sin_port = htons(port);
+	mpImpl->mbMasterResolved = true;
+	mpImpl->mbMasterWarned = false;
+
+	char where[64];
+	FormatAddrPort(mpImpl->mMasterAddr, port, where, sizeof(where));
+	Log(" multiplayer: master server '%s' -> %s\n", sMaster.c_str(), where);
+	return true;
+}
+
+/** Host -> master beacon, from the host discovery socket (the one bound to
+    kNetDiscoveryPort; if that bind failed there is nothing to send from and
+    the server is simply not listed — same as not LAN-discoverable). */
+void cNetworkManager::SendMasterRegister()
+{
+	if (!mpImpl || !mbHosting || !mbPublic || !mpImpl->mbMasterResolved)
+		return;
+	if (mpImpl->mDiscoveryListenSock == INVALID_SOCKET)
+		return;
+
+	cNetMasterRegister reg;
+	memset(&reg, 0, sizeof(reg));
+	reg.mType = eNetMasterPacketType_Register;
+	reg.mlMagic = kNetMasterMagic;
+	reg.mlMasterVer = kNetMasterProtocolVersion;
+	reg.mlGamePort = mlListenPort;
+	reg.mlPlayerCount = (uint8_t)(m_mapGhosts.size() + 1); /* guests + me */
+	reg.mlMaxPlayers = mlMaxPlayers;
+	reg.mFlags = HasServerPassword() ? kNetMasterFlag_Password : 0; /* v15 auth: the real setting */
+	reg.mlProtocolVer = kNetProtocolVersion;
+	{
+		/* same advertised name as the LAN pong: server_name, else "<player_name>'s game" */
+		hpl::tString sAdvertised = msServerName;
+		if (sAdvertised.empty())
+			sAdvertised = msPlayerName.empty() ? hpl::tString("Penumbra Server") : msPlayerName + "'s game";
+		CopyPacketString(reg.msServerName, sizeof(reg.msServerName), sAdvertised.c_str());
+	}
+	const char *mapName = "";
+	if (mpInit && mpInit->mpMapHandler)
+		mapName = mpInit->mpMapHandler->GetCurrentMapName().c_str();
+	CopyPacketString(reg.msMapName, sizeof(reg.msMapName), mapName);
+
+	if (sendto(mpImpl->mDiscoveryListenSock, (const char *)&reg, sizeof(reg), 0,
+			   (const sockaddr *)&mpImpl->mMasterAddr, sizeof(mpImpl->mMasterAddr)) == SOCKET_ERROR)
+	{
+		Log(" multiplayer: master register FAILED (err %d)\n", WSAGetLastError());
+		return;
+	}
+	if (!mbMasterRegistered) /* fire-and-forget: the master never acks a beacon */
+		Log(" multiplayer: master register beacon -> %s as '%s' game port %u (forward udp/%u on your router)\n",
+			GetMasterServer().c_str(), reg.msServerName, (unsigned)reg.mlGamePort, (unsigned)reg.mlGamePort);
+	mbMasterRegistered = true;
+}
+
+void cNetworkManager::SendMasterUnregister()
+{
+	if (!mpImpl || !mbMasterRegistered || !mpImpl->mbMasterResolved)
+		return;
+	mbMasterRegistered = false;
+	if (mpImpl->mDiscoveryListenSock == INVALID_SOCKET)
+		return;
+
+	cNetMasterUnregister un;
+	memset(&un, 0, sizeof(un));
+	un.mType = eNetMasterPacketType_Unregister;
+	un.mlMagic = kNetMasterMagic;
+	un.mlMasterVer = kNetMasterProtocolVersion;
+	un.mlGamePort = mlListenPort;
+	sendto(mpImpl->mDiscoveryListenSock, (const char *)&un, sizeof(un), 0,
+		   (const sockaddr *)&mpImpl->mMasterAddr, sizeof(mpImpl->mMasterAddr));
+	Log(" multiplayer: unregistered from the master\n");
+}
+
+void cNetworkManager::SetPublic(bool abPublic)
+{
+	if (mbPublic == abPublic)
+		return;
+	mbPublic = abPublic;
+	if (!mbHosting)
+		return;
+	if (mbPublic)
+	{
+		mfMasterRegisterAccum = 0;
+		if (ResolveMasterAddress()) /* button click: blocking DNS is fine */
+			SendMasterRegister();
+	}
+	else
+		SendMasterUnregister();
+}
+
+void cNetworkManager::RefreshInternetServers()
+{
 	if (!mpImpl)
 		return;
-	CloseUdpSocket(mpImpl->mDiscoveryBrowseSock);
-	if (mpImpl->mbBrowseHoldsNetRef)
+
+	StopInternetRefresh();
+	mvInternet.clear();
+	msInternetFailReason = "";
+
+	if (GetMasterServer().empty())
 	{
-		mpImpl->mbBrowseHoldsNetRef = false;
-		NetRelease();
+		msInternetFailReason = "No master server configured (multiplayer.cfg master_server=host:port)";
+		Log(" multiplayer: internet refresh — %s\n", msInternetFailReason.c_str());
+		return;
+	}
+	if (!OpenBrowseSocket())
+	{
+		msInternetFailReason = "Could not open a UDP socket";
+		return;
+	}
+	if (!ResolveMasterAddress()) /* enet is up now (OpenBrowseSocket acquired it) */
+	{
+		msInternetFailReason = "Master server '" + GetMasterServer() + "' does not resolve";
+		CloseBrowseSocketIfIdle();
+		return;
+	}
+
+	cNetMasterList req;
+	memset(&req, 0, sizeof(req));
+	req.mType = eNetMasterPacketType_List;
+	req.mlMagic = kNetMasterMagic;
+	req.mlMasterVer = kNetMasterProtocolVersion;
+	req.mlProtocolVer = kNetProtocolVersion;
+	if (sendto(mpImpl->mDiscoveryBrowseSock, (const char *)&req, sizeof(req), 0,
+			   (const sockaddr *)&mpImpl->mMasterAddr, sizeof(mpImpl->mMasterAddr)) == SOCKET_ERROR)
+	{
+		msInternetFailReason = "Sending to the master failed";
+		Log(" multiplayer: master list request FAILED (err %d)\n", WSAGetLastError());
+		CloseBrowseSocketIfIdle();
+		return;
+	}
+
+	mbInternetActive = true;
+	mfInternetTimeLeft = kNetMasterListWindowSeconds;
+	Log(" multiplayer: master list request -> %s\n", GetMasterServer().c_str());
+}
+
+void cNetworkManager::StopInternetRefresh()
+{
+	mbInternetActive = false;
+	mfInternetTimeLeft = 0;
+	CloseBrowseSocketIfIdle();
+}
+
+/** One Entries datagram from the master (source already verified). Every
+    bound is checked against alLen, never against the header's count alone. */
+void cNetworkManager::HandleMasterEntries(const char *apBuf, int alLen)
+{
+	if (!apBuf || alLen < (int)sizeof(cNetMasterEntries))
+		return;
+	cNetMasterEntries hdr;
+	memcpy(&hdr, apBuf, sizeof(hdr));
+	if (hdr.mType != eNetMasterPacketType_Entries || hdr.mlMagic != kNetMasterMagic ||
+		hdr.mlMasterVer != kNetMasterProtocolVersion)
+		return;
+
+	size_t count = hdr.mCount;
+	const size_t avail = ((size_t)alLen - sizeof(hdr)) / sizeof(cNetMasterEntry);
+	if (count > avail)
+		count = avail; /* truncated datagram: take what really arrived */
+	if (count > kNetMasterMaxEntriesPerDatagram)
+		count = kNetMasterMaxEntriesPerDatagram;
+
+	for (size_t i = 0; i < count; ++i)
+	{
+		cNetMasterEntry e;
+		memcpy(&e, apBuf + sizeof(hdr) + i * sizeof(e), sizeof(e));
+		e.msServerName[sizeof(e.msServerName) - 1] = '\0';
+		e.msMapName[sizeof(e.msMapName) - 1] = '\0';
+
+		char addr[64];
+		_snprintf(addr, sizeof(addr), "%u.%u.%u.%u:%u",
+				  (unsigned)e.mIp4[0], (unsigned)e.mIp4[1], (unsigned)e.mIp4[2], (unsigned)e.mIp4[3],
+				  (unsigned)e.mlGamePort);
+		addr[sizeof(addr) - 1] = '\0';
+
+		bool known = false;
+		for (size_t k = 0; k < mvInternet.size(); ++k)
+			if (mvInternet[k].msAddress == addr)
+			{
+				known = true;
+				break;
+			}
+		if (known || mvInternet.size() >= 100)
+			continue;
+
+		cDiscoveredServer sv;
+		sv.msAddress = addr;
+		sv.msName = e.msServerName;
+		sv.msMap = e.msMapName;
+		sv.mlPlayerCount = e.mlPlayerCount;
+		sv.mlMaxPlayers = e.mlMaxPlayers;
+		sv.mbVersionMatch = (e.mlProtocolVer == kNetProtocolVersion);
+		sv.mbPassword = (e.mFlags & kNetMasterFlag_Password) != 0;
+		sv.mlAgeSeconds = e.mlAgeSeconds;
+		sv.mbInternet = true;
+		mvInternet.push_back(sv);
+
+		Log(" multiplayer: internet server '%s' map='%s' %u/%u at %s age %us%s%s\n",
+			sv.msName.c_str(), sv.msMap.c_str(),
+			(unsigned)sv.mlPlayerCount, (unsigned)sv.mlMaxPlayers,
+			sv.msAddress.c_str(), (unsigned)sv.mlAgeSeconds,
+			sv.mbPassword ? " [pw]" : "",
+			sv.mbVersionMatch ? "" : " [VERSION MISMATCH]");
 	}
 }
 
@@ -3431,13 +3826,13 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 		}
 	}
 
-	/* --- Browser: collect pongs until the window closes ------------------- */
-	if (!mbDiscoveryActive || mpImpl->mDiscoveryBrowseSock == INVALID_SOCKET)
+	/* --- Browser: collect pongs / master entries until the windows close -- */
+	if (!(mbDiscoveryActive || mbInternetActive) || mpImpl->mDiscoveryBrowseSock == INVALID_SOCKET)
 		return;
 
 	for (;;)
 	{
-		char buf[128];
+		char buf[1024]; /* a full master Entries datagram is 778 bytes */
 		sockaddr_in from;
 		int fromLen = sizeof(from);
 		int n = recvfrom(mpImpl->mDiscoveryBrowseSock, buf, sizeof(buf), 0,
@@ -3449,6 +3844,20 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 				continue;
 			break;
 		}
+		if (n < 1)
+			continue;
+
+		/* Master reply? Only from the address we asked — anything else on
+		   this socket claiming to be the master is dropped unread. */
+		if ((uint8_t)buf[0] == eNetMasterPacketType_Entries)
+		{
+			if (mbInternetActive && mpImpl->mbMasterResolved &&
+				from.sin_addr.s_addr == mpImpl->mMasterAddr.sin_addr.s_addr &&
+				from.sin_port == mpImpl->mMasterAddr.sin_port)
+				HandleMasterEntries(buf, n);
+			continue;
+		}
+
 		if (n != (int)sizeof(cNetDiscoveryPong))
 			continue;
 		cNetDiscoveryPong pong;
@@ -3480,6 +3889,9 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 		sv.mlPlayerCount = pong.mlPlayerCount;
 		sv.mlMaxPlayers = pong.mlMaxPlayers;
 		sv.mbVersionMatch = (pong.mlProtocolVer == kNetProtocolVersion);
+		sv.mbPassword = false; /* LAN pongs predate the flag; the host refuses a wrong password anyway */
+		sv.mlAgeSeconds = 0;
+		sv.mbInternet = false;
 		mvDiscovered.push_back(sv);
 
 		Log(" multiplayer: discovered '%s' map='%s' %u/%u at %s%s\n",
@@ -3488,11 +3900,23 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 			sv.msAddress.c_str(), sv.mbVersionMatch ? "" : " [VERSION MISMATCH]");
 	}
 
-	mfDiscoveryTimeLeft -= afTimeStep;
-	if (mfDiscoveryTimeLeft <= 0)
+	if (mbDiscoveryActive)
 	{
-		Log(" multiplayer: discovery done — %u server(s)\n", (unsigned)mvDiscovered.size());
-		StopDiscovery();
+		mfDiscoveryTimeLeft -= afTimeStep;
+		if (mfDiscoveryTimeLeft <= 0)
+		{
+			Log(" multiplayer: discovery done — %u server(s)\n", (unsigned)mvDiscovered.size());
+			StopDiscovery();
+		}
+	}
+	if (mbInternetActive)
+	{
+		mfInternetTimeLeft -= afTimeStep;
+		if (mfInternetTimeLeft <= 0)
+		{
+			Log(" multiplayer: internet list done — %u server(s)\n", (unsigned)mvInternet.size());
+			StopInternetRefresh();
+		}
 	}
 }
 

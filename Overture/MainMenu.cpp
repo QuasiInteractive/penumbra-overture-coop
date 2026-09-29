@@ -52,6 +52,8 @@ static eMainMenuState gvMenuBackStates[] = {
 		eMainMenuState_Multiplayer,//eMainMenuState_MultiplayerHostLobby,
 		eMainMenuState_Multiplayer,//eMainMenuState_MultiplayerJoin,
 		eMainMenuState_Multiplayer,//eMainMenuState_MultiplayerName (v13)
+		eMainMenuState_Multiplayer,//eMainMenuState_MultiplayerBrowser,
+		eMainMenuState_MultiplayerBrowser,//eMainMenuState_MultiplayerPassword,
 
 		eMainMenuState_Start,//eMainMenuState_LoadGameSpot,
 		eMainMenuState_Start,//eMainMenuState_LoadGameAuto,
@@ -74,6 +76,8 @@ static eMainMenuState gvMenuBackStates[] = {
 
 #ifdef PENUMBRA_MULTIPLAYER
 class cMainMenuWidget_MultiIpLine;
+class cMainMenuWidget_MultiServerRow;
+class cMainMenuWidget_MultiPublicToggle;
 
 namespace {
 
@@ -88,6 +92,20 @@ static bool gMulJoinAwaitHandshake = false;
 static cMainMenuWidget_MultiIpLine *gpMulTypedName = NULL;
 static cMainMenuWidget_Text *gpMulNameFoot = NULL;
 static cMainMenuWidget_Text *gpMulNameShown = NULL;
+/* Server browser screen: Internet tab = master server list, LAN tab = the
+   broadcast scan. Rows are fixed slots refreshed from the network manager's
+   result vectors every frame (cheap: string compares). */
+static const int kMulBrowserRows = 8;
+static std::vector<cMainMenuWidget_MultiServerRow *> gvMulRows;
+static cMainMenuWidget_Text *gpMulBrowserFoot = NULL;
+static bool gMulBrowserInternet = true;
+/* Password prompt: the [pw] row that was clicked, joined once typed. */
+static cMainMenuWidget_MultiIpLine *gpMulTypedPw = NULL;
+static cMainMenuWidget_Text *gpMulPwTitle = NULL;
+static cDiscoveredServer gMulPendingServer;
+/* Host lobby: 'Public (list on master)' toggle + the port-forward note. */
+static cMainMenuWidget_MultiPublicToggle *gpMulPublicToggle = NULL;
+static cMainMenuWidget_Text *gpMulHostPublicNote = NULL;
 
 static tString MulTrimAscii(const tString &s)
 {
@@ -152,6 +170,16 @@ public:
 	bool IsTypingFocused() const { return mbTypingFocus; }
 
 	const tString &GetAscii() const { return msAscii; }
+	void SetAscii(const tString &asAscii)
+	{
+		msAscii = asAscii;
+		mbSelectAll = false;
+		FlushToWide();
+	}
+
+	/** Password prompt reuse: any printable ASCII is accepted (not just
+	    address characters) and the field draws asterisks. */
+	void SetPasswordMode(bool abX) { mbPasswordMode = abX; }
 
 	/** v13: Enter was pressed while focused since the last call (one-shot). */
 	bool TakeEnter()
@@ -182,6 +210,7 @@ private:
 	bool mbSelectAll;
 	bool mbNameMode;     /**< v13: username instead of an address */
 	bool mbEnterPressed; /**< v13: see TakeEnter */
+	bool mbPasswordMode; /**< server-browser password prompt: any printable ASCII, drawn as asterisks */
 
 	void FlushToWide();
 
@@ -189,7 +218,7 @@ private:
 
 	bool CharOk(char c) const
 	{
-		if (mbNameMode)
+		if (mbNameMode || mbPasswordMode)
 			return c >= 32 && c < 127; /* printable ASCII, spaces included */
 		if (std::isalnum((unsigned char)c))
 			return true;
@@ -292,7 +321,7 @@ cMainMenuWidget_MultiIpLine::cMainMenuWidget_MultiIpLine(cInit *apInit, const cV
 														 cVector2f avFontSize, eFontAlign aAlignment,
 														 bool abNameMode)
 	: cMainMenuWidget_Text(apInit, avPos, _W(""), avFontSize, aAlignment), mbTypingFocus(false), mbSelectAll(false)
-	, mbNameMode(abNameMode), mbEnterPressed(false)
+	, mbNameMode(abNameMode), mbEnterPressed(false), mbPasswordMode(false)
 {
 	msAscii = asciiSeed;
 	FlushToWide();
@@ -301,7 +330,9 @@ cMainMenuWidget_MultiIpLine::cMainMenuWidget_MultiIpLine(cInit *apInit, const cV
 
 void cMainMenuWidget_MultiIpLine::FlushToWide()
 {
-	if (msAscii.empty())
+	if (mbPasswordMode)
+		msText = tWString(msAscii.size(), L'*');
+	else if (msAscii.empty())
 		msText = mbNameMode ? _W("(type name)") : _W("(type host)");
 	else
 		msText = cString::To16Char(msAscii);
@@ -317,7 +348,10 @@ void cMainMenuWidget_MultiIpLine::OnDraw()
 
 	tWString sShow = _W("[ ");
 	if (msAscii.empty())
-		sShow += mbNameMode ? _W("type your name here") : _W("type address here");
+		sShow += mbNameMode ? _W("type your name here") :
+				 mbPasswordMode ? _W("type password") : _W("type address here");
+	else if (mbPasswordMode)
+		sShow += tWString(msAscii.size(), L'*');
 	else
 		sShow += cString::To16Char(msAscii);
 	if (mbTypingFocus && ((sBlink / 25) % 2) == 0)
@@ -563,6 +597,275 @@ void cMainMenuWidget_MultiLaunchPlaying::OnMouseDown(eMButton aButton)
 	mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
 	(void)aButton;
 }
+
+//-----------------------------------------------------------------------
+// Server browser (Internet = master server list, LAN = broadcast scan),
+// password prompt, host lobby 'Public' toggle.
+//-----------------------------------------------------------------------
+
+namespace {
+
+/* A click on a row that cannot be joined explains itself on the foot line
+   for a few seconds; the status text takes over again afterwards. */
+static tString gMulBrowserNotice;
+static float gMulBrowserNoticeLeft = 0;
+
+static void MulBrowserNotice(const tString &asText)
+{
+	gMulBrowserNotice = asText;
+	gMulBrowserNoticeLeft = 4.0f;
+}
+
+/** Ask the network manager for the list the current tab shows. */
+static void MulRefreshBrowser(cInit *apInit)
+{
+	if (!apInit || !apInit->mpNetworkManager)
+		return;
+	if (gMulBrowserInternet)
+		apInit->mpNetworkManager->RefreshInternetServers();
+	else
+		apInit->mpNetworkManager->StartDiscovery();
+}
+
+/** Join a browser row through the SAME path as the direct-connect screen,
+    then show that screen so its handshake status line does the talking.
+    abSetPassword=false leaves whatever SetJoinPassword / cfg join_password=
+    holds untouched (a LAN pong cannot tell us the host wants one). */
+static void MulJoinServer(cInit *apInit, const cDiscoveredServer &aServer,
+						  bool abSetPassword, const tString &asPassword)
+{
+	if (!apInit || !apInit->mpNetworkManager || !apInit->mpMainMenu || aServer.msAddress.empty())
+		return;
+	cNetworkManager *nm = apInit->mpNetworkManager;
+	if (abSetPassword)
+		nm->SetJoinPassword(asPassword);
+	apInit->mpConfig->SetString("Multiplayer", "LastJoinHost", aServer.msAddress);
+	if (gpMulTypedIp)
+		gpMulTypedIp->SetAscii(aServer.msAddress);
+	nm->JoinGame(aServer.msAddress.c_str());
+	gMulJoinAwaitHandshake = true;
+	if (gpMulJoinFoot)
+	{
+		gpMulJoinFoot->msText = _W("Connecting... (waiting for handshake)");
+		gpMulJoinFoot->UpdateSize();
+	}
+	apInit->mpMainMenu->SetState(eMainMenuState_MultiplayerJoin);
+	apInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+}
+
+}
+
+/** 'Internet' / 'LAN' tab: selects the list and refreshes it. */
+class cMainMenuWidget_MultiBrowserTab : public cMainMenuWidget_Button
+{
+public:
+	cMainMenuWidget_MultiBrowserTab(cInit *apInit, const cVector3f &avPos, const tWString &lbl,
+									bool abInternet)
+		: cMainMenuWidget_Button(apInit, avPos, lbl, eMainMenuState_LastEnum, 20, eFontAlign_Center)
+		, mbInternet(abInternet)
+	{
+	}
+
+	virtual void OnMouseDown(eMButton aButton)
+	{
+		(void)aButton;
+		gMulBrowserInternet = mbInternet;
+		gMulBrowserNoticeLeft = 0;
+		MulRefreshBrowser(mpInit);
+		mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+	}
+
+	virtual void OnDraw()
+	{
+		cMainMenuWidget_Button::OnDraw();
+		if (gMulBrowserInternet == mbInternet) /* the selected tab reads bright */
+			mpFont->Draw(mvPositon, mvFontSize, cColor(1.0f, 1), mAlignment, msText.c_str());
+	}
+
+private:
+	bool mbInternet;
+};
+
+class cMainMenuWidget_MultiBrowserRefresh : public cMainMenuWidget_Button
+{
+public:
+	cMainMenuWidget_MultiBrowserRefresh(cInit *apInit, const cVector3f &avPos, const tWString &lbl)
+		: cMainMenuWidget_Button(apInit, avPos, lbl, eMainMenuState_LastEnum, 20, eFontAlign_Center)
+	{
+	}
+
+	virtual void OnMouseDown(eMButton aButton)
+	{
+		(void)aButton;
+		gMulBrowserNoticeLeft = 0;
+		MulRefreshBrowser(mpInit);
+		mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+	}
+};
+
+/** Multiplayer menu -> browser, refreshing on the way so it is never blank. */
+class cMainMenuWidget_MultiOpenBrowser : public cMainMenuWidget_MainButton
+{
+public:
+	cMainMenuWidget_MultiOpenBrowser(cInit *apInit, const cVector3f &avPos, const tWString &lbl)
+		: cMainMenuWidget_MainButton(apInit, avPos, lbl, eMainMenuState_MultiplayerBrowser)
+	{
+	}
+
+	virtual void OnMouseDown(eMButton aButton)
+	{
+		cMainMenuWidget_MainButton::OnMouseDown(aButton);
+		MulRefreshBrowser(mpInit);
+	}
+};
+
+/** One list slot: "name | map | players/max | [pw] | age". Empty slots draw
+    nothing and ignore clicks; version-mismatched servers draw greyed. */
+class cMainMenuWidget_MultiServerRow : public cMainMenuWidget_Button
+{
+public:
+	cMainMenuWidget_MultiServerRow(cInit *apInit, const cVector3f &avPos, int alIndex, float afWidth)
+		: cMainMenuWidget_Button(apInit, avPos, _W(""), eMainMenuState_LastEnum, 13, eFontAlign_Left)
+		, mlIndex(alIndex)
+		, mbHasServer(false)
+		, mServer()
+	{
+		/* Fixed-width hit box: the whole line is clickable, text length aside. */
+		mRect.x = avPos.x;
+		mRect.w = afWidth;
+		mRect.h = mvFontSize.y + 5;
+	}
+
+	/** Mirror slot mlIndex of the list the current tab shows. */
+	void SyncFromList(const std::vector<cDiscoveredServer> &avList)
+	{
+		const bool bHas = mlIndex >= 0 && (size_t)mlIndex < avList.size();
+		if (!bHas)
+		{
+			if (mbHasServer)
+			{
+				mbHasServer = false;
+				msText = _W("");
+			}
+			return;
+		}
+		const cDiscoveredServer &sv = avList[(size_t)mlIndex];
+		tString s = sv.msName.empty() ? tString("(unnamed)") : sv.msName;
+		s += "  |  ";
+		s += sv.msMap.empty() ? tString("-") : sv.msMap;
+		s += "  |  " + cString::ToString((int)sv.mlPlayerCount) + "/" +
+			 cString::ToString((int)sv.mlMaxPlayers);
+		if (sv.mbPassword)
+			s += "  |  [pw]";
+		s += "  |  ";
+		s += sv.mbInternet ? (cString::ToString((int)sv.mlAgeSeconds) + "s ago") : tString("LAN");
+		if (!sv.mbVersionMatch)
+			s += "  |  other version";
+		const tWString ws = cString::To16Char(s);
+		if (!mbHasServer || ws != msText || mServer.msAddress != sv.msAddress)
+		{
+			mbHasServer = true;
+			mServer = sv;
+			msText = ws;
+		}
+	}
+
+	virtual void OnMouseDown(eMButton aButton)
+	{
+		(void)aButton;
+		if (!mbHasServer || !mpInit->mpNetworkManager || !mpInit->mpMainMenu)
+			return;
+		if (!mServer.mbVersionMatch)
+		{
+			MulBrowserNotice("That server runs another version of the mod - both machines need the same zip.");
+			return;
+		}
+		if (mServer.mbPassword)
+		{
+			gMulPendingServer = mServer;
+			if (gpMulPwTitle)
+			{
+				gpMulPwTitle->msText = cString::To16Char(
+					"Password for '" + mServer.msName + "'  (" + mServer.msAddress + ")");
+				gpMulPwTitle->UpdateSize();
+			}
+			if (gpMulTypedPw)
+				gpMulTypedPw->SetAscii("");
+			mpInit->mpMainMenu->SetState(eMainMenuState_MultiplayerPassword);
+			mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+			return;
+		}
+		MulJoinServer(mpInit, mServer, false, "");
+	}
+
+	virtual void OnDraw()
+	{
+		if (!mbHasServer)
+			return;
+		if (!mServer.mbVersionMatch)
+		{
+			mpFont->Draw(mvPositon, mvFontSize, cColor(0.4f, 1), mAlignment, msText.c_str());
+			return;
+		}
+		cMainMenuWidget_Button::OnDraw();
+	}
+
+private:
+	int mlIndex;
+	bool mbHasServer;
+	cDiscoveredServer mServer;
+};
+
+/** Password screen 'Join': stores the typed password, joins the pending row. */
+class cMainMenuWidget_MultiPwJoin : public cMainMenuWidget_Button
+{
+public:
+	cMainMenuWidget_MultiPwJoin(cInit *apInit, const cVector3f &avPos, const tWString &lbl)
+		: cMainMenuWidget_Button(apInit, avPos, lbl, eMainMenuState_LastEnum, 24, eFontAlign_Center)
+	{
+	}
+
+	virtual void OnMouseDown(eMButton aButton)
+	{
+		(void)aButton;
+		if (!gpMulTypedPw)
+			return;
+		MulJoinServer(mpInit, gMulPendingServer, true, gpMulTypedPw->GetAscii());
+	}
+};
+
+/** Host lobby: 'Public (list on master): ON/OFF'. Bound to the cfg `public=`
+    setting (cNetworkManager::SetPublic); the choice is also remembered in
+    the game config unless multiplayer.cfg pins it. */
+class cMainMenuWidget_MultiPublicToggle : public cMainMenuWidget_Button
+{
+public:
+	cMainMenuWidget_MultiPublicToggle(cInit *apInit, const cVector3f &avPos)
+		: cMainMenuWidget_Button(apInit, avPos, _W(""), eMainMenuState_LastEnum, 18, eFontAlign_Center)
+	{
+		RefreshLabel();
+	}
+
+	void RefreshLabel()
+	{
+		const bool bOn = mpInit->mpNetworkManager && mpInit->mpNetworkManager->IsPublic();
+		msText = bOn ? _W("[x] Public (list on master server)") : _W("[ ] Public (list on master server)");
+		mRect.w = mpFont->GetLength(mvFontSize, msText.c_str());
+		mRect.x = mvPositon.x - mRect.w / 2;
+	}
+
+	virtual void OnMouseDown(eMButton aButton)
+	{
+		(void)aButton;
+		cNetworkManager *nm = mpInit->mpNetworkManager;
+		if (!nm)
+			return;
+		nm->SetPublic(!nm->IsPublic()); /* while hosting: registers / unregisters at once */
+		mpInit->mpConfig->SetBool("Multiplayer", "Public", nm->IsPublic());
+		RefreshLabel();
+		mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+	}
+};
 
 #endif /* PENUMBRA_MULTIPLAYER */
 
@@ -2785,6 +3088,15 @@ void cMainMenu::Update(float afTimeStep)
 				if (gpMulTypedName->TakeEnter())
 					MulSaveTypedName(mpInit);
 			}
+			if (gpMulTypedPw != NULL && mState == eMainMenuState_MultiplayerPassword)
+			{
+				/* password prompt: same focus-on-arrival; Enter joins */
+				if (sMulPrevState != eMainMenuState_MultiplayerPassword)
+					gpMulTypedPw->FocusTyping();
+				gpMulTypedPw->PollTyping();
+				if (gpMulTypedPw->TakeEnter())
+					MulJoinServer(mpInit, gMulPendingServer, true, gpMulTypedPw->GetAscii());
+			}
 			sMulPrevState = mState;
 		}
 
@@ -2800,6 +3112,76 @@ void cMainMenu::Update(float afTimeStep)
 			{
 				gpMulNameShown->msText = wl;
 				gpMulNameShown->UpdateSize();
+			}
+		}
+
+		/* Server browser: mirror the current tab's result list into the row
+		   slots and keep the status line honest. */
+		if (mState == eMainMenuState_MultiplayerBrowser && mpInit->mpNetworkManager != NULL)
+		{
+			cNetworkManager *nm = mpInit->mpNetworkManager;
+			const std::vector<cDiscoveredServer> &vList =
+				gMulBrowserInternet ? nm->GetInternetServers() : nm->GetDiscoveredServers();
+			for (size_t r = 0; r < gvMulRows.size(); ++r)
+				if (gvMulRows[r])
+					gvMulRows[r]->SyncFromList(vList);
+
+			if (gpMulBrowserFoot)
+			{
+				tString sFoot;
+				if (gMulBrowserNoticeLeft > 0)
+				{
+					gMulBrowserNoticeLeft -= afTimeStep;
+					sFoot = gMulBrowserNotice;
+				}
+				else if (gMulBrowserInternet)
+				{
+					if (nm->IsInternetRefreshActive())
+						sFoot = "Asking the master server " + nm->GetMasterServer() + " ...";
+					else if (!nm->GetInternetFailReason().empty())
+						sFoot = nm->GetInternetFailReason();
+					else
+						sFoot = cString::ToString((int)vList.size()) + " public server(s) listed by " +
+								nm->GetMasterServer() + " - click one to join.";
+				}
+				else
+				{
+					if (nm->IsDiscoveryActive())
+						sFoot = "Scanning the LAN (and Hamachi/Radmin) ...";
+					else
+						sFoot = cString::ToString((int)vList.size()) +
+								" server(s) found on the LAN - click one to join.";
+				}
+				const tWString wsFoot = cString::To16Char(sFoot);
+				if (gpMulBrowserFoot->msText != wsFoot)
+				{
+					gpMulBrowserFoot->msText = wsFoot;
+					gpMulBrowserFoot->UpdateSize();
+				}
+			}
+		}
+
+		/* Host lobby: what the 'Public' toggle means right now. */
+		if (gpMulHostPublicNote != NULL && mpInit->mpNetworkManager != NULL &&
+			mState == eMainMenuState_MultiplayerHostLobby)
+		{
+			cNetworkManager *nm = mpInit->mpNetworkManager;
+			const tString sPort = cString::ToString((int)nm->GetDefaultPort());
+			const tString sMaster = nm->GetMasterServer();
+			tString sNote;
+			if (nm->IsPublic() && sMaster == kNetMasterDefaultHost)
+				sNote = "public=1 but no master_server= in multiplayer.cfg - nobody can list this server.";
+			else if (nm->IsPublic())
+				sNote = "Listed on " + sMaster + ".  Forward UDP " + sPort +
+						" on your router so internet players can connect.";
+			else
+				sNote = "Not listed. Friends join by IP; forward UDP " + sPort +
+						" on your router for internet friends.";
+			const tWString wsNote = cString::To16Char(sNote);
+			if (gpMulHostPublicNote->msText != wsNote)
+			{
+				gpMulHostPublicNote->msText = wsNote;
+				gpMulHostPublicNote->UpdateSize();
 			}
 		}
 
@@ -3015,6 +3397,12 @@ void cMainMenu::OnMouseDown(eMButton aButton)
 		!cMath::PointBoxCollision(mvMousePos, gpMulTypedName->GetRect()))
 	{
 		gpMulTypedName->BlurTyping();
+	}
+	if (gpMulTypedPw && mState == eMainMenuState_MultiplayerPassword &&
+		gpMulTypedPw->IsTypingFocused() &&
+		!cMath::PointBoxCollision(mvMousePos, gpMulTypedPw->GetRect()))
+	{
+		gpMulTypedPw->BlurTyping();
 	}
 #endif
 
@@ -3399,6 +3787,13 @@ void cMainMenu::CreateWidgets()
 	gpMulTypedName = NULL;
 	gpMulNameFoot = NULL;
 	gpMulNameShown = NULL;
+	gvMulRows.clear();
+	gpMulBrowserFoot = NULL;
+	gpMulTypedPw = NULL;
+	gpMulPwTitle = NULL;
+	gpMulPublicToggle = NULL;
+	gpMulHostPublicNote = NULL;
+	gMulBrowserNoticeLeft = 0;
 #endif
 	STLDeleteAll(mlstWidgets);
 	for(size_t i=0; i< eMainMenuState_LastEnum; ++i) mvState[i].clear();
@@ -3541,20 +3936,25 @@ void cMainMenu::CreateWidgets()
 								 _W("A Quasi Interactive mod  -  quasi-interactive.com"),
 								 13, eFontAlign_Center)));
 
-		vPos.y += 40;
+		/* five buttons + name line + hint + Back must fit above y=600: 38 px pitch */
+		vPos.y += 30;
 		AddWidgetToState(eMainMenuState_Multiplayer,
 						 hplNew(cMainMenuWidget_MultiHostStartListen,
 								(mpInit, vPos, _W("Host / listen"))));
-		vPos.y += 40;
+		vPos.y += 38;
 		AddWidgetToState(
 			eMainMenuState_Multiplayer,
-			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, _W("Join game"), eMainMenuState_MultiplayerJoin)));
-		vPos.y += 40;
+			hplNew(cMainMenuWidget_MultiOpenBrowser,(mpInit, vPos, _W("Server browser"))));
+		vPos.y += 38;
+		AddWidgetToState(
+			eMainMenuState_Multiplayer,
+			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, _W("Direct connect"), eMainMenuState_MultiplayerJoin)));
+		vPos.y += 38;
 		/* v13: username (multiplayer.cfg player_name) — shown to the party */
 		AddWidgetToState(
 			eMainMenuState_Multiplayer,
 			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, _W("Change name"), eMainMenuState_MultiplayerName)));
-		vPos.y += 40;
+		vPos.y += 38;
 		gpMulNameShown = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W(""), 13, eFontAlign_Center));
 		AddWidgetToState(eMainMenuState_Multiplayer, gpMulNameShown); /* text set in Update */
 		vPos.y += 24;
@@ -3610,10 +4010,21 @@ void cMainMenu::CreateWidgets()
 			AddWidgetToState(eMainMenuState_MultiplayerHostLobby,
 							 hplNew(cMainMenuWidget_Text,
 									(mpInit, vPos,
-									 _W("Give a friend the Radmin/Hamachi one; they type it under 'Join game'."),
+									 _W("Give a friend the Radmin/Hamachi one; they type it under 'Direct connect'."),
 									 13, eFontAlign_Center)));
+			vPos.y += 30;
+			/* 'Public' toggle: multiplayer.cfg `public=` pins it; otherwise
+			   the last menu choice is remembered in the game config. */
+			if (!mpInit->mpNetworkManager->IsPublicFromCfg())
+				mpInit->mpNetworkManager->SetPublic(
+					mpInit->mpConfig->GetBool("Multiplayer", "Public", mpInit->mpNetworkManager->IsPublic()));
+			gpMulPublicToggle = hplNew(cMainMenuWidget_MultiPublicToggle,(mpInit, vPos));
+			AddWidgetToState(eMainMenuState_MultiplayerHostLobby, gpMulPublicToggle);
+			vPos.y += 26;
+			gpMulHostPublicNote = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W(""), 13, eFontAlign_Center));
+			AddWidgetToState(eMainMenuState_MultiplayerHostLobby, gpMulHostPublicNote);
 		}
-		vPos.y += 50;
+		vPos.y += 36;
 		AddWidgetToState(
 			eMainMenuState_MultiplayerHostLobby,
 			hplNew(cMainMenuWidget_MultiLaunchPlaying,(mpInit, vPos,
@@ -3700,6 +4111,77 @@ void cMainMenu::CreateWidgets()
 			eMainMenuState_MultiplayerName,
 			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, kTranslate("MainMenu", "Back"),
 												eMainMenuState_Multiplayer)));
+		// Server browser (Internet / LAN)
+		///////////////////////////////////
+		vPos = vTextStart;
+		AddWidgetToState(eMainMenuState_MultiplayerBrowser,
+						 hplNew(cMainMenuWidget_Text,
+								(mpInit, vPos, _W("Server browser"), 24, eFontAlign_Center)));
+		vPos.y += 40;
+		AddWidgetToState(eMainMenuState_MultiplayerBrowser,
+						 hplNew(cMainMenuWidget_MultiBrowserTab,
+								(mpInit, cVector3f(110, vPos.y, 40), _W("Internet"), true)));
+		AddWidgetToState(eMainMenuState_MultiplayerBrowser,
+						 hplNew(cMainMenuWidget_MultiBrowserTab,
+								(mpInit, cVector3f(225, vPos.y, 40), _W("LAN"), false)));
+		AddWidgetToState(eMainMenuState_MultiplayerBrowser,
+						 hplNew(cMainMenuWidget_MultiBrowserRefresh,
+								(mpInit, cVector3f(340, vPos.y, 40), _W("Refresh"))));
+		vPos.y += 32;
+		AddWidgetToState(eMainMenuState_MultiplayerBrowser,
+						 hplNew(cMainMenuWidget_Text,
+								(mpInit, cVector3f(12, vPos.y, 40),
+								 _W("Name  |  Map  |  Players  |  [pw] = password  |  Age    (click a row to join)"),
+								 13, eFontAlign_Left)));
+		vPos.y += 20;
+		gvMulRows.clear();
+		for (int r = 0; r < kMulBrowserRows; ++r)
+		{
+			cMainMenuWidget_MultiServerRow *pRow =
+				hplNew(cMainMenuWidget_MultiServerRow,(mpInit, cVector3f(12, vPos.y, 40), r, 440.0f));
+			gvMulRows.push_back(pRow);
+			AddWidgetToState(eMainMenuState_MultiplayerBrowser, pRow);
+			vPos.y += 19;
+		}
+		vPos.y += 8;
+		gpMulBrowserFoot = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W(""), 13, eFontAlign_Center));
+		AddWidgetToState(eMainMenuState_MultiplayerBrowser, gpMulBrowserFoot);
+		vPos.y += 30;
+		AddWidgetToState(
+			eMainMenuState_MultiplayerBrowser,
+			hplNew(cMainMenuWidget_Button,(mpInit, vPos, _W("Direct connect (type an address)"),
+										   eMainMenuState_MultiplayerJoin, 20, eFontAlign_Center)));
+		vPos.y += 34;
+		AddWidgetToState(
+			eMainMenuState_MultiplayerBrowser,
+			hplNew(cMainMenuWidget_Button,(mpInit, vPos, kTranslate("MainMenu", "Back"),
+										   eMainMenuState_Multiplayer, 22, eFontAlign_Center)));
+
+		///////////////////////////////////
+		// Password prompt for a [pw] row
+		///////////////////////////////////
+		vPos = vTextStart;
+		gpMulPwTitle = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W("Password required"), 22, eFontAlign_Center));
+		AddWidgetToState(eMainMenuState_MultiplayerPassword, gpMulPwTitle);
+		vPos.y += 40;
+		AddWidgetToState(eMainMenuState_MultiplayerPassword,
+						 hplNew(cMainMenuWidget_Text,
+								(mpInit, vPos,
+								 _W("This server is password protected. Type the password the host gave you, then press Join."),
+								 13, eFontAlign_Center)));
+		vPos.y += 50;
+		gpMulTypedPw = hplNew(cMainMenuWidget_MultiIpLine,(mpInit, vPos, tString(""), 20, eFontAlign_Center));
+		gpMulTypedPw->SetPasswordMode(true);
+		gpMulTypedPw->SetAscii("");
+		AddWidgetToState(eMainMenuState_MultiplayerPassword, gpMulTypedPw);
+		vPos.y += 60;
+		AddWidgetToState(eMainMenuState_MultiplayerPassword,
+						 hplNew(cMainMenuWidget_MultiPwJoin,(mpInit, vPos, _W("Join"))));
+		vPos.y += 40;
+		AddWidgetToState(
+			eMainMenuState_MultiplayerPassword,
+			hplNew(cMainMenuWidget_Button,(mpInit, vPos, _W("Cancel"),
+										   eMainMenuState_MultiplayerBrowser, 22, eFontAlign_Center)));
 	}
 #endif
 

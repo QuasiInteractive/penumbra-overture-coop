@@ -14,7 +14,8 @@ class cBodySync;
 namespace hpl { class iPhysicsBody; }
 
 //-----------------------------------------------------------------------
-/** One LAN-discovered host, ready for the browser UI (RUNG 2). */
+/** One discovered host (LAN pong or master-server entry), ready for the
+    browser UI (RUNG 2). */
 struct cDiscoveredServer
 {
 	hpl::tString msAddress; /**< "ip:port" — feed straight to JoinGame(). */
@@ -24,6 +25,20 @@ struct cDiscoveredServer
 	uint8_t mlMaxPlayers;
 	/** false = server speaks another kNetProtocolVersion; list greyed out, do not join. */
 	bool mbVersionMatch;
+	/** Host requires a join password (master listing flag; LAN pongs: false).
+	    The browser asks for one before JoinGame — see SetJoinPassword. */
+	bool mbPassword;
+	/** Internet rows: seconds since the host's last master beacon (0..65535);
+	    LAN rows: 0. */
+	uint16_t mlAgeSeconds;
+	/** true = came from the master server, false = LAN pong. */
+	bool mbInternet;
+
+	cDiscoveredServer()
+		: mlPlayerCount(0), mlMaxPlayers(0), mbVersionMatch(false),
+		  mbPassword(false), mlAgeSeconds(0), mbInternet(false)
+	{
+	}
 };
 
 //-----------------------------------------------------------------------
@@ -153,6 +168,35 @@ public:
 	bool IsDiscoveryActive() const { return mbDiscoveryActive; }
 	const std::vector<cDiscoveredServer> &GetDiscoveredServers() const { return mvDiscovered; }
 
+	/** INTERNET server browser (master server, raw UDP — NetworkPackets.h
+	    'MASTER SERVER protocol'). RefreshInternetServers() sends a List to
+	    the configured master (cfg `master_server=host:port`, resolved once
+	    per refresh — blocking, called from a button, never per frame) and
+	    collects Entries for kNetMasterListWindowSeconds; results persist
+	    until the next refresh. Shares the LAN browse socket. */
+	void RefreshInternetServers();
+	void StopInternetRefresh();
+	bool IsInternetRefreshActive() const { return mbInternetActive; }
+	const std::vector<cDiscoveredServer> &GetInternetServers() const { return mvInternet; }
+	/** Why the last refresh produced nothing ("" = fine / not tried yet):
+	    no master configured, unresolvable host, socket failure. */
+	const hpl::tString &GetInternetFailReason() const { return msInternetFailReason; }
+
+	/** Host lobby 'Public (list on master)' checkbox: register with the
+	    master while hosting. cfg `public=1`; `master_server=` alone implies
+	    public unless `public=0` is given. Toggling while hosting sends a
+	    Register / Unregister right away. */
+	bool IsPublic() const { return mbPublic; }
+	void SetPublic(bool abPublic);
+	/** true = multiplayer.cfg had an explicit `public=` — the menu must not
+	    override it with its remembered toggle. */
+	bool IsPublicFromCfg() const { return mbPublicExplicit; }
+	/** "host:port" the host registers with / the browser lists from ("" =
+	    none configured; the placeholder default is only used with public=1). */
+	hpl::tString GetMasterServer() const;
+	/* The browser's password prompt feeds SetJoinPassword (v15 auth, below);
+	   a host's HasServerPassword() sets the [pw] flag in its master beacon. */
+
 private:
 	typedef std::map<uint8_t, cGhostPlayer *> tGhostMap;
 
@@ -257,6 +301,18 @@ private:
 	hpl::tString msServerName;
 	uint8_t mlMaxPlayers;
 
+	/** Master server (internet browser) state — see RefreshInternetServers. */
+	hpl::tString msMasterServer;     /**< cfg `master_server=host:port` ("" = none) */
+	bool mbPublic;                   /**< register with the master while hosting */
+	bool mbPublicExplicit;           /**< cfg had `public=` */
+	std::vector<cDiscoveredServer> mvInternet;
+	bool mbInternetActive;
+	float mfInternetTimeLeft;
+	hpl::tString msInternetFailReason;
+	float mfMasterRegisterAccum;     /**< host: seconds since the last Register */
+	bool mbMasterRegistered;         /**< host: at least one Register went out
+	    this session -> send an Unregister on stop */
+
 	/** Phase 5 object sync lives in cBodySync (multiplayer/BodySync.h) —
 	    body identity + census, host state batches, guest apply. This class
 	    only decides WHEN to build a packet and WHICH peers receive it. */
@@ -292,6 +348,17 @@ private:
 	void CloseHostDiscovery();
 	void SendDiscoveryPings();
 	void PollDiscovery(float afTimeStep);
+	/** Browser-side ephemeral UDP socket shared by the LAN scan and the
+	    master List: opened on demand, closed once neither window is open. */
+	bool OpenBrowseSocket();
+	void CloseBrowseSocketIfIdle();
+	/** Master server: resolve cfg host:port once (blocking; cached until the
+	    string changes), Register/Unregister from the host discovery socket,
+	    parse an Entries datagram into mvInternet. */
+	bool ResolveMasterAddress();
+	void SendMasterRegister();
+	void SendMasterUnregister();
+	void HandleMasterEntries(const char *apBuf, int alLen);
 	void EmitObjectStates();
 	/** Reliable census to one peer, or every connected peer when NULL. */
 	void SendCensus(struct _ENetPeer *apOnlyTo);
