@@ -4,7 +4,9 @@ Two-player (and more) online co-op mod for Penumbra: Overture on the HPL1 engine
 All multiplayer code is in `Overture/multiplayer/`; game glue is spread through
 `Overture/*.cpp` behind `#ifdef PENUMBRA_MULTIPLAYER`. Read
 `Overture/multiplayer/README.md` first — it documents the protocol, every
-subsystem and the `multiplayer.cfg` keys.
+subsystem and the `multiplayer.cfg` keys. `HANDOFF.md` (repo root) is the
+project history/changelog, current state and open items — read it at the
+start of a new chat and keep it updated when a feature lands.
 
 ## Local layout (Windows)
 - Repo: `C:\PenumbraDev\gitpull` (branch `claude/serene-ptolemy-3bzkij`)
@@ -26,7 +28,7 @@ PowerShell needs the policy flag quoted. Re-run configure after vcpkg.json chang
 
 ## Install for testing
 Copy `build_win32\Release\overture.exe` (+ any new vcpkg DLL such as `opus.dll`)
-into both redist folders; copy `Overture\multiplayer\models\*.dae` and `*.json`
+into both redist folders; copy `Overture\multiplayer\models\*.dae`, `*.mat`, `*.tga` and `*.json`
 to `<redist>\multiplayer\models\` and delete `*.collcach` there (the engine
 prefers stale caches). Each redist has its own `multiplayer.cfg`
 (`host=1` vs `join=127.0.0.1:7777`, `player_name=`, `force_windowed=1`,
