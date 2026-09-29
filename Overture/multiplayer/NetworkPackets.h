@@ -60,8 +60,13 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
         3D source at the speaker's ghost head (proximity falloff). Both
         directions (guest -> host, host -> guests; the host relays with the
         author stamped from the peer), validated like every other
-        guest-authored payload (ValidateEventPacket). */
-static const uint16_t kNetProtocolVersion = 16;
+        guest-authored payload (ValidateEventPacket).
+    v17: host-assigned characters — cNetPlayerName grew mCharacter: the
+        host's slot for that player (slot 0 = the host, each accepted guest
+        the lowest free one, freed on leave), i.e. an index into the
+        character list, so every player in a lobby is a DIFFERENT character.
+        The effective player cap is min(max_players, character count). */
+static const uint16_t kNetProtocolVersion = 17;
 
 
 /** v13: cNetPlayerName::msName capacity. A name is at most this many
@@ -69,6 +74,13 @@ static const uint16_t kNetProtocolVersion = 16;
     the wire (a 24-char name fills the field), so receivers copy with a
     bounded scan (cNetworkManager::SanitizePlayerName). */
 static const size_t kNetPlayerNameMaxChars = 24;
+
+/** v17: cNetPlayerName::mCharacter — "no slot known" (a guest's own name
+    packet always carries it; the host ignores the byte from a guest). */
+static const uint8_t kNetCharacterUnknown = 255;
+/** v17: character slots are < this (ValidateEventPacket). The effective cap
+    min(max_players <= 31, character count) keeps real slots well below. */
+static const uint8_t kNetMaxCharacterSlots = 32;
 
 /** Snapshot send period, every sender (cNetworkManager::kSendPeriodSeconds
     is this value). The receiver uses cNetPlayerState::mSeq * this period as
@@ -156,7 +168,8 @@ enum eNetPacketType : uint8_t
 	eNetPacketType_PlayerName = 26,  /* v13, reliable ch0: guest -> host (my
 	                                    name, right after PlayerJoin), host ->
 	                                    every guest (the full table, one
-	                                    packet per player; the host is id 1) */
+	                                    packet per player; the host is id 1;
+	                                    v17: + the player's character slot) */
 	/* v15 — JOIN AUTHENTICATION (reliable ch0). */
 	eNetPacketType_Auth = 27,      /* guest -> host, the guest's FIRST packet:
 	                                  answer to the challenge (cNetAuth) */
@@ -327,12 +340,16 @@ struct cNetPlayerLeave
     (the host trusts the peer it came from). Host -> guests: one per known
     player. msName is NUL-padded, NOT necessarily NUL-terminated (see
     kNetPlayerNameMaxChars); an empty name means "no name known" and the
-    receiver shows "Player <id>". */
+    receiver shows "Player <id>".
+    v17: mCharacter = the host-assigned character slot of mPlayerID (index
+    into the sorted character list, modulo its length on the receiver);
+    kNetCharacterUnknown from a guest (the host never reads it). */
 struct cNetPlayerName
 {
 	uint8_t mType; /**< eNetPacketType_PlayerName */
 	uint8_t mPlayerID;
 	char msName[kNetPlayerNameMaxChars];
+	uint8_t mCharacter; /**< v17: slot, < kNetMaxCharacterSlots or kNetCharacterUnknown */
 };
 
 /** v16 voice packet header. Payload layout after the header, mFrames
@@ -738,7 +755,7 @@ static inline void NetAuthDigest(const char *apPassword, size_t alPasswordLen,
 
 static_assert(sizeof(cNetPlayerJoin) == 2, "");
 static_assert(sizeof(cNetPlayerLeave) == 2, "");
-static_assert(sizeof(cNetPlayerName) == 26, ""); /* v13 */
+static_assert(sizeof(cNetPlayerName) == 27, ""); /* v13; v17: +mCharacter */
 static_assert(sizeof(cNetVoice) == 5, "");       /* v16 */
 static_assert(sizeof(cNetPlayerState) == 30, ""); /* v7: +mSeq; v11: +vel/flags; v12: +mHealth */
 static_assert(sizeof(cNetDiscoveryPing) == 7, "");

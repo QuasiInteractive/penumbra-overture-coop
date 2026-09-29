@@ -280,6 +280,7 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mlNextGuestId(2)
 	  , mlDefaultPort(7777)
 	  , mbActionsRegistered(false)
+	  , mbCfgAutoHost(false) /* v17 */
 	  , mpImpl(new Impl())
 	  , mvGhostMeshPaths()
 	  , mfGhostMeshBodyYOffset(9999.0f)  /* AUTO: derived from game.cfg Player Height/CameraHeightAdd */
@@ -321,6 +322,8 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mvPartyEvents()
 	  , m_setJoinAnnounced()
 	  , mfSinceJoinSeconds(0)
+	  , m_mapPlayerSlots()  /* v17: character slots */
+	  , mlSlotWarned(0)
 	  , mvSnapChunks()      /* v14: world snapshot */
 	  , mlSnapId(0)
 	  , mlSnapGen(0)
@@ -417,6 +420,8 @@ void cNetworkManager::ClearGhostsInternal()
 	m_mapGhostHealth.clear();
 	m_mapPlayerNames.clear(); /* v13: names + "joined" bookkeeping are per session */
 	m_setJoinAnnounced.clear();
+	m_mapPlayerSlots.clear(); /* v17: slots are per session (HostGame re-seeds id 1 = slot 0) */
+	mlSlotWarned = 0;
 	if (mpVoice)
 		mpVoice->DropAllPlayers(); /* v16: every remote decoder + AL source */
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
@@ -439,6 +444,7 @@ void cNetworkManager::DropRemotePlayer(uint8_t id)
 	m_mapGhostMoveState.erase(id);
 	m_mapGhostHealth.erase(id); /* v12: gone = not alive for the respawn rule */
 	ForgetPlayerName(id);       /* v13: "<name> left" + name table entry */
+	m_mapPlayerSlots.erase(id); /* v17: host = the character slot is free again */
 	if (mpVoice)
 		mpVoice->DropPlayer(id); /* v16: decoder + AL source freed */
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
@@ -984,6 +990,7 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mlNextGuestId(2)
 	  , mlDefaultPort(7777)
 	  , mbActionsRegistered(false)
+	  , mbCfgAutoHost(false) /* v17 */
 	  , mpImpl(new Impl())
 	  , mvGhostMeshPaths()
 	  , mfGhostMeshBodyYOffset(9999.0f)  /* AUTO: derived from game.cfg Player Height/CameraHeightAdd */
@@ -1025,6 +1032,8 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mvPartyEvents()
 	  , m_setJoinAnnounced()
 	  , mfSinceJoinSeconds(0)
+	  , m_mapPlayerSlots()  /* v17: character slots */
+	  , mlSlotWarned(0)
 	  , mvSnapChunks()      /* v14: world snapshot */
 	  , mlSnapId(0)
 	  , mlSnapGen(0)
@@ -1102,7 +1111,8 @@ void cNetworkManager::RegisterInputActions()
    server_password=secret        (guests must know it; listed with [pw])
    join_password=secret          (presented on join; the browser prompts too)
 
-   Peer PlayerID picks mesh as index (id-1) modulo list length — id 1 => first .dae, id 2 => second.
+   v17: the host assigns each player a character slot (host = 0, guests the lowest
+   free one); a ghost uses mesh index slot modulo list length, one of each per lobby.
    Without ghost_models/ghost_model every multiplayer/models/<name>.dae with no
    '_' in <name> and at least one <name>_<clip>.dae sibling is a character,
    sorted case-insensitively (ResolveGhostModels, run from Startup).
@@ -1275,9 +1285,43 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 
 	if (wantHost)
 	{
+		/* v17: hosted at the END of Startup, once ResolveGhostModels has
+		   the final character list (= the player cap, see HostGame) */
 		msDeferredJoinAddress = "";
-		HostGame(mlDefaultPort);
+		mbCfgAutoHost = true;
 	}
+}
+
+/* Character order for auto-discovered lists. Slot 0 is the HOST, and the
+   host always plays Phillip, the game's main character; guests then get the
+   next free character in this order as they join. Characters not listed here
+   follow alphabetically; names missing from the folder are skipped. An
+   explicit ghost_models= in multiplayer.cfg keeps its own order instead. */
+static const char *const kGhostCharacterOrder[] = { "phillip", "fisherman", "stefan", "malik" };
+
+static void OrderGhostCharacters(std::vector<tString> &avPaths)
+{
+	std::vector<tString> vOut;
+	std::vector<bool> vUsed(avPaths.size(), false);
+	for (size_t o = 0; o < sizeof(kGhostCharacterOrder) / sizeof(kGhostCharacterOrder[0]); ++o)
+	{
+		for (size_t i = 0; i < avPaths.size(); ++i)
+		{
+			if (vUsed[i])
+				continue;
+			tString sBase = cString::ToLowerCase(cString::SetFileExt(cString::GetFileName(avPaths[i]), ""));
+			if (sBase == kGhostCharacterOrder[o])
+			{
+				vOut.push_back(avPaths[i]);
+				vUsed[i] = true;
+				break;
+			}
+		}
+	}
+	for (size_t i = 0; i < avPaths.size(); ++i) /* the rest keep the sorted order */
+		if (!vUsed[i])
+			vOut.push_back(avPaths[i]);
+	avPaths.swap(vOut);
 }
 
 void cNetworkManager::ResolveGhostModels()
@@ -1327,25 +1371,27 @@ void cNetworkManager::ResolveGhostModels()
 	{
 		/* No cfg list (the default): every character in the folder, so a new
 		   character is added by dropping <name>.dae + its <name>_*.dae clips
-		   there. ghost_body_ys then index this sorted list. */
+		   there. ghost_body_ys then index this (priority-ordered) list. */
 		DiscoverGhostCharacters(pRes, kGhostModelDir, mvGhostMeshPaths);
 		szSource = "auto-discovered in multiplayer/models";
+		OrderGhostCharacters(mvGhostMeshPaths);
 	}
 
 	if (mvGhostMeshPaths.empty())
 	{
 		/* Nothing found either (folder missing / not installed): the shipped
 		   pair, as before — a missing mesh leaves the marker light only. */
+		mvGhostMeshPaths.push_back("phillip.dae"); /* v17: host = Phillip (kGhostCharacterOrder) */
 		mvGhostMeshPaths.push_back("malik.dae");
-		mvGhostMeshPaths.push_back("phillip.dae");
 		szSource = "built-in default";
 	}
 
-	Log(" multiplayer: %u character(s) (%s): %s — player N uses entry (N-1) mod %u\n",
+	Log(" multiplayer: %u character(s) (%s): %s — the host gives every player a different one (slot mod %u)\n",
 		(unsigned)mvGhostMeshPaths.size(), szSource,
 		GhostModelListText(mvGhostMeshPaths).c_str(), (unsigned)mvGhostMeshPaths.size());
 	if (mvGhostMeshPaths.size() < 4)
-		Log(" multiplayer: fewer than 4 characters - in a 4-player lobby some players share a model\n");
+		Log(" multiplayer: fewer than 4 characters - a lobby we host holds at most %u player(s) (one per character)\n",
+			(unsigned)GetCharacterCount());
 }
 
 void cNetworkManager::Startup()
@@ -1378,6 +1424,12 @@ void cNetworkManager::Startup()
 	}
 	else if (cVoiceChat::IsCompiledIn())
 		Log(" multiplayer: voice chat off (voice_enabled=0)\n");
+	/* v17: cfg host=1, now that the character list (the player cap) is final */
+	if (mbCfgAutoHost)
+	{
+		mbCfgAutoHost = false;
+		HostGame(mlDefaultPort);
+	}
 }
 
 //-----------------------------------------------------------------------
@@ -1651,6 +1703,8 @@ void cNetworkManager::ClearGhostsInternal()
 	m_mapGhostHealth.clear();
 	m_mapPlayerNames.clear(); /* v13: names + "joined" bookkeeping are per session */
 	m_setJoinAnnounced.clear();
+	m_mapPlayerSlots.clear(); /* v17: slots are per session (HostGame re-seeds id 1 = slot 0) */
+	mlSlotWarned = 0;
 	if (mpVoice)
 		mpVoice->DropAllPlayers(); /* v16: every remote decoder + AL source */
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
@@ -1665,6 +1719,7 @@ void cNetworkManager::DropRemotePlayer(uint8_t id)
 	m_mapGhostMoveState.erase(id);
 	m_mapGhostHealth.erase(id); /* v12: gone = not alive for the respawn rule */
 	ForgetPlayerName(id);       /* v13: "<name> left" + name table entry */
+	m_mapPlayerSlots.erase(id); /* v17: host = the character slot is free again */
 	if (mpVoice)
 		mpVoice->DropPlayer(id); /* v16: decoder + AL source freed */
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
@@ -1681,9 +1736,11 @@ void cNetworkManager::EnsureGhost(uint8_t id)
 		return;
 	if (m_mapGhosts.find(id) != m_mapGhosts.end())
 		return;
-	/* PlayerID picks the mesh as index (id-1) modulo the list length —
-	   id 1 => first .dae, id 2 => second (same order on every machine). */
-	cGhostPlayer *pGhost = CreateGhost(id, (size_t)(id - 1));
+	/* v17: the host-assigned character slot picks the mesh (slot mod list
+	   length — the sorted list is the same on every machine); until the
+	   host's table told us the slot, (id-1) mod length, and
+	   OnPlayerSlotReceived rebuilds the ghost if that guess was wrong. */
+	cGhostPlayer *pGhost = CreateGhost(id, GhostMeshIndexFor(id));
 	if (pGhost)
 		m_mapGhosts[id] = pGhost;
 }
@@ -1754,6 +1811,7 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		if (!mbHosting && len >= sizeof(cNetPlayerName))
 		{
 			const cNetPlayerName *pn = (const cNetPlayerName *)data;
+			OnPlayerSlotReceived(pn->mPlayerID, pn->mCharacter); /* v17, ours included */
 			OnPlayerNameReceived(pn->mPlayerID, pn->msName, sizeof(pn->msName));
 		}
 		return;
@@ -2168,14 +2226,17 @@ void cNetworkManager::Service(int timeoutMs)
 				/* v15: max_players at CONNECT. Every connected slot counts —
 				   accepted or still answering the challenge — so a burst of
 				   half-open joins cannot exceed the cap either. ev.peer is
-				   already CONNECTED here, hence the "- 1". */
+				   already CONNECTED here, hence the "- 1". v17: the cap is
+				   min(max_players, characters) — one character each, so a
+				   free character slot always exists for whoever gets in. */
 				{
 					const int lOthers = CountConnectedPeers(false) - 1;
-					if (lOthers >= (int)mlMaxPlayers - 1 ||
+					const unsigned lCap = (unsigned)GetMaxPlayers();
+					if (lOthers >= (int)lCap - 1 ||
 						(mvFreeGuestIds.empty() && mlNextGuestId >= kPreviewGhostId))
 					{
-						Log(" multiplayer: REFUSED peer %s - server full (%d/%u guests)\n",
-							sWho, lOthers, (unsigned)mlMaxPlayers - 1u);
+						Log(" multiplayer: REFUSED peer %s - server full (%d/%u guests, cap %u = min(max_players %u, %u characters))\n",
+							sWho, lOthers, lCap - 1u, lCap, (unsigned)mlMaxPlayers, (unsigned)GetCharacterCount());
 						enet_peer_disconnect(ev.peer, kNetDisconnectFull);
 						break;
 					}
@@ -2221,7 +2282,7 @@ void cNetworkManager::Service(int timeoutMs)
 				}
 				else if (ev.data == kNetDisconnectFull) /* v15 */
 				{
-					msJoinFailReason = "Host REFUSED: the server is full.";
+					msJoinFailReason = "Host REFUSED: the server is full (one player per character).";
 					Log(" multiplayer: host refused us - server full\n");
 				}
 				else if (ev.data == kNetDisconnectKicked) /* v15 */
@@ -2241,17 +2302,7 @@ void cNetworkManager::Service(int timeoutMs)
 			{
 				uint8_t gone = PeerGetId(ev.peer);
 				if (gone)
-				{
-					BlastLeaves(mpImpl->mpHost, gone, ev.peer);
-					DropRemotePlayer(gone);
-					SendNameTable(NULL); /* v13: table without the leaver */
-					/* rung 3: a vanished guest drops whatever it held */
-					int lFreed = mpBodySync->ReleaseAllHeldBy(gone);
-					if (lFreed > 0)
-						Log(" multiplayer: guest %u left holding %d object(s) — released\n",
-							(unsigned)gone, lFreed);
-					FreeGuestId(gone); /* v15: the id goes back to the pool */
-				}
+					HostForgetGuest(ev.peer, gone); /* v17: + its character slot */
 				else
 				{
 					char sWho[64];
@@ -2474,11 +2525,19 @@ void cNetworkManager::HostGame(uint16_t alPort)
 	m_setPartyItems.clear();
 	mlNextGuestId = 2;
 	mvFreeGuestIds.clear(); /* v15: fresh id space */
+	m_mapPlayerSlots.clear(); /* v17: fresh slot table (Disconnect cleared it too) */
+	m_mapPlayerSlots[mlLocalPlayerId] = 0; /* the host is always character slot 0 */
+	mlSlotWarned = 0;
 	ResetPeerGuards();
 	mbHadJoinPacket = true;
 	mlListenPort = alPort;
 	mbClientConnected = false;
 	Log(" multiplayer: HOST udp/%u\n", (unsigned)alPort);
+	Log(" multiplayer: player cap %u = min(max_players %u, %u character(s)) - every player a different character\n",
+		(unsigned)GetMaxPlayers(), (unsigned)mlMaxPlayers, (unsigned)GetCharacterCount());
+	if (GetMaxPlayers() < 2)
+		Log(" multiplayer: WARNING only one character (ghost_model= / ghost_models=) - nobody can join; "
+			"list more characters or remove the key\n");
 
 	OpenHostDiscovery();
 
@@ -3893,7 +3952,7 @@ void cNetworkManager::SendMasterRegister()
 	reg.mlMasterVer = kNetMasterProtocolVersion;
 	reg.mlGamePort = mlListenPort;
 	reg.mlPlayerCount = (uint8_t)(CountConnectedPeers(true) + 1); /* accepted guests + me */
-	reg.mlMaxPlayers = mlMaxPlayers;
+	reg.mlMaxPlayers = GetMaxPlayers(); /* v17: effective cap (one per character) */
 	reg.mFlags = HasServerPassword() ? kNetMasterFlag_Password : 0; /* v15 auth: the real setting */
 	reg.mlProtocolVer = kNetProtocolVersion;
 	{
@@ -4201,7 +4260,7 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 			pong.mlProtocolVer = kNetProtocolVersion;
 			pong.mlGamePort = mlListenPort;
 			pong.mlPlayerCount = (uint8_t)(CountConnectedPeers(true) + 1); /* accepted guests + me */
-			pong.mlMaxPlayers = mlMaxPlayers;
+			pong.mlMaxPlayers = GetMaxPlayers(); /* v17: effective cap (one per character) */
 			{
 				/* v13: no server_name -> "<player_name>'s game" (or the old default) */
 				hpl::tString sAdvertised = msServerName;
@@ -5405,29 +5464,159 @@ void cNetworkManager::ForgetPlayerName(uint8_t alId)
 		AddPartyEvent(sName + " left");
 }
 
+//----------------------------------------------------------------------
+// v17: host-assigned characters (both builds; the stub never has a slot).
+// The host owns the slot table (id 1 = slot 0, guests the lowest free
+// slot), the name table carries it, every machine draws slot mod N of its
+// own sorted character list.
+
+uint8_t cNetworkManager::GetCharacterCount() const
+{
+	size_t n = mvGhostMeshPaths.size();
+	if (n < 1)
+		n = 1;
+	if (n > kNetMaxCharacterSlots)
+		n = kNetMaxCharacterSlots;
+	return (uint8_t)n;
+}
+
+uint8_t cNetworkManager::GetMaxPlayers() const
+{
+	const uint8_t lChars = GetCharacterCount();
+	return mlMaxPlayers < lChars ? mlMaxPlayers : lChars;
+}
+
+size_t cNetworkManager::GhostMeshIndexFor(uint8_t alId) const
+{
+	std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.find(alId);
+	if (it != m_mapPlayerSlots.end())
+		return it->second;
+	return alId > 0 ? (size_t)(alId - 1) : 0; /* pre-v17 guess until the slot arrives */
+}
+
+hpl::tString cNetworkManager::GetPlayerCharacterName(uint8_t alId) const
+{
+	std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.find(alId);
+	if (it == m_mapPlayerSlots.end() || mvGhostMeshPaths.empty())
+		return "";
+	const hpl::tString &sPath = mvGhostMeshPaths[it->second % mvGhostMeshPaths.size()];
+	size_t lStart = 0;
+	for (size_t i = 0; i < sPath.size(); ++i)
+		if (sPath[i] == '/' || sPath[i] == '\\')
+			lStart = i + 1;
+	hpl::tString sName = sPath.substr(lStart);
+	const size_t lDot = sName.rfind('.');
+	if (lDot != hpl::tString::npos && lDot > 0)
+		sName = sName.substr(0, lDot); /* "fisherman.dae" -> "fisherman" */
+	return sName;
+}
+
+uint8_t cNetworkManager::AllocCharacterSlot() const
+{
+	const uint8_t lCount = GetCharacterCount();
+	for (uint8_t lSlot = 1; lSlot < lCount; ++lSlot) /* 0 is the host's */
+	{
+		bool bUsed = false;
+		for (std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.begin();
+			it != m_mapPlayerSlots.end() && !bUsed; ++it)
+			bUsed = (it->second == lSlot);
+		if (!bUsed)
+			return lSlot;
+	}
+	return kNetCharacterUnknown;
+}
+
+void cNetworkManager::OnPlayerSlotReceived(uint8_t alId, uint8_t alSlot)
+{
+	if (alId == 0 || alId == kPreviewGhostId || mbHosting)
+		return; /* the host's table is its own; never from the wire */
+	const size_t lCount = mvGhostMeshPaths.size();
+	const size_t lOldIdx = GhostMeshIndexFor(alId);
+
+	std::map<uint8_t, uint8_t>::iterator it = m_mapPlayerSlots.find(alId);
+	if (alSlot == kNetCharacterUnknown || alSlot >= kNetMaxCharacterSlots)
+	{
+		if (it != m_mapPlayerSlots.end())
+			m_mapPlayerSlots.erase(it);
+	}
+	else
+	{
+		const bool bChanged = (it == m_mapPlayerSlots.end() || it->second != alSlot);
+		m_mapPlayerSlots[alId] = alSlot;
+		if (bChanged)
+			Log(" multiplayer: player %u is character slot %u (%s)\n",
+				(unsigned)alId, (unsigned)alSlot, GetPlayerCharacterName(alId).c_str());
+		if (lCount > 0 && alSlot >= lCount && (mlSlotWarned & (1u << alSlot)) == 0)
+		{
+			/* the host has more characters than we do: the lists differ,
+			   so this player shares a look with somebody here */
+			mlSlotWarned |= (1u << alSlot);
+			Log(" multiplayer: WARNING host assigned character slot %u but we only have %u character(s) - "
+				"using %s; copy the host's multiplayer/models characters to this machine\n",
+				(unsigned)alSlot, (unsigned)lCount, GetPlayerCharacterName(alId).c_str());
+		}
+	}
+
+	/* A ghost built from the (id-1) guess (or an older slot) with the wrong
+	   mesh: delete it here — Service runs after Update's world check, so it
+	   lives in the current world and a plain hplDelete is the right
+	   teardown (as in DropRemotePlayer). The next state packet re-creates
+	   it through EnsureGhost with the slot's mesh; seq/health/move state
+	   live outside the ghost, the interpolation buffer refills. */
+	if (lCount == 0 || (lOldIdx % lCount) == (GhostMeshIndexFor(alId) % lCount))
+		return;
+	tGhostMap::iterator gi = m_mapGhosts.find(alId);
+	if (gi == m_mapGhosts.end())
+		return;
+	hplDelete(gi->second);
+	m_mapGhosts.erase(gi);
+	Log(" multiplayer: ghost %u rebuilt as %s (host-assigned character)\n",
+		(unsigned)alId, GetPlayerCharacterName(alId).c_str());
+}
+
 #ifdef PENUMBRA_MULTIPLAYER
 
 void cNetworkManager::SendNameTable(ENetPeer *apOnlyTo)
 {
 	if (!mbHosting || !mpImpl || !mpImpl->mpHost)
 		return;
-	/* our own entry first (id 1, may be empty = "Player 1"), then every guest */
-	std::vector<std::pair<uint8_t, hpl::tString> > vTable;
-	vTable.push_back(std::make_pair(mlLocalPlayerId, msPlayerName));
+	/* our own entry first (id 1, may be empty = "Player 1"), then every
+	   guest. v17: every id with a character slot (= every accepted guest)
+	   is listed even without a name, so each machine learns everybody's
+	   character; ids ascend, so id 1 still goes first. At most 1 + 30
+	   guests (enet_host_create's 31 peers) packets of 27 B. */
+	std::set<uint8_t> setIds;
+	setIds.insert(mlLocalPlayerId);
 	for (std::map<uint8_t, hpl::tString>::const_iterator it = m_mapPlayerNames.begin();
 		it != m_mapPlayerNames.end(); ++it)
-		vTable.push_back(*it);
+		setIds.insert(it->first);
+	for (std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.begin();
+		it != m_mapPlayerSlots.end(); ++it)
+		setIds.insert(it->first);
 
-	for (size_t i = 0; i < vTable.size(); ++i)
+	for (std::set<uint8_t>::const_iterator id = setIds.begin(); id != setIds.end(); ++id)
 	{
+		if (*id == 0)
+			continue;
 		cNetPlayerName pkt;
 		memset(&pkt, 0, sizeof(pkt)); /* NUL padding; a full name has no NUL */
 		pkt.mType = eNetPacketType_PlayerName;
-		pkt.mPlayerID = vTable[i].first;
-		const hpl::tString &sName = vTable[i].second;
+		pkt.mPlayerID = *id;
+		hpl::tString sName;
+		if (*id == mlLocalPlayerId)
+			sName = msPlayerName;
+		else
+		{
+			std::map<uint8_t, hpl::tString>::const_iterator ni = m_mapPlayerNames.find(*id);
+			if (ni != m_mapPlayerNames.end())
+				sName = ni->second;
+		}
 		const size_t n = sName.size() < sizeof(pkt.msName) ? sName.size() : sizeof(pkt.msName);
 		if (n > 0)
 			memcpy(pkt.msName, sName.data(), n);
+		std::map<uint8_t, uint8_t>::const_iterator si = m_mapPlayerSlots.find(*id);
+		pkt.mCharacter = (si != m_mapPlayerSlots.end() && si->second < kNetMaxCharacterSlots) ?
+			si->second : kNetCharacterUnknown; /* v17 */
 		if (apOnlyTo)
 			SendStructToPeer(apOnlyTo, &pkt, sizeof(pkt), true);
 		else
@@ -5448,6 +5637,7 @@ void cNetworkManager::SendLocalName()
 	const size_t n = msPlayerName.size() < sizeof(pkt.msName) ? msPlayerName.size() : sizeof(pkt.msName);
 	if (n > 0)
 		memcpy(pkt.msName, msPlayerName.data(), n);
+	pkt.mCharacter = kNetCharacterUnknown; /* v17: the host assigns, it never reads this */
 	SendReliableEvent(&pkt, sizeof(pkt)); /* no-op until connected + joined */
 }
 
@@ -5717,6 +5907,21 @@ void cNetworkManager::MakeNonce(const ENetPeer *apPeer, uint8_t aOut[16])
 	NetAuthDigest((const char *)aSeed, sizeof(aSeed), aPrev, (uint16_t)(aSeed[4] & 0xFFFFu), aOut);
 }
 
+void cNetworkManager::HostForgetGuest(ENetPeer *apPeer, uint8_t alId)
+{
+	if (!mbHosting || !mpImpl || !mpImpl->mpHost || alId < 2)
+		return;
+	BlastLeaves(mpImpl->mpHost, alId, apPeer);
+	DropRemotePlayer(alId); /* v17: also frees its character slot */
+	SendNameTable(NULL);    /* v13: table without the leaver */
+	/* rung 3: a vanished guest drops whatever it held */
+	int lFreed = mpBodySync->ReleaseAllHeldBy(alId);
+	if (lFreed > 0)
+		Log(" multiplayer: guest %u left holding %d object(s) — released\n",
+			(unsigned)alId, lFreed);
+	FreeGuestId(alId); /* v15: the id goes back to the pool */
+}
+
 void cNetworkManager::HostAcceptPeer(ENetPeer *apPeer, const cNetAuth &aAuth)
 {
 	if (!mbHosting || !mpImpl || !mpImpl->mpHost || !apPeer)
@@ -5754,6 +5959,20 @@ void cNetworkManager::HostAcceptPeer(ENetPeer *apPeer, const cNetAuth &aAuth)
 		enet_peer_disconnect(apPeer, kNetDisconnectFull);
 		return;
 	}
+	/* v17: one character each. CONNECT already caps the peers at the
+	   character count, so this only fires if the list and the cap disagree
+	   — refused as "full" rather than sharing a character. */
+	const uint8_t lSlot = AllocCharacterSlot();
+	if (lSlot == kNetCharacterUnknown)
+	{
+		FreeGuestId(aid);
+		guard.mbRefused = true;
+		Log(" multiplayer: REFUSED peer %s - every character is taken (%u)\n",
+			sWho, (unsigned)GetCharacterCount());
+		enet_peer_disconnect(apPeer, kNetDisconnectFull);
+		return;
+	}
+	m_mapPlayerSlots[aid] = lSlot; /* erased in DropRemotePlayer (HostForgetGuest) */
 	guard.mbAuthed = true;
 	guard.mlStrikes = 0;
 	PeerSetId(apPeer, aid);
@@ -5775,7 +5994,8 @@ void cNetworkManager::HostAcceptPeer(ENetPeer *apPeer, const cNetAuth &aAuth)
 	if (aAuth.msName[0] != '\0')
 		OnPlayerNameReceived(aid, aAuth.msName, sizeof(aAuth.msName)); /* sanitised inside */
 	SendNameTable(NULL); /* v13: who is here — the newcomer lists it silently */
-	Log(" multiplayer: peer %s accepted as id=%u%s\n", sWho, (unsigned)aid,
+	Log(" multiplayer: peer %s accepted as id=%u, character slot %u (%s)%s\n", sWho, (unsigned)aid,
+		(unsigned)lSlot, GetPlayerCharacterName(aid).c_str(),
 		msServerPassword.empty() ? "" : " (password ok)");
 }
 
@@ -5997,7 +6217,15 @@ bool cNetworkManager::ValidateEventPacket(unsigned char *apData, size_t alLen, b
 		return true;
 	}
 	case eNetPacketType_PlayerName:
-		return alLen >= sizeof(cNetPlayerName); /* SanitizePlayerName on apply */
+	{
+		/* SanitizePlayerName on apply; v17: the slot is a real one or
+		   "unknown" (a guest sends unknown; the host ignores it anyway) */
+		if (alLen < sizeof(cNetPlayerName))
+			return false;
+		cNetPlayerName pn;
+		memcpy(&pn, apData, sizeof(pn));
+		return pn.mCharacter < kNetMaxCharacterSlots || pn.mCharacter == kNetCharacterUnknown;
+	}
 	case eNetPacketType_Voice:
 	{
 		/* v16: header + 1..2 length-prefixed Opus frames, payload bounded
@@ -6137,8 +6365,19 @@ void cNetworkManager::UpdatePeerGuards(float afTimeStep)
 		   enet_peer_disconnect, which reports one) — drop the record */
 		if (pPeer->state == ENET_PEER_STATE_DISCONNECTED || pPeer->state == ENET_PEER_STATE_ZOMBIE)
 		{
+			/* v17: an accepted guest that vanishes this way still frees its
+			   id + character slot (else the slot is lost until a restart) */
+			ENetPeer *pDead = const_cast<ENetPeer *>(pPeer);
+			const uint8_t lGone = PeerGetId(pDead);
 			std::map<const ENetPeer *, Impl::cPeerGuard>::iterator dead = it++;
 			mpImpl->m_mapGuards.erase(dead);
+			if (lGone)
+			{
+				PeerSetId(pDead, 0); /* a late DISCONNECT event is then "unaccepted" */
+				Log(" multiplayer: guest %u's slot died without a disconnect event - dropped\n",
+					(unsigned)lGone);
+				HostForgetGuest(pDead, lGone);
+			}
 			continue;
 		}
 		guard.mfAge += afTimeStep;

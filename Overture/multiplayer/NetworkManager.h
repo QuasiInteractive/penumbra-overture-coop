@@ -128,9 +128,19 @@ public:
 
 	/** Host lobby UI: guests currently on the socket. */
 	int GetConnectedGuestCount() const;
-	/** Host lobby UI: multiplayer.cfg max_players (2..31, default 4), the
-	    same value discovery pongs / the master listing advertise. */
-	uint8_t GetMaxPlayers() const { return mlMaxPlayers; }
+	/** Host lobby UI: the EFFECTIVE player cap (v17) = min(multiplayer.cfg
+	    max_players (2..31, default 4), number of characters) — every player
+	    is a different character, so there are never more players than
+	    characters. The same value discovery pongs / the master listing
+	    advertise and CONNECT enforces. */
+	uint8_t GetMaxPlayers() const;
+	/** v17: characters in the list (mvGhostMeshPaths), at least 1, at most
+	    kNetMaxCharacterSlots — the number of character slots a host hands out. */
+	uint8_t GetCharacterCount() const;
+	/** v17: the character of any id, ours included: the base name of its
+	    model without ".dae" ("fisherman"), "" while its host-assigned slot
+	    is not known (offline, or before the host's table arrived). */
+	hpl::tString GetPlayerCharacterName(uint8_t alId) const;
 
 	/** Join screen UI: why the last join attempt died ("" = no failure).
 	    Cleared by the next JoinGame call. */
@@ -268,8 +278,12 @@ private:
 
 	bool mbActionsRegistered;
 	hpl::tString msDeferredJoinAddress;
+	/** v17: cfg host=1 — Startup hosts AFTER ResolveGhostModels, so the
+	    character count (= the player cap) is final when the host opens. */
+	bool mbCfgAutoHost;
 
-	/** Character mesh per PlayerID, index = (id-1) mod N (host = 1). Built in
+	/** Character meshes. v17: a PlayerID uses entry (its host-assigned slot)
+	    mod N (m_mapPlayerSlots; (id-1) mod N until the slot is known). Built in
 	    Startup by ResolveGhostModels: `ghost_models=a,b,c` / `ghost_model=a`
 	    in cfg order minus files that do not resolve, else auto-discovered
 	    characters in multiplayer/models (sorted), else malik + phillip. */
@@ -473,6 +487,21 @@ private:
 	std::vector<cNetPartyEvent> mvPartyEvents;
 	std::set<uint8_t> m_setJoinAnnounced; /**< ids whose "joined" line went out (so "left" is only shown for them) */
 	float mfSinceJoinSeconds;             /**< guest: seconds since our PlayerJoin (kPartyJoinGraceSeconds) */
+	/** v17: id -> character slot (index into mvGhostMeshPaths, mod its size),
+	    ours included. HOST: the slot table itself — id 1 = slot 0 (HostGame),
+	    each accepted guest the lowest free slot (HostAcceptPeer), erased in
+	    DropRemotePlayer = freed. GUEST: copied from the host's name table. */
+	std::map<uint8_t, uint8_t> m_mapPlayerSlots;
+	uint32_t mlSlotWarned; /**< guest: bit per slot >= our character count already logged */
+	/** Mesh list index for a ghost of alId: its slot, else (id-1). */
+	size_t GhostMeshIndexFor(uint8_t alId) const;
+	/** Host: lowest slot in 1..GetCharacterCount()-1 no entry uses,
+	    kNetCharacterUnknown when every slot is taken. */
+	uint8_t AllocCharacterSlot() const;
+	/** Guest: a table entry's slot arrived (kNetCharacterUnknown = forget).
+	    An existing ghost whose mesh index changes is deleted — the next
+	    state packet re-creates it with the right character (EnsureGhost). */
+	void OnPlayerSlotReceived(uint8_t alId, uint8_t alSlot);
 	/** Ages the feed, drops dead lines. Called from Update (both builds). */
 	void UpdatePartyEvents(float afTimeStep);
 	/** A name for a remote id arrived (host: from the peer itself; guest:
@@ -571,6 +600,10 @@ private:
 	int CountConnectedPeers(bool abAcceptedOnly) const;
 	/** Host: a fresh per-connection nonce (time, address, counter, mixed). */
 	void MakeNonce(const struct _ENetPeer *apPeer, uint8_t aOut[16]);
+	/** Host: an accepted guest (wire id alId) is gone — PlayerLeave to the
+	    rest, ghost/name/voice/slot dropped, name table re-sent, held bodies
+	    released, id freed. From DISCONNECT and the dead-slot sweep. */
+	void HostForgetGuest(struct _ENetPeer *apPeer, uint8_t alId);
 	/** Host: the guest's cNetAuth arrived — accept (id, ack, join, census,
 	    beacon, name table) or refuse with kNetDisconnectBadAuth. */
 	void HostAcceptPeer(struct _ENetPeer *apPeer, const cNetAuth &aAuth);

@@ -7,13 +7,17 @@
 # multiplayer/models/. By DEFAULT (no ghost_models= line) every
 # <name>.dae there whose <name> has no '_' and that has at least one
 # <name>_<clip>.dae clip next to it (malik.dae + malik_idle.dae, ...) is a
-# character; they are sorted by name (case-insensitive) and PlayerID N uses
-# entry (N-1) mod count: host = 1st, first guest = 2nd, ... With four
-# characters a four-player lobby shows four different people. Adding one =
-# drop <name>.dae + <name>_*.dae (+ <name>.mat/.tga, <name>_clips.json) into
-# the folder on EVERY machine (the mapping is local: the same files on all
-# machines = the same character for the same player). hpl.log lists them:
-#   multiplayer: 2 character(s) (auto-discovered in multiplayer/models): malik.dae, phillip.dae
+# character. v17: the list is ordered phillip, fisherman, stefan, malik, then
+# any other character alphabetically, and the HOST gives every player a
+# different one (host = 1st = always Phillip, each guest the lowest free one
+# — fisherman, Stefan, Malik in join order — freed when it leaves): one of
+# each, never a duplicate, so the lobby holds at most as many players as
+# there are characters (see max_players). Adding one = drop
+# <name>.dae + <name>_*.dae (+ <name>.mat/.tga, <name>_clips.json) into the
+# folder on EVERY machine: only the slot number travels, so all machines
+# need the same files (a guest with fewer characters than the host logs a
+# WARNING and shows that player as another character). hpl.log lists them:
+#   multiplayer: 4 character(s) (auto-discovered in multiplayer/models): phillip.dae, fisherman.dae, stefan.dae, malik.dae
 #
 # v11: the wire carries the sender's FEET height and the shipped meshes have
 # their origin at the feet, so no grounding offset is needed any more.
@@ -39,6 +43,10 @@ player_name=
 #                 (2..31, default 4, host included): one more is refused
 #                 with "server full". The host lobby and the server browser
 #                 show "players/max" (e.g. 3/4).
+#                 v17: the real cap is min(max_players, number of characters)
+#                 — every player is a different character, so with the four
+#                 shipped characters max_players=8 still means 4 (hpl.log:
+#                 "player cap 4 = min(max_players 8, 4 character(s))").
 # server_name=Penumbra Server
 max_players=4
 port=7777
@@ -72,9 +80,14 @@ public=0
 # ghost_models= pins the list and its ORDER instead of auto-discovery (see
 # the top of this file). Entries whose file does not exist are skipped (one
 # hpl.log line each), so a list naming four characters works before all four
-# are exported. Nothing left / nothing found = malik.dae, phillip.dae.
+# are exported. Nothing left / nothing found = phillip.dae, malik.dae.
+# v17: a ghost_models= list keeps ITS order (entry 1 = the host), no
+# phillip-first reordering. The host's list decides the player cap (one player per entry) and
+# the slots it hands out index it — use the SAME list (or none) on every
+# machine, or players look like different characters on different screens.
 # ghost_models=malik.dae,phillip.dae
-# Alternative: single mesh for everybody — ghost_model=foo.dae
+# ghost_model=foo.dae — a single character. v17: that means a SOLO host (one
+# player per character, nobody can join); only useful for ghost_preview.
 # ghost_body_y=0
 # ghost_body_y_crouch=0
 

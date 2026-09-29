@@ -1876,19 +1876,28 @@ void cPlayer::DrawPartyPanel()
 	const float fX = 12.0f;
 	float fY = 12.0f;
 	const float fZ = 90.0f;
-	const float kBarX = 150.0f;     /* bar column, right of the names */
+	float fBarX = 150.0f;           /* bar column, right of the names (widened below) */
 	const float kBarW = 50.0f, kBarH = 5.0f;
 	const float kLineH = 16.0f;
 	const cVector2f vFontSize(12,12);
 
+	/* v17: "<name> (<character>)" — the host-assigned character, one of
+	   each per lobby. The bar column moves right of the longest line. */
+	std::vector<tWString> vTexts;
 	for(size_t i=0; i<vLines.size(); ++i)
 	{
 		const int lId = vLines[i].first;
 		const float fHealth = (vLines[i].second < 0) ? 0.0f : ((vLines[i].second > 100) ? 100.0f : vLines[i].second);
-		const float fPercent = fHealth / 100.0f;
 
 		tWString sName = cString::To16Char(pNet->GetPlayerName((uint8_t)lId));
+		const tString sChar = pNet->GetPlayerCharacterName((uint8_t)lId);
+		if(sChar.empty()==false) sName += _W(" (") + cString::To16Char(sChar) + _W(")");
 		if(lId == 1) sName += _W(" (host)");
+		/* column from the stable part + the longest status suffix, so it
+		   neither jumps while somebody talks nor runs into the bar */
+		const tWString sWorst = sName + _W("  (talking)");
+		const float fLen = mpFont->GetLength(vFontSize, sWorst.c_str()) + 10.0f;
+		if(fLen > fBarX) fBarX = fLen;
 		if(fHealth <= 0) sName += _W("  dead");
 		/* v16 voice: who is heard right now; our own line shows the live mic */
 		if(lId == lLocalId)
@@ -1896,18 +1905,26 @@ void cPlayer::DrawPartyPanel()
 			if(pNet->IsMicOpen()) sName += _W("  [MIC]");
 		}
 		else if(pNet->IsPlayerTalking((uint8_t)lId)) sName += _W("  (talking)");
+		vTexts.push_back(sName);
+	}
+
+	for(size_t i=0; i<vLines.size(); ++i)
+	{
+		const float fHealth = (vLines[i].second < 0) ? 0.0f : ((vLines[i].second > 100) ? 100.0f : vLines[i].second);
+		const float fPercent = fHealth / 100.0f;
+		const tWString &sName = vTexts[i];
 		const cColor col = (fHealth > 0) ? cColor(1,1,1,0.9f) : cColor(1,0.3f,0.3f,0.9f);
 
 		mpFont->Draw(cVector3f(fX+1, fY+1, fZ+1),vFontSize,cColor(0,0,0,0.7f),eFontAlign_Left,_W("%ls"),sName.c_str());
 		mpFont->Draw(cVector3f(fX, fY, fZ+2),vFontSize,col,eFontAlign_Left,_W("%ls"),sName.c_str());
 
 		mpGfxDrawer->DrawGfxObject(mpGfxPartyBar,
-									cVector3f(fX + kBarX - 1, fY + 4 - 1, fZ),
+									cVector3f(fX + fBarX - 1, fY + 4 - 1, fZ),
 									cVector2f(kBarW + 2, kBarH + 2), cColor(0,0,0,0.6f));
 		if(fPercent > 0)
 		{
 			mpGfxDrawer->DrawGfxObject(mpGfxPartyBar,
-										cVector3f(fX + kBarX, fY + 4, fZ+1),
+										cVector3f(fX + fBarX, fY + 4, fZ+1),
 										cVector2f(kBarW * fPercent, kBarH),
 										cColor(1.0f-fPercent, fPercent, 0, 0.9f));
 		}
