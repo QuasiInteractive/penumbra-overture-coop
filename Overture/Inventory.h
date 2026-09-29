@@ -312,6 +312,17 @@ public:
 	void RemoveItem(cInventoryItem *apItem);
 	cInventoryItem *GetItem(const tString &asName);
 
+	/** Co-op: the multiplayer item rules are on (hosting, or a synced
+	    guest) — every discrete item can then be dragged out and dropped,
+	    weapons included. False offline: single-player keeps vanilla rules. */
+	bool NetItemRulesActive();
+	/** True if apItem is (still) one of the carried items. Pointer compare
+	    only — safe to call with a pointer that was already deleted. */
+	bool HasItem(cInventoryItem *apItem);
+	/** True if a carried item other than apIgnore drives hud model asHudName
+	    (case-insensitive; "" never matches). */
+	bool HasItemWithHudModel(const tString &asHudName, cInventoryItem *apIgnore=NULL);
+
 	void SetMousePos(const cVector2f &avPos);
 	void AddMousePos(const cVector2f &avRel);
 
@@ -394,6 +405,14 @@ private:
 	    a solid white 4x4 built from a bitmap, tinted per draw. */
 	cGfxObject *mpGfxPartyBar;
 	void DrawParty();
+
+	/** Co-op held-item safety (no-op unless NetItemRulesActive()):
+	    NetReleaseHeldItem runs in RemoveItem BEFORE apItem is deleted and
+	    takes the player out of the weapon / throw / use-item state that item
+	    drives; NetCheckHeldItems is the per-frame backstop (Update) for a
+	    weapon / throw / use-item state whose item is gone by any other path. */
+	void NetReleaseHeldItem(cInventoryItem *apItem);
+	void NetCheckHeldItems();
 
 	tGameItemTypeVec mvItemTypes;
 
