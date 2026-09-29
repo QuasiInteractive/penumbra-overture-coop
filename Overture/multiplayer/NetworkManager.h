@@ -128,6 +128,9 @@ public:
 
 	/** Host lobby UI: guests currently on the socket. */
 	int GetConnectedGuestCount() const;
+	/** Host lobby UI: multiplayer.cfg max_players (2..31, default 4), the
+	    same value discovery pongs / the master listing advertise. */
+	uint8_t GetMaxPlayers() const { return mlMaxPlayers; }
 
 	/** Join screen UI: why the last join attempt died ("" = no failure).
 	    Cleared by the next JoinGame call. */
@@ -222,6 +225,14 @@ private:
 	bool mbLocalMapChangeArmed;     /**< we initiated one; ignore remote
 	    follows until our new map is up (else two doors at once SWAP maps) */
 	bool mbHavePendingMapChange;    /**< a follow is queued for a safe point */
+	bool mbPendingMapChangeDeferred; /**< guest: the queued follow arrived while
+	    our own transition was armed — kept, re-evaluated on our census frame
+	    (same map = discard, else follow: every MapChange a guest receives is
+	    the host's destination, see IsHostMapBusy) */
+	bool mbBeaconAfterTransition;   /**< host: a guest's MapChange was refused
+	    while we were mid-transition — beacon our map once we are settled */
+	float mfLocalMapChangeArmedAge; /**< seconds armed with no fade running and
+	    no census (failed load / same-map ChangeMap) — failsafe unarm at 5 s */
 	hpl::tString msPendingMap, msPendingPos;
 	hpl::tString msRemoteCurrentMap; /**< last map the party announced (kept
 	    after apply) — lets spawn-at-friend work even when a save-loaded host's
@@ -235,6 +246,11 @@ private:
 	void ApplyTakenItems();       /**< deactivate current-map matches */
 	void ApplyRemoteDrop(const cNetItemDrop &aDrop);
 	void ApplyPendingMapChange(); /**< runs the queued ChangeMap */
+	/** Host: armed, following, fading, or the current world's census not
+	    taken yet (incl. no world). A guest MapChange arriving then is refused
+	    (not applied, not relayed) and the beacon goes out once settled, so
+	    guests only ever receive the host's own destination. */
+	bool IsHostMapBusy() const;
 	void SendMapBeacon(struct _ENetPeer *apOnlyTo); /**< NULL = every guest */
 	void SendReliableEvent(const void *apData, size_t alLen); /**< host: all
 	    peers; guest: the server (which relays to other guests) */
@@ -253,8 +269,15 @@ private:
 	bool mbActionsRegistered;
 	hpl::tString msDeferredJoinAddress;
 
-	/** Mesh paths per remote PlayerID — from `ghost_models=a,b,c` or a single `ghost_model=a`. Index = (id-1) mod N. */
+	/** Character mesh per PlayerID, index = (id-1) mod N (host = 1). Built in
+	    Startup by ResolveGhostModels: `ghost_models=a,b,c` / `ghost_model=a`
+	    in cfg order minus files that do not resolve, else auto-discovered
+	    characters in multiplayer/models (sorted), else malik + phillip. */
 	std::vector<hpl::tString> mvGhostMeshPaths;
+	/** Startup, after multiplayer/models is a resource dir: finalise
+	    mvGhostMeshPaths (see above) and keep a per-mesh grounding list that
+	    matched the cfg list entry for entry aligned with it. */
+	void ResolveGhostModels();
 	/** Offset along Y from synced camera (eye) to mesh origin; depends on DAE pivot, not model “height in meters”.
 	    Retune when switching from placeholder props to ~1.75m-tall character meshes. */
 	float mfGhostMeshBodyYOffset;

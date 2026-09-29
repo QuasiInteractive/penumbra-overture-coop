@@ -3,10 +3,17 @@
 # join=HOST:PRT — auto-connect once a map is loaded
 # port=7777    — default listen / F10 localhost join port
 #
-# Remote-player body mesh — .dae files (+ their <name>_<clip>.dae siblings) in:
-#   multiplayer/models/malik.dae
-#   multiplayer/models/phillip.dae
-# PlayerID 1 (host) uses the first mesh, ID 2 the second — same order everywhere.
+# Remote-player characters — .dae files (+ their <name>_<clip>.dae siblings) in
+# multiplayer/models/. By DEFAULT (no ghost_models= line) every
+# <name>.dae there whose <name> has no '_' and that has at least one
+# <name>_<clip>.dae clip next to it (malik.dae + malik_idle.dae, ...) is a
+# character; they are sorted by name (case-insensitive) and PlayerID N uses
+# entry (N-1) mod count: host = 1st, first guest = 2nd, ... With four
+# characters a four-player lobby shows four different people. Adding one =
+# drop <name>.dae + <name>_*.dae (+ <name>.mat/.tga, <name>_clips.json) into
+# the folder on EVERY machine (the mapping is local: the same files on all
+# machines = the same character for the same player). hpl.log lists them:
+#   multiplayer: 2 character(s) (auto-discovered in multiplayer/models): malik.dae, phillip.dae
 #
 # v11: the wire carries the sender's FEET height and the shipped meshes have
 # their origin at the feet, so no grounding offset is needed any more.
@@ -29,8 +36,9 @@ player_name=
 #                 Empty / not set = "<player_name>'s game" ("Penumbra Server"
 #                 when there is no player_name either).
 # max_players=  — advertised in discovery pongs / master listing AND enforced at connect
-#                 (2..31, default 4): the (max_players)th player and later
-#                 are refused with "server full".
+#                 (2..31, default 4, host included): one more is refused
+#                 with "server full". The host lobby and the server browser
+#                 show "players/max" (e.g. 3/4).
 # server_name=Penumbra Server
 max_players=4
 port=7777
@@ -61,14 +69,20 @@ join_password=
 #   browser asks for the password when such a row is clicked.
 # master_server=
 public=0
-# Host (id 1) appears as malik.dae to others; client (id 2) phillip — more peers rotate.
-ghost_models=malik.dae,phillip.dae
-# Alternative: single mesh — ghost_model=foo.dae
+# ghost_models= pins the list and its ORDER instead of auto-discovery (see
+# the top of this file). Entries whose file does not exist are skipped (one
+# hpl.log line each), so a list naming four characters works before all four
+# are exported. Nothing left / nothing found = malik.dae, phillip.dae.
+# ghost_models=malik.dae,phillip.dae
+# Alternative: single mesh for everybody — ghost_model=foo.dae
 # ghost_body_y=0
 # ghost_body_y_crouch=0
 
-# Per-mesh grounding overrides (CSV, indexed like ghost_models — a rig whose
-# origin is NOT at its feet). Overrides ghost_body_y/_crouch per mesh.
+# Per-mesh grounding overrides (CSV, indexed like the FINAL character list —
+# ghost_models order, or the sorted auto-discovered order — for a rig whose
+# origin is NOT at its feet). A list with exactly one value per ghost_models
+# entry loses the values of skipped (missing) entries so it stays aligned.
+# Overrides ghost_body_y/_crouch per mesh.
 # More negative = mesh lower.
 # ghost_body_ys=0,0
 # ghost_body_ys_crouch=0,0
@@ -135,7 +149,7 @@ voice_open_mic=0
 #             game.cfg speeds so gait scaling + clip selection can be judged
 # One hpl.log line per change.
 # ghost_preview=0
-# ghost_preview_model=0 — which ghost_models entry the preview uses (0-based)
+# ghost_preview_model=0 — which character (final list, 0-based) the preview uses
 
 # ---- Windowed test instances (read by Init.cpp at startup) ----
 # force_windowed=1 overrides the Documents settings.cfg FullScreen setting for

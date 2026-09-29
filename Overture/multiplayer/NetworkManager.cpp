@@ -44,6 +44,7 @@ static void ScriptVarNetThunk(int alOp, const char* asName, int alVal)
 #include <cstring>
 #include <cmath>
 #include <ctime> /* v15: nonce seed */
+#include <algorithm> /* character discovery: std::sort */
 
 //======================================================================
 // Shared by the real and the stub build.
@@ -269,6 +270,9 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbApplyingRemoteMapChange(false)
 	  , mbLocalMapChangeArmed(false)
 	  , mbHavePendingMapChange(false)
+	  , mbPendingMapChangeDeferred(false)
+	  , mbBeaconAfterTransition(false)
+	  , mfLocalMapChangeArmedAge(0)
 	  , mfSendAccum(0)
 	  , mpWorld(NULL)
 	  , mlLocalPlayerId(0)
@@ -752,6 +756,113 @@ static void ParseCsvFloats(const char *src, std::vector<float> &out)
 	}
 }
 
+//-----------------------------------------------------------------------
+// Character slots (four-player lobbies).
+
+static const char *const kGhostModelDir = "multiplayer/models";
+
+/* ASCII-only lowercase: the discovered order (and so which player gets which
+   character) must be the same on every machine, whatever the C locale. */
+static tString GhostAsciiLower(const tString &asIn)
+{
+	tString s = asIn;
+	for (size_t i = 0; i < s.size(); ++i)
+		if (s[i] >= 'A' && s[i] <= 'Z')
+			s[i] = (char)(s[i] - 'A' + 'a');
+	return s;
+}
+
+/* Case-insensitive, byte-wise; exact bytes break ties so the order is total. */
+static bool GhostModelLess(const tString &a, const tString &b)
+{
+	const tString la = GhostAsciiLower(a), lb = GhostAsciiLower(b);
+	if (la != lb)
+		return la < lb;
+	return a < b;
+}
+
+/** Every <name>.dae in asDir whose <name> has no '_' and that has at least
+    one <name>_<clip>.dae sibling (idle, walk, ...), sorted case-insensitively.
+    Enumeration goes through the engine's own FindFilesInDir (_wfindfirst on
+    Windows, opendir on POSIX — impl/platform/*.cpp), the same call
+    AddResourceDir indexes the folder with. Both match the mask
+    case-insensitively; the extension is re-checked here anyway. */
+static void DiscoverGhostCharacters(hpl::cResources *apRes, const tString &asDir,
+	std::vector<tString> &avOut)
+{
+	avOut.clear();
+	if (apRes == NULL || apRes->GetLowLevel() == NULL)
+		return;
+	tWStringList lstFiles;
+	apRes->GetLowLevel()->FindFilesInDir(lstFiles, cString::To16Char(asDir), _W("*.dae"));
+
+	std::vector<tString> vDae;   /* original file names */
+	std::set<tString> setStems;  /* lowercase stems, for the sibling test */
+	for (tWStringListIt it = lstFiles.begin(); it != lstFiles.end(); ++it)
+	{
+		const tString sFile = cString::To8Char(*it);
+		const tString sLow = GhostAsciiLower(sFile);
+		if (sLow.size() <= 4 || sLow.compare(sLow.size() - 4, 4, ".dae") != 0)
+			continue;
+		vDae.push_back(sFile);
+		setStems.insert(sLow.substr(0, sLow.size() - 4));
+	}
+
+	for (size_t i = 0; i < vDae.size(); ++i)
+	{
+		const tString sLow = GhostAsciiLower(vDae[i]);
+		const tString sStem = sLow.substr(0, sLow.size() - 4);
+		if (sStem.find('_') != tString::npos)
+			continue; /* a clip (malik_idle) or not a character name */
+		const tString sPrefix = sStem + "_";
+		std::set<tString>::const_iterator sib = setStems.lower_bound(sPrefix);
+		if (sib == setStems.end() || sib->compare(0, sPrefix.size(), sPrefix) != 0)
+			continue; /* a lone mesh with no clips is a prop, not a character */
+		avOut.push_back(vDae[i]);
+	}
+	std::sort(avOut.begin(), avOut.end(), GhostModelLess);
+	/* Malik.dae + malik.dae (only possible on a case-sensitive file system)
+	   would be the same resource for the case-insensitive file searcher:
+	   keep the first. */
+	std::vector<tString> vUnique;
+	for (size_t i = 0; i < avOut.size(); ++i)
+		if (vUnique.empty() || GhostAsciiLower(vUnique.back()) != GhostAsciiLower(avOut[i]))
+			vUnique.push_back(avOut[i]);
+	avOut.swap(vUnique);
+}
+
+/** Does the mesh manager find this name? Same lookup as
+    cMeshManager::CreateMesh: the file searcher, with every supported mesh
+    extension tried when the name has none. */
+static bool GhostModelResolves(hpl::cResources *apRes, const tString &asName)
+{
+	if (apRes == NULL || apRes->GetFileSearcher() == NULL)
+		return false;
+	hpl::cFileSearcher *pSearcher = apRes->GetFileSearcher();
+	if (cString::GetFileExt(asName) != "")
+		return pSearcher->GetFilePath(asName) != "";
+	tStringVec *pTypes = apRes->GetMeshLoaderHandler() ?
+		apRes->GetMeshLoaderHandler()->GetSupportedTypes() : NULL;
+	if (pTypes == NULL)
+		return false;
+	for (size_t i = 0; i < pTypes->size(); ++i)
+		if (pSearcher->GetFilePath(cString::SetFileExt(asName, (*pTypes)[i])) != "")
+			return true;
+	return false;
+}
+
+static tString GhostModelListText(const std::vector<tString> &avList)
+{
+	tString s;
+	for (size_t i = 0; i < avList.size(); ++i)
+	{
+		if (i)
+			s += ", ";
+		s += avList[i];
+	}
+	return s;
+}
+
 /** Reliable = channel 0 (control), else channel 1 unsequenced (streams). */
 static void SendStructToPeer(ENetPeer *apPeer, const void *apData, size_t alLen, bool abReliable)
 {
@@ -863,6 +974,9 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbApplyingRemoteMapChange(false)
 	  , mbLocalMapChangeArmed(false)
 	  , mbHavePendingMapChange(false)
+	  , mbPendingMapChangeDeferred(false)
+	  , mbBeaconAfterTransition(false)
+	  , mfLocalMapChangeArmedAge(0)
 	  , mfSendAccum(0)
 	  , mpWorld(NULL)
 	  , mlLocalPlayerId(0)
@@ -989,6 +1103,9 @@ void cNetworkManager::RegisterInputActions()
    join_password=secret          (presented on join; the browser prompts too)
 
    Peer PlayerID picks mesh as index (id-1) modulo list length — id 1 => first .dae, id 2 => second.
+   Without ghost_models/ghost_model every multiplayer/models/<name>.dae with no
+   '_' in <name> and at least one <name>_<clip>.dae sibling is a character,
+   sorted case-insensitively (ResolveGhostModels, run from Startup).
 */
 void cNetworkManager::TryLoadMultiplayerCfg()
 {
@@ -1163,22 +1280,86 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 	}
 }
 
+void cNetworkManager::ResolveGhostModels()
+{
+	hpl::cResources *pRes = (mpInit && mpInit->mpGame) ? mpInit->mpGame->GetResources() : NULL;
+	const char *szSource = "multiplayer.cfg ghost_models";
+
+	if (mvGhostMeshPaths.empty() == false)
+	{
+		/* cfg order, minus what does not exist yet — a cfg naming four
+		   characters works before all four are exported. A per-mesh
+		   grounding list written entry-for-entry against the cfg list loses
+		   the same entries so it stays aligned; a shorter one keeps its
+		   modulo meaning. */
+		const size_t lCfgCount = mvGhostMeshPaths.size();
+		const bool bTrimStand = (mvGhostBodyYList.size() == lCfgCount);
+		const bool bTrimCrouch = (mvGhostBodyYCrouchList.size() == lCfgCount);
+		std::vector<tString> vKeep;
+		std::vector<float> vStand, vCrouch;
+		for (size_t i = 0; i < lCfgCount; ++i)
+		{
+			if (pRes && !GhostModelResolves(pRes, mvGhostMeshPaths[i]))
+			{
+				Log(" multiplayer: ghost_models entry %u '%s' not found - skipped\n",
+					(unsigned)i, mvGhostMeshPaths[i].c_str());
+				continue;
+			}
+			vKeep.push_back(mvGhostMeshPaths[i]);
+			if (bTrimStand)
+				vStand.push_back(mvGhostBodyYList[i]);
+			if (bTrimCrouch)
+				vCrouch.push_back(mvGhostBodyYCrouchList[i]);
+		}
+		if (vKeep.size() != lCfgCount)
+		{
+			if (bTrimStand)
+				mvGhostBodyYList.swap(vStand);
+			if (bTrimCrouch)
+				mvGhostBodyYCrouchList.swap(vCrouch);
+		}
+		mvGhostMeshPaths.swap(vKeep);
+		if (mvGhostMeshPaths.empty())
+			Log(" multiplayer: no ghost_models entry resolves - looking in %s instead\n", kGhostModelDir);
+	}
+
+	if (mvGhostMeshPaths.empty())
+	{
+		/* No cfg list (the default): every character in the folder, so a new
+		   character is added by dropping <name>.dae + its <name>_*.dae clips
+		   there. ghost_body_ys then index this sorted list. */
+		DiscoverGhostCharacters(pRes, kGhostModelDir, mvGhostMeshPaths);
+		szSource = "auto-discovered in multiplayer/models";
+	}
+
+	if (mvGhostMeshPaths.empty())
+	{
+		/* Nothing found either (folder missing / not installed): the shipped
+		   pair, as before — a missing mesh leaves the marker light only. */
+		mvGhostMeshPaths.push_back("malik.dae");
+		mvGhostMeshPaths.push_back("phillip.dae");
+		szSource = "built-in default";
+	}
+
+	Log(" multiplayer: %u character(s) (%s): %s — player N uses entry (N-1) mod %u\n",
+		(unsigned)mvGhostMeshPaths.size(), szSource,
+		GhostModelListText(mvGhostMeshPaths).c_str(), (unsigned)mvGhostMeshPaths.size());
+	if (mvGhostMeshPaths.size() < 4)
+		Log(" multiplayer: fewer than 4 characters - in a 4-player lobby some players share a model\n");
+}
+
 void cNetworkManager::Startup()
 {
 	RegisterInputActions();
 	TryLoadMultiplayerCfg();
-	/* No cfg (fresh install from the zip): default to the SHIPPED models —
-	   otherwise remote players have no mesh at all and render as nothing but
-	   their marker light. Offsets stay AUTO: the 2026-07-18 exports have
-	   their origin exactly at the feet. */
-	if (mvGhostMeshPaths.empty())
-	{
-		mvGhostMeshPaths.push_back("malik.dae");
-		mvGhostMeshPaths.push_back("phillip.dae");
-	}
-	/* Relative to cwd (folder with overture.exe). Drop survivor1.dae / survivor2.dae here — see multiplayer.cfg.example. */
+	/* Relative to cwd (folder with overture.exe). Character meshes + their
+	   <name>_<clip>.dae clips live here — see multiplayer.cfg.example. */
 	if (mpInit && mpInit->mpGame && mpInit->mpGame->GetResources())
 		mpInit->mpGame->GetResources()->AddResourceDir("multiplayer/models");
+	/* Characters: the cfg list (entries that resolve), else every character
+	   found in multiplayer/models, else the shipped pair. Offsets stay AUTO:
+	   the exports have their origin exactly at the feet. */
+	ResolveGhostModels();
 	/* Remote grabs use the same feel constants as the local grab state. */
 	if (mpInit && mpInit->mpGameConfig)
 		mpBodySync->SetGrabTuning(
@@ -2186,6 +2367,17 @@ void cNetworkManager::Service(int timeoutMs)
 					   the packet), relayed unsequenced to the other guests */
 					RelayVoice(ev.peer, author, pk->data, (size_t)pk->dataLength);
 				}
+				else if (author >= 2 && lFirst == eNetPacketType_MapChange && IsHostMapBusy())
+				{
+					/* Host wins: we are armed, following, fading or not
+					   settled on a world yet. Neither applied nor relayed,
+					   so every MapChange a guest receives is where the HOST
+					   goes; the requester, still mid-transition, defers the
+					   host's announcement/beacon and follows it on landing. */
+					Log(" multiplayer: guest %u level transition refused - host is mid-transition (beacon follows once settled)\n",
+						(unsigned)author);
+					mbBeaconAfterTransition = true;
+				}
 				else if (author >= 2 && (lFirst == eNetPacketType_MapChange ||
 					lFirst == eNetPacketType_ItemPickup ||
 					lFirst == eNetPacketType_ItemDrop ||
@@ -2274,7 +2466,10 @@ void cNetworkManager::HostGame(uint16_t alPort)
 	mbHosting = true;
 	mlLocalPlayerId = 1;
 	mbHavePendingMapChange = false;
+	mbPendingMapChangeDeferred = false;
+	mbBeaconAfterTransition = false;
 	mbLocalMapChangeArmed = false;
+	mfLocalMapChangeArmedAge = 0;
 	m_setTakenItems.clear(); /* one-of-each bookkeeping is per session */
 	m_setPartyItems.clear();
 	mlNextGuestId = 2;
@@ -2677,7 +2872,16 @@ void cNetworkManager::NetOnLocalMapChange(const hpl::tString &asMap, const hpl::
 		return;
 	if (!mpImpl || !mpImpl->mpHost)
 		return;
-	mbLocalMapChangeArmed = true; /* our own transition wins until it lands */
+	/* A ChangeMap onto the map we already stand on only moves us to another
+	   start: cMapHandler::Load skips the world load, so no census frame would
+	   ever unarm us and every later follow would be deferred forever. Such a
+	   call never arms, and it cancels an earlier arm (its fade retargeted
+	   the pending transition to this map). */
+	const bool bSameMap = mpInit && mpInit->mpMapHandler &&
+		cString::ToLowerCase(cString::SetFileExt(asMap, "")) ==
+		cString::ToLowerCase(cString::SetFileExt(mpInit->mpMapHandler->GetCurrentMapName(), ""));
+	mbLocalMapChangeArmed = !bSameMap; /* our own transition wins until it lands */
+	mfLocalMapChangeArmedAge = 0;
 	cNetMapChange pkt;
 	memset(&pkt, 0, sizeof(pkt));
 	pkt.mType = eNetPacketType_MapChange;
@@ -2801,13 +3005,67 @@ void cNetworkManager::ApplyTakenItems()
 	}
 }
 
+bool cNetworkManager::IsHostMapBusy() const
+{
+	if (mbLocalMapChangeArmed || mbHavePendingMapChange)
+		return true;
+	if (!mpInit || !mpInit->mpMapHandler)
+		return true;
+	if (mpInit->mpMapHandler->IsChangingMap() || mpInit->mpMapHandler->GetCurrentMapName().empty())
+		return true;
+	/* world loaded but its census (and with it our beacon) not out yet */
+	return mpBodySync == NULL || !mpBodySync->HasCensus();
+}
+
 void cNetworkManager::ApplyPendingMapChange()
 {
 	if (!mbHavePendingMapChange || !mpInit || !mpInit->mpMapHandler)
 		return;
-	mbHavePendingMapChange = false;
-	if (mbLocalMapChangeArmed) /* we are mid-transition ourselves; ours wins */
+	if (mbLocalMapChangeArmed)
+	{
+		/* We are mid-transition ourselves. With 3-4 players two doors at
+		   once are likely, so the request is not thrown away:
+		   - host: host wins. Guest requests are normally refused before
+		     they get here (IsHostMapBusy in Service); one queued in the same
+		     frame we armed is dropped and the census-frame beacon tells
+		     everybody where we went.
+		   - guest: every MapChange we receive is the host's destination
+		     (the host refuses guest requests while it is busy and never
+		     relays a refused one), so keep the newest and re-evaluate on
+		     our census frame: same map = discard, else follow. Following
+		     never re-announces (mbApplyingRemoteMapChange), so this cannot
+		     loop. */
+		if (mbHosting)
+		{
+			Log(" multiplayer: guest level transition to '%s' ignored - host is mid-transition (host wins)\n",
+				msPendingMap.c_str());
+			mbHavePendingMapChange = false;
+			mbBeaconAfterTransition = true;
+		}
+		else if (!mbPendingMapChangeDeferred)
+		{
+			Log(" multiplayer: party transition to '%s' deferred until our own transition lands\n",
+				msPendingMap.c_str());
+			mbPendingMapChangeDeferred = true;
+		}
 		return;
+	}
+	mbHavePendingMapChange = false;
+	if (mbPendingMapChangeDeferred)
+	{
+		mbPendingMapChangeDeferred = false;
+		const tString sHere = cString::ToLowerCase(
+			cString::SetFileExt(mpInit->mpMapHandler->GetCurrentMapName(), ""));
+		const tString sThere = cString::ToLowerCase(cString::SetFileExt(msPendingMap, ""));
+		if (sHere == sThere)
+		{
+			Log(" multiplayer: deferred party transition to '%s' discarded - we landed there ourselves\n",
+				msPendingMap.c_str());
+			return;
+		}
+		Log(" multiplayer: our transition landed on '%s' but the host is heading to '%s' - following\n",
+			mpInit->mpMapHandler->GetCurrentMapName().c_str(), msPendingMap.c_str());
+	}
 
 	/* Parked in the main menu with no world (joined from the lobby): perform
 	   the same launch the join screen's manual button does, straight into the
@@ -2904,7 +3162,10 @@ void cNetworkManager::JoinGame(const char *aszHostPort)
 	mlGuestViolationsLogged = 0; /* v15: log-once per connection */
 	msJoinFailReason = "";
 	mbHavePendingMapChange = false;
+	mbPendingMapChangeDeferred = false;
+	mbBeaconAfterTransition = false;
 	mbLocalMapChangeArmed = false;
+	mfLocalMapChangeArmedAge = 0;
 	m_setTakenItems.clear(); /* one-of-each bookkeeping is per session */
 	m_setPartyItems.clear();
 	mlLocalPlayerId = 0;
@@ -3006,25 +3267,61 @@ void cNetworkManager::Update(float afTimeStep)
 	   every connected peer (a guest self-verifies against the host's inside). */
 	ApplyPendingMapChange(); /* party follow runs at this safe point */
 
+	/* Failsafe: armed, no fade running and still no census after 5 s means
+	   the transition never produced a new world (failed load, a same-map
+	   retarget the arm check could not see) — unarm, or every follow would
+	   be deferred for the rest of the session. */
+	if (mbLocalMapChangeArmed && mpInit->mpMapHandler && !mpInit->mpMapHandler->IsChangingMap())
+	{
+		mfLocalMapChangeArmedAge += afTimeStep;
+		if (mfLocalMapChangeArmedAge > 5.0f)
+		{
+			Log(" multiplayer: own level transition never landed on a new world - unarmed\n");
+			mbLocalMapChangeArmed = false;
+			mfLocalMapChangeArmedAge = 0;
+		}
+	}
+	else
+		mfLocalMapChangeArmedAge = 0;
+
 	if (mpBodySync->Update(mpWorld))
 	{
 		if (mbHosting)
 		{
 			SendCensus(NULL);
 			SendMapBeacon(NULL); /* save loads/new games never call ChangeMap */
+			mbBeaconAfterTransition = false; /* that was it */
 		}
 		/* The new map is up: our own transition (if any) has landed, and any
 		   items a friend pocketed while we were elsewhere vanish before the
 		   fade-in shows them. */
 		mbLocalMapChangeArmed = false;
+		mfLocalMapChangeArmedAge = 0;
 		ApplyTakenItems();
+		/* A party transition that arrived while ours was in flight is
+		   re-evaluated now (same map = discarded, else we follow the host).
+		   Following starts a fade to another world: do not ask the host for
+		   the state of this one, the next census frame asks for that one. */
+		bool bLeavingAgain = false;
+		if (mbHavePendingMapChange && mbPendingMapChangeDeferred)
+		{
+			ApplyPendingMapChange();
+			bLeavingAgain = mpInit->mpMapHandler && mpInit->mpMapHandler->IsChangingMap();
+		}
 		/* v14 hook 1: our census for a NEW world is in and the host's is
 		   already known (menu launch via beacon, a followed MapChange, our
 		   own save reload) — ask the host for this world's state. Runs one
 		   frame after the load, i.e. after OnStart/OnLoad/PreUpdate, which
 		   is exactly what the host's state must overwrite. */
-		if (!mbHosting && mpBodySync->HasRemoteCensus())
+		if (!mbHosting && !bLeavingAgain && mpBodySync->HasRemoteCensus())
 			SendMapReady();
+	}
+	else if (mbHosting && mbBeaconAfterTransition && !IsHostMapBusy())
+	{
+		/* a refused guest request while we were busy without a new world
+		   (same-map retarget, a fade that ended where it started) */
+		mbBeaconAfterTransition = false;
+		SendMapBeacon(NULL);
 	}
 
 	/* v14: a snapshot whose End never comes (host died mid-send) must not
@@ -4306,9 +4603,10 @@ int cNetworkManager::SendBodySnapshot(ENetPeer *apPeer, size_t *apBytesOut)
 	if (!mbHosting || !apPeer || apPeer->state != ENET_PEER_STATE_CONNECTED)
 		return 0;
 	/* Every replicable body, resting ones flagged Sleeping (the guest pins
-	   those and disables the twin); primes m_mapSent so the delta path does
-	   not resend what this just carried. Reliable ch0: ordered with the
-	   snapshot sections around it. */
+	   those and disables the twin). Read-only for the shared delta
+	   bookkeeping (BodySync m_mapSent): priming it for this one peer used to
+	   swallow the awake->asleep rest pose of the OTHER connected guests.
+	   Reliable ch0: ordered with the snapshot sections around it. */
 	unsigned char aSnapBuf[cBodySync::kMaxBatchBytes];
 	uint32_t lCursor = 0;
 	int lChunks = 0;

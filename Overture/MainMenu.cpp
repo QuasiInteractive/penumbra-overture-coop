@@ -3192,8 +3192,11 @@ void cMainMenu::Update(float afTimeStep)
 			tString lh = "Listening on UDP port ";
 			lh += cString::ToString((int)mpInit->mpNetworkManager->GetDefaultPort());
 			const int lFriends = mpInit->mpNetworkManager->GetConnectedGuestCount();
-			lh += lFriends == 1 ? ".   1 friend connected" :
-				(".   " + cString::ToString(lFriends) + " friends connected");
+			/* "Players n/max" — the same n/max the server browser shows */
+			lh += ".   Players " + cString::ToString(lFriends + 1) + "/" +
+				cString::ToString((int)mpInit->mpNetworkManager->GetMaxPlayers());
+			lh += lFriends == 1 ? " (1 friend connected)" :
+				(" (" + cString::ToString(lFriends) + " friends connected)");
 			const tWString wlh = cString::To16Char(lh);
 			if (gpMulHostFoot->msText != wlh)
 			{
@@ -3980,7 +3983,7 @@ void cMainMenu::CreateWidgets()
 		{
 			tString lh = "Listening on UDP port ";
 			lh += cString::ToString((int)defPort);
-			lh += ". Tell your friend HOST:";
+			lh += ". Tell your friends HOST:";
 			lh += portBuf;
 			gpMulHostFoot = hplNew(cMainMenuWidget_Text,(mpInit, vPos, cString::To16Char(lh), 14,
 														 eFontAlign_Center));

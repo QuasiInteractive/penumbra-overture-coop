@@ -1328,7 +1328,11 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 		uint8_t lId; bool bGhost; bool bCrouch;
 		float fDist; bool bSeen;
 	};
-	cSeeCand vCands[8];
+	/* local player + every ghost: enet_host_create is sized for 31 peers
+	   (max_players 2..31), so 32 never truncates a lobby — 8 silently left
+	   ghosts 8+ out of every sight check */
+	enum { kMaxSeeCands = 32 };
+	cSeeCand vCands[kMaxSeeCands];
 	int lCands = 0;
 
 	if(mpInit->mpPlayer->IsDead()==false)
@@ -1347,7 +1351,7 @@ void iGameEnemy::UpdateCheckForPlayer(float afTimeStep)
 	{
 		std::vector<std::pair<uint8_t, cVector3f> > vGhosts;
 		mpInit->mpNetworkManager->GetGhostCamPositions(vGhosts);
-		for(size_t g=0; g<vGhosts.size() && lCands<8; ++g)
+		for(size_t g=0; g<vGhosts.size() && lCands<kMaxSeeCands; ++g)
 		{
 			//v12: a dead guest is skipped exactly like the dead local player
 			//above — never a sight candidate, so no enemy locks onto a corpse.

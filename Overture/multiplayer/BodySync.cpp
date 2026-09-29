@@ -381,13 +381,16 @@ size_t cBodySync::BuildSnapshotChunk(unsigned char *apBuf, uint32_t *apCursor)
 		memcpy(apBuf + sizeof(cNetObjectStateBatch) + (size_t)lCount * sizeof(cNetObjectState),
 			&st, sizeof(st));
 
-		/* Prime the send record so the delta path doesn't immediately resend
-		   what the snapshot just carried (and no phantom sleep edge either). */
-		cSendRecord &rec = m_mapSent[lHash];
-		rec.mvPos = vPos;
-		rec.mqRot = qRot;
-		rec.mbEverSent = true;
-		rec.mbWasEnabled = bEnabled;
+		/* READ-ONLY with respect to m_mapSent. The send records are the
+		   delta bookkeeping of the stream EVERY guest receives; this chunk
+		   goes to ONE peer (a MapReady joiner). Priming them here (as up to
+		   v16 did) overwrote mbWasEnabled of a body that fell asleep since
+		   the last batch, so the reliable awake->asleep rest pose never went
+		   out to the guests that were ALREADY connected — every 3rd/4th
+		   player joining cost the others their rest poses. The price of not
+		   priming is at most one redundant unreliable state per awake body
+		   for the joiner; a missing record defaults to "was asleep, never
+		   sent", which cannot fake a sleep edge either. */
 
 		*apCursor = lHash;
 		++lCount;

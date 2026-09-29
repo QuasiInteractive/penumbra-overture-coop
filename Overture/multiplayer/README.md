@@ -16,7 +16,7 @@ All dedicated multiplayer source lives in this folder. Work here first; game glu
 | `VoiceChat.h` / `.cpp` | v16 proximity voice chat: OpenAL capture (push-to-talk / level-gated open mic) -> Opus 16 kHz 20 ms frames -> `cNetVoice` packets; per-remote-player Opus decoder + OpenAL streaming source at the ghost's head with a 3-packet jitter buffer, PLC and inverse-distance gain. Raw `<AL/al.h>` on the engine's context; stubbed without `PENUMBRA_VOICE`. |
 | `multiplayer.cfg.example` | Copy next to `overture.exe` as `multiplayer.cfg`. |
 | `tools/syntax_check.sh` + `tools/syntax_stubs/` | Linux `g++ -fsyntax-only` harness with fake third-party headers (enet, Newton, AngelScript, GL, SDL, opus, AL) — `--no-voice` / `--no-mp` check the stub halves. |
-| `models/` | Ghost `.dae` meshes + `<name>_<clip>.dae` clips + `<name>_clips.json` (gait table); runtime resource dir is `multiplayer/models` (cwd = exe folder). |
+| `models/` | Ghost `.dae` meshes + `<name>_<clip>.dae` clips + `<name>_clips.json` (gait table); runtime resource dir is `multiplayer/models` (cwd = exe folder). Every `<name>.dae` (no `_`) with clips here is a player character (see 'Characters'). |
 
 Build flag: `PENUMBRA_MULTIPLAYER` (CMake option, default ON when vcpkg `enet` is found). Without it, `NetworkManager` is a stub.
 
@@ -120,6 +120,71 @@ if everybody else died or left meanwhile the vanilla death menu opens; if a
 living member has no position yet (between maps) it waits up to 15 s, then
 gives up to the death menu. Offline the code path is the original two
 lines — single-player is unchanged.
+
+## Characters (four-player lobbies)
+
+Every player is drawn with the character of its slot: PlayerID N uses entry
+`(N-1) mod count` of the character list (host = 1st, guests 2nd, 3rd, 4th in
+join order; ids of departed guests are reused). `cNetworkManager::
+ResolveGhostModels` (called from `Startup`, right after `multiplayer/models`
+became a resource dir) builds that list once:
+
+1. **`ghost_models=a.dae,b.dae,...`** (or `ghost_model=x.dae`) in
+   `multiplayer.cfg`: that order, minus entries the engine's file searcher
+   cannot resolve (same lookup `cMeshManager::CreateMesh` uses; one
+   `ghost_models entry N 'x.dae' not found - skipped` line each) — a cfg
+   naming four characters works before all four are exported.
+2. **Otherwise (the shipped default): auto-discovery.** Every
+   `multiplayer/models/<name>.dae` whose `<name>` contains no `_` and that
+   has at least one `<name>_<clip>.dae` sibling (`malik.dae` +
+   `malik_idle.dae`, ...) is a character. Files are enumerated with the
+   engine's `iLowLevelResources::FindFilesInDir` (`_wfindfirst` on Windows,
+   `opendir` elsewhere) and sorted by an ASCII-lowercase compare (exact
+   bytes break ties; case-only duplicates collapse), so the order does not
+   depend on the file system or the C locale. A lone `.dae` without clips
+   (a prop) is ignored.
+3. **Still empty** (folder missing): `malik.dae`, `phillip.dae` as before.
+
+hpl.log: `multiplayer: N character(s) (<source>): a.dae, b.dae, ... — player
+N uses entry (N-1) mod N`, plus a warning when fewer than four exist (some
+players then share a model). **Adding a character** = export
+`<name>.dae` + its `<name>_<clip>.dae` clips (+ `.mat`/`.tga`,
+`<name>_clips.json`) into `multiplayer/models/` on **every** machine: the
+mapping is computed locally, so all machines need the same set to agree on
+who looks like whom (nothing about it travels on the wire). A mesh that fails
+to load still leaves that player as the marker light only.
+
+`ghost_body_ys` / `ghost_body_ys_crouch` index the final list (a cfg list
+with exactly one value per `ghost_models` entry drops the values of skipped
+entries so it stays aligned; shorter lists keep their modulo meaning).
+`ghost_preview_model` indexes the final list too.
+
+### More than two players
+
+- **Map transitions.** Two doors at once are likely with four players. A
+  guest whose own transition is armed no longer drops a party `MapChange`:
+  it keeps the newest one and re-evaluates it on its census frame (landed on
+  the same map = discarded, else it follows). The host wins every race: a
+  guest `MapChange` that arrives while the host is armed, following, fading,
+  or has no census for its current world yet (`IsHostMapBusy`) is neither
+  applied nor relayed (`guest N level transition refused - host is
+  mid-transition`), and the host re-beacons its map once settled (the census
+  frame always beacons). So every `MapChange` a guest receives is the host's
+  destination and the party converges on it; following never re-announces,
+  so nothing can loop. A `ChangeMap` onto the map we already stand on no
+  longer arms (it produced no census, so the arm stuck), and an arm with no
+  fade running and no census for 5 s is dropped (`own level transition never
+  landed on a new world - unarmed`).
+- **Body snapshot.** `cBodySync::BuildSnapshotChunk` (the MapReady joiner's
+  body poses) is read-only for the shared delta bookkeeping (`m_mapSent`).
+  It used to prime `mbWasEnabled`/last pose for everybody, which swallowed the
+  reliable awake->asleep rest pose for guests already connected whenever a
+  3rd/4th player joined.
+- **Enemy sight candidates** hold the local player + 31 ghosts (was 8).
+- Party panel, HUD bars, inventory party list, co-op respawn target, voice
+  streams and the name table are per-id maps/vectors with no player cap.
+- The host lobby shows `Players n/max` (`max_players`, default 4); the
+  browser rows already show `players/max`.
 
 ## World snapshot (v14: late join, reconnect, host save/load)
 
@@ -386,12 +451,12 @@ handshake), `cNetVoice` = 5 bytes, constants `kNetVoice*` in
 - **F9** — LAN/Hamachi discovery scan (~1.5s window; results logged, feed the server browser).
 - **V** (hold) — push-to-talk voice chat (v16); heard from your character's head, fading with distance.
 - **Menu** — Multiplayer → Host / Server browser (Internet · LAN) / Direct connect / Change name (asks for a username the first time).
-- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=` (enforced at CONNECT since v15), `server_password=` / `join_password=` (v15, see Security), `ghost_models=a.dae,b.dae`, `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `voice_enabled=1`, `voice_volume=1.0`, `voice_open_mic=0` (v16), `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`, `master_server=HOST:PORT`, `public=0|1` (internet browser, see 'Public servers'). See `multiplayer.cfg.example`.
+- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=` (enforced at CONNECT since v15), `server_password=` / `join_password=` (v15, see Security), `ghost_models=a.dae,b.dae` (optional: without it the characters in `multiplayer/models` are auto-discovered, see 'Characters'), `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `voice_enabled=1`, `voice_volume=1.0`, `voice_open_mic=0` (v16), `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`, `master_server=HOST:PORT`, `public=0|1` (internet browser, see 'Public servers'). See `multiplayer.cfg.example`.
 
 ### Ghost preview (offline animation check)
 
 `ghost_preview=1` spawns a local ghost (`ghost_preview_model` picks the
-`ghost_models` entry) 2 m in front of the player, facing them, feet on the
+character-list entry, 0-based) 2 m in front of the player, facing them, feet on the
 player's feet height, as soon as a map is up — no session needed. It is fed
 synthetic states through the same `ApplyState`/`Update` path as a network
 ghost, so interpolation, selection, crossfades and gait scaling are what a

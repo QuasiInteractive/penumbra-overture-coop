@@ -64,7 +64,9 @@ public:
 	/** Host, late-join snapshot: serialize the next up-to-kMaxStatesPerBatch
 	    bodies AFTER *apCursor regardless of movement, advancing the cursor.
 	    Start with *apCursor = 0 and loop until 0 is returned; send each chunk
-	    RELIABLY so the joiner starts from the host's exact current poses. */
+	    RELIABLY so the joiner starts from the host's exact current poses.
+	    Never touches the shared delta bookkeeping (m_mapSent): the snapshot
+	    goes to one peer, the delta stream (and its sleep edges) to all. */
 	size_t BuildSnapshotChunk(unsigned char *apBuf, uint32_t *apCursor);
 
 	/** Guest: ingest one received eNetPacketType_ObjectState payload.
