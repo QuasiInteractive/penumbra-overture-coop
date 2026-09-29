@@ -493,16 +493,19 @@ private:
 	    each accepted guest the lowest free slot (HostAcceptPeer), erased in
 	    DropRemotePlayer = freed. GUEST: copied from the host's name table. */
 	std::map<uint8_t, uint8_t> m_mapPlayerSlots;
-	uint32_t mlSlotWarned; /**< guest: bit per slot >= our character count already logged */
+	uint32_t mlSlotWarned; /**< guest: bit per slot >= our character count already logged; bit 31 also = v19 'host character not ours' logged */
 	/** Mesh list index for a ghost of alId: its slot, else (id-1). */
 	size_t GhostMeshIndexFor(uint8_t alId) const;
 	/** Host: lowest slot in 1..GetCharacterCount()-1 no entry uses,
 	    kNetCharacterUnknown when every slot is taken. */
 	uint8_t AllocCharacterSlot() const;
 	/** Guest: a table entry's slot arrived (kNetCharacterUnknown = forget).
+	    v19: asCharacter is the host's base name for it; when our list has
+	    that name the entry stores OUR index for it (lists may differ in
+	    order), otherwise the host's slot number (modulo on use).
 	    An existing ghost whose mesh index changes is deleted — the next
 	    state packet re-creates it with the right character (EnsureGhost). */
-	void OnPlayerSlotReceived(uint8_t alId, uint8_t alSlot);
+	void OnPlayerSlotReceived(uint8_t alId, uint8_t alSlot, const hpl::tString &asCharacter);
 	/** Ages the feed, drops dead lines. Called from Update (both builds). */
 	void UpdatePartyEvents(float afTimeStep);
 	/** A name for a remote id arrived (host: from the peer itself; guest:

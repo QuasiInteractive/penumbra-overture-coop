@@ -1307,18 +1307,24 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 	}
 }
 
-/* Character order for auto-discovered lists. Slot 0 is the HOST, and the
-   host always plays Philip (file phillip.dae), the game's main character; guests then get the
-   next free character in this order as they join. Characters not listed here
-   follow alphabetically; names missing from the folder are skipped. An
-   explicit ghost_models= in multiplayer.cfg keeps its own order instead.
-   v18: guests may pick another free character (character= / the menu's
-   'Character' line); the display names live in GetCharacterDisplayName. */
+/* Character order for EVERY list (v19: ghost_models= included). Slot 0 is
+   the HOST, and the host always plays Philip (file phillip.dae), the game's
+   main character; guests then get the next free character in this order as
+   they join. Characters not listed here follow in their previous order
+   (sorted for auto-discovery, cfg order for ghost_models=); names missing
+   from the list are skipped. v18: guests may pick another free character
+   (character= / the menu's 'Character' line); the display names live in
+   GetCharacterDisplayName. v19: an old ghost_models=malik.dae,phillip.dae
+   made the host Malik — the fixed order now wins over the cfg's. */
 static const char *const kGhostCharacterOrder[] = { "phillip", "fisherman", "red", "malik" };
 
-static void OrderGhostCharacters(std::vector<tString> &avPaths)
+/* Reorders avPaths into kGhostCharacterOrder; a per-mesh list of the SAME
+   length (ghost_body_ys written entry-for-entry) is permuted with it, a
+   shorter one keeps its modulo meaning. Returns true when anything moved. */
+static bool OrderGhostCharacters(std::vector<tString> &avPaths, std::vector<float> *apStand = NULL,
+	std::vector<float> *apCrouch = NULL)
 {
-	std::vector<tString> vOut;
+	std::vector<size_t> vOrder;
 	std::vector<bool> vUsed(avPaths.size(), false);
 	for (size_t o = 0; o < sizeof(kGhostCharacterOrder) / sizeof(kGhostCharacterOrder[0]); ++o)
 	{
@@ -1329,16 +1335,40 @@ static void OrderGhostCharacters(std::vector<tString> &avPaths)
 			tString sBase = cString::ToLowerCase(cString::SetFileExt(cString::GetFileName(avPaths[i]), ""));
 			if (sBase == kGhostCharacterOrder[o])
 			{
-				vOut.push_back(avPaths[i]);
+				vOrder.push_back(i);
 				vUsed[i] = true;
 				break;
 			}
 		}
 	}
-	for (size_t i = 0; i < avPaths.size(); ++i) /* the rest keep the sorted order */
+	for (size_t i = 0; i < avPaths.size(); ++i) /* the rest keep their order */
 		if (!vUsed[i])
-			vOut.push_back(avPaths[i]);
+			vOrder.push_back(i);
+
+	bool bMoved = false;
+	for (size_t i = 0; i < vOrder.size(); ++i)
+		bMoved = bMoved || (vOrder[i] != i);
+	if (!bMoved)
+		return false;
+	const size_t n = avPaths.size();
+	std::vector<tString> vOut;
+	std::vector<float> vStand, vCrouch;
+	const bool bStand = apStand && apStand->size() == n;
+	const bool bCrouch = apCrouch && apCrouch->size() == n;
+	for (size_t i = 0; i < n; ++i)
+	{
+		vOut.push_back(avPaths[vOrder[i]]);
+		if (bStand)
+			vStand.push_back((*apStand)[vOrder[i]]);
+		if (bCrouch)
+			vCrouch.push_back((*apCrouch)[vOrder[i]]);
+	}
 	avPaths.swap(vOut);
+	if (bStand)
+		apStand->swap(vStand);
+	if (bCrouch)
+		apCrouch->swap(vCrouch);
+	return true;
 }
 
 void cNetworkManager::ResolveGhostModels()
@@ -1380,6 +1410,9 @@ void cNetworkManager::ResolveGhostModels()
 				mvGhostBodyYCrouchList.swap(vCrouch);
 		}
 		mvGhostMeshPaths.swap(vKeep);
+		if (OrderGhostCharacters(mvGhostMeshPaths, &mvGhostBodyYList, &mvGhostBodyYCrouchList))
+			Log(" multiplayer: ghost_models reordered to the fixed character order "
+				"(phillip = the host first) - every machine must agree on who is who\n");
 		if (mvGhostMeshPaths.empty())
 			Log(" multiplayer: no ghost_models entry resolves - looking in %s instead\n", kGhostModelDir);
 	}
@@ -1829,7 +1862,11 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		if (!mbHosting && len >= sizeof(cNetPlayerName))
 		{
 			const cNetPlayerName *pn = (const cNetPlayerName *)data;
-			OnPlayerSlotReceived(pn->mPlayerID, pn->mCharacter); /* v17, ours included */
+			size_t lChar = 0; /* v19: bounded, the field need not end in NUL */
+			while (lChar < sizeof(pn->msCharacter) && pn->msCharacter[lChar] != '\0')
+				++lChar;
+			OnPlayerSlotReceived(pn->mPlayerID, pn->mCharacter, /* v17, ours included */
+				SanitizeCharacterName(hpl::tString(pn->msCharacter, lChar)));
 			OnPlayerNameReceived(pn->mPlayerID, pn->msName, sizeof(pn->msName));
 		}
 		return;
@@ -5541,7 +5578,7 @@ uint8_t cNetworkManager::AllocCharacterSlot() const
 	return kNetCharacterUnknown;
 }
 
-void cNetworkManager::OnPlayerSlotReceived(uint8_t alId, uint8_t alSlot)
+void cNetworkManager::OnPlayerSlotReceived(uint8_t alId, uint8_t alSlot, const hpl::tString &asCharacter)
 {
 	if (alId == 0 || alId == kPreviewGhostId || mbHosting)
 		return; /* the host's table is its own; never from the wire */
@@ -5556,6 +5593,26 @@ void cNetworkManager::OnPlayerSlotReceived(uint8_t alId, uint8_t alSlot)
 	}
 	else
 	{
+		/* v19: the host's NAME wins over its index — our list may be in
+		   another order (or lack characters), and an index into it would
+		   show the host as whoever sits at that position here */
+		bool bByName = false;
+		if (!asCharacter.empty())
+		{
+			const int lMine = FindCharacterIndex(asCharacter);
+			if (lMine >= 0 && lMine < (int)kNetMaxCharacterSlots)
+			{
+				alSlot = (uint8_t)lMine;
+				bByName = true;
+			}
+			else if ((mlSlotWarned & 0x80000000u) == 0)
+			{
+				mlSlotWarned |= 0x80000000u;
+				Log(" multiplayer: WARNING the host's character '%s' is not in our multiplayer/models - "
+					"copy the host's characters to this machine (showing slot %u instead)\n",
+					asCharacter.c_str(), (unsigned)alSlot);
+			}
+		}
 		const bool bHadSlot = (it != m_mapPlayerSlots.end());
 		const bool bChanged = (!bHadSlot || it->second != alSlot);
 		m_mapPlayerSlots[alId] = alSlot;
@@ -5568,7 +5625,7 @@ void cNetworkManager::OnPlayerSlotReceived(uint8_t alId, uint8_t alSlot)
 			(alId == mlLocalPlayerId || m_setJoinAnnounced.find(alId) != m_setJoinAnnounced.end()))
 			AddPartyEvent(GetPlayerName(alId) + " now plays " +
 				GetCharacterDisplayName(GetPlayerCharacterName(alId)));
-		if (lCount > 0 && alSlot >= lCount && (mlSlotWarned & (1u << alSlot)) == 0)
+		if (!bByName && lCount > 0 && alSlot >= lCount && (mlSlotWarned & (1u << alSlot)) == 0)
 		{
 			/* the host has more characters than we do: the lists differ,
 			   so this player shares a look with somebody here */
@@ -5649,6 +5706,14 @@ void cNetworkManager::SendNameTable(ENetPeer *apOnlyTo)
 		std::map<uint8_t, uint8_t>::const_iterator si = m_mapPlayerSlots.find(*id);
 		pkt.mCharacter = (si != m_mapPlayerSlots.end() && si->second < kNetMaxCharacterSlots) ?
 			si->second : kNetCharacterUnknown; /* v17 */
+		if (pkt.mCharacter != kNetCharacterUnknown && !mvGhostMeshPaths.empty())
+		{
+			/* v19: the name too — the receiver maps it into its own list */
+			const hpl::tString sChar = GetCharacterBaseName(pkt.mCharacter % mvGhostMeshPaths.size());
+			const size_t lc = sChar.size() < sizeof(pkt.msCharacter) ? sChar.size() : sizeof(pkt.msCharacter);
+			if (lc > 0)
+				memcpy(pkt.msCharacter, sChar.data(), lc);
+		}
 		if (apOnlyTo)
 			SendStructToPeer(apOnlyTo, &pkt, sizeof(pkt), true);
 		else
@@ -6776,9 +6841,15 @@ bool cNetworkManager::IsCharacterTakenByOther(const hpl::tString &asBase) const
 
 bool cNetworkManager::IsCharacterSelectable(size_t alIdx) const
 {
-	if (alIdx == 0 || alIdx >= mvGhostMeshPaths.size() || alIdx >= kNetMaxCharacterSlots)
-		return false; /* slot 0 is the host's; beyond the slot range never exists */
-	return !IsCharacterTakenByOther(GetCharacterBaseName(alIdx));
+	if (alIdx >= mvGhostMeshPaths.size() || alIdx >= kNetMaxCharacterSlots)
+		return false; /* beyond the slot range never exists */
+	/* Philip is the host's (slot 0 on the host). v19: by NAME — every list
+	   puts phillip first, but a machine without him has somebody else at
+	   0 who is a perfectly good guest character */
+	const hpl::tString sBase = GetCharacterBaseName(alIdx);
+	if (CharNameLowerAscii(sBase) == "phillip") /* kGhostCharacterOrder[0] (real build only) */
+		return false;
+	return !IsCharacterTakenByOther(sBase);
 }
 
 hpl::tString cNetworkManager::GetNextSelectableCharacter(const hpl::tString &asCurrent) const

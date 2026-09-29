@@ -32,7 +32,7 @@ writes, entity activation, door locks, item pickups/drops/consumption and
 breakable damage are replicated as reliable events; map changes move the
 whole party). Player state, bodies and enemies stream at **30 Hz**
 (`kNetSendPeriodSeconds`); every wire layout change bumps
-`kNetProtocolVersion` (currently **18**), and the connect handshake refuses
+`kNetProtocolVersion` (currently **19**), and the connect handshake refuses
 mismatched builds (then the v15 password challenge, see **Security**).
 
 Remote players are drawn as **ghosts** (`cGhostPlayer`): each `cNetPlayerState`
@@ -85,7 +85,7 @@ the Multiplayer screen edits it later, live sessions included).
 
 Wire: reliable `cNetPlayerName` (type **26**: id + `char[24]`, NUL-padded,
 not necessarily NUL-terminated — receivers scan bounded; v17 appends the
-`uint8_t mCharacter` slot, 27 B, see 'Characters'). A guest sends its
+`uint8_t mCharacter` slot, v19: + `msCharacter[24]` name, 51 B, see 'Characters'). A guest sends its
 name right after `PlayerJoin` (it knows its id then, and sends even an
 empty one so the host can announce the join); the host stores names per
 peer id (the id BYTE from a guest is ignored, the peer it came from is the
@@ -136,8 +136,11 @@ shipped list is ordered `phillip, fisherman, red, malik`
 characters follow alphabetically), so the host always plays Philip, the
 game's main character, and a guest without a preference gets The
 Fisherman, Red and Malik in join order; a player who leaves frees the
-character for the next joiner. An explicit `ghost_models=` keeps its own
-order. Since v18 a guest can pick (below).
+character for the next joiner. Since v19 an explicit `ghost_models=` is put
+in that same order too (per-entry `ghost_body_ys` move with it; hpl.log says
+`ghost_models reordered to the fixed character order`): an old
+`ghost_models=malik.dae,phillip.dae` made the host Malik. Since v18 a guest
+can pick (below).
 
 **Display names (v18).** Players never see file names:
 `cNetworkManager::GetCharacterDisplayName` maps `phillip` -> Philip,
@@ -210,10 +213,14 @@ itself — the host never reads it). The host fills it for every entry (its
 own = 0) and re-broadcasts the table on every join/leave/rename as before
 (v18: and on every accepted character request);
 `ValidateEventPacket` accepts `mCharacter < 32` or 255. Guests keep the slot
-per id (theirs included).
+per id (theirs included). **v19:** the entry also carries
+`msCharacter[24]`, the slot's file base name in the host's list (51 bytes
+now); a guest looks it up in its own list and stores ITS index for that
+character, so lists in another order still agree on who is who.
 
 **Model choice.** A ghost for PlayerID N draws `list[slot mod count]` on
-every machine (the sorted list is the same everywhere). A state packet can
+every machine, where a guest's slot is its own index of the host's
+character name (v19). A state packet can
 beat the table, so until the slot is known the ghost uses the old guess
 `(N-1) mod count`; when the slot arrives or changes and the guess was a
 different mesh, `OnPlayerSlotReceived` deletes the ghost and the next state
@@ -223,13 +230,11 @@ preview ghost keeps `ghost_preview_model`. `GetPlayerCharacterName(id)`
 ("fisherman") is shown in the party panel through its display name:
 `Deadl (The Fisherman)`, the host's line `Host (Philip) (host)`.
 
-**Every machine needs the same character files.** Only the slot travels
-in the name table, not the file name (the v18 request is by name, but the
-host answers with slots). A guest with fewer characters than the host logs
-`WARNING host assigned character slot N but we only have M character(s)` and
-falls back to `slot mod M` (that player then looks like somebody else on
-that machine only); a guest with a different set of the same size cannot
-tell and simply draws its own list's entry.
+**Every machine needs the same character files.** Since v19 the name
+travels with the slot, so a different ORDER is harmless; a guest that lacks
+the host's character logs `WARNING the host's character 'x' is not in our
+multiplayer/models` once and falls back to `slot mod M` (that player then
+looks like somebody else on that machine only).
 
 The list itself — `cNetworkManager::ResolveGhostModels` (called from
 `Startup`, right after `multiplayer/models` became a resource dir; cfg

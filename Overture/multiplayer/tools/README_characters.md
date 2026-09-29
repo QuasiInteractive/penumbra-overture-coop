@@ -263,7 +263,7 @@ every `<name>.dae` that has `<name>_*.dae` clips and orders them
 phillip, fisherman, red, malik first (`kGhostCharacterOrder` in
 `NetworkManager.cpp`; the host plays phillip), then any other name
 alphabetically. With a `ghost_models=`
-line, add the new file there. hpl.log prints the final list
+line, add the new file there (v19: the same fixed order is applied to it). hpl.log prints the final list
 (`multiplayer: N character(s) ...`). See `../README.md`, section
 "Characters". **Every** player must install the same model set, nothing is
 sent over the network.

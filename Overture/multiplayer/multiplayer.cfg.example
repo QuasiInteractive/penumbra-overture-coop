@@ -96,11 +96,11 @@ public=0
 # the top of this file). Entries whose file does not exist are skipped (one
 # hpl.log line each), so a list naming four characters works before all four
 # are exported. Nothing left / nothing found = phillip.dae, malik.dae.
-# v17: a ghost_models= list keeps ITS order (entry 1 = the host), no
-# phillip-first reordering. The host's list decides the player cap (one player per entry) and
-# the slots it hands out index it — use the SAME list (or none) on every
-# machine, or players look like different characters on different screens.
-# ghost_models=malik.dae,phillip.dae
+# v19: the list is put in the fixed order phillip, fisherman, red, malik
+# (others after, in cfg order) — the host is ALWAYS phillip when it is
+# listed. The host's list decides the player cap (one player per entry);
+# characters travel by name, but every machine still needs every file.
+# ghost_models=phillip.dae,malik.dae
 # ghost_model=foo.dae — a single character. v17: that means a SOLO host (one
 # player per character, nobody can join); only useful for ghost_preview.
 # ghost_body_y=0

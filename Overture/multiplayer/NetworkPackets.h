@@ -74,8 +74,17 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
         while connected. The host moves the requester to that slot if the
         character exists in ITS list, is not slot 0 (the host's) and is
         free, then re-broadcasts the name table; otherwise the request is
-        ignored and the table stays as it is. */
-static const uint16_t kNetProtocolVersion = 18;
+        ignored and the table stays as it is.
+    v19: characters by NAME on the wire too — cNetPlayerName grew
+        msCharacter (the file base name of that player's character, as the
+        HOST's list spells it). A receiver looks the name up in its own
+        list, so two machines whose lists differ in order or content still
+        show every player as the same character (v17/v18 sent only the
+        host's list index, and a guest with another order showed the host
+        as Malik). mCharacter stays as the fallback when the name is not in
+        the receiver's list. Every list is also put in the fixed character
+        order now (phillip first), ghost_models= included. */
+static const uint16_t kNetProtocolVersion = 19;
 
 
 /** v13: cNetPlayerName::msName capacity. A name is at most this many
@@ -362,13 +371,17 @@ struct cNetPlayerLeave
     receiver shows "Player <id>".
     v17: mCharacter = the host-assigned character slot of mPlayerID (index
     into the sorted character list, modulo its length on the receiver);
-    kNetCharacterUnknown from a guest (the host never reads it). */
+    kNetCharacterUnknown from a guest (the host never reads it).
+    v19: msCharacter = that slot's file base name in the HOST's list
+    ("fisherman"), NUL-padded like msName; empty from a guest or when the
+    player has no slot. Receivers prefer it over mCharacter. */
 struct cNetPlayerName
 {
 	uint8_t mType; /**< eNetPacketType_PlayerName */
 	uint8_t mPlayerID;
 	char msName[kNetPlayerNameMaxChars];
 	uint8_t mCharacter; /**< v17: slot, < kNetMaxCharacterSlots or kNetCharacterUnknown */
+	char msCharacter[kNetCharacterNameMaxChars]; /**< v19: base name, "" = unknown */
 };
 
 /** v18: guest -> host, "move me to this character". msCharacter is the
@@ -784,7 +797,7 @@ static inline void NetAuthDigest(const char *apPassword, size_t alPasswordLen,
 
 static_assert(sizeof(cNetPlayerJoin) == 2, "");
 static_assert(sizeof(cNetPlayerLeave) == 2, "");
-static_assert(sizeof(cNetPlayerName) == 27, ""); /* v13; v17: +mCharacter */
+static_assert(sizeof(cNetPlayerName) == 51, ""); /* v13; v17: +mCharacter; v19: +msCharacter */
 static_assert(sizeof(cNetCharacterRequest) == 25, ""); /* v18 */
 static_assert(sizeof(cNetVoice) == 5, "");       /* v16 */
 static_assert(sizeof(cNetPlayerState) == 30, ""); /* v7: +mSeq; v11: +vel/flags; v12: +mHealth */
