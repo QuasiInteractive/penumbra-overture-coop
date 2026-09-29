@@ -12,6 +12,9 @@ subsystem and the `multiplayer.cfg` keys.
 - vcpkg: `C:\vcpkg`
 - Game: `D:\SteamLibrary\steamapps\common\Penumbra Overture\redist` (host) and
   `...\redist_guest` (second windowed instance for local two-player tests)
+- Release package output: `C:\Users\Deadl\Downloads\po models\new version of penumbra coop`
+  (same layout as redist: overture.exe + build DLLs at the root,
+  `multiplayer\models\*`, `multiplayer.cfg.example`, `master_server.py`)
 
 ## Build
 ```
