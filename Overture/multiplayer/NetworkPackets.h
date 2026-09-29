@@ -54,8 +54,14 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
         enforced at CONNECT (kNetDisconnectFull). Packet types are role
         gated (IsAllowedFrom) and every guest-authored payload is validated
         before the host applies or relays it. The digest input includes the
-        version, so a v14 build can never answer a v15 challenge. */
-static const uint16_t kNetProtocolVersion = 15;
+        version, so a v14 build can never answer a v15 challenge.
+    v16: voice — unsequenced cNetVoice (type 29): Opus frames from a
+        push-to-talk microphone, played back by every other machine as a
+        3D source at the speaker's ghost head (proximity falloff). Both
+        directions (guest -> host, host -> guests; the host relays with the
+        author stamped from the peer), validated like every other
+        guest-authored payload (ValidateEventPacket). */
+static const uint16_t kNetProtocolVersion = 16;
 
 
 /** v13: cNetPlayerName::msName capacity. A name is at most this many
@@ -156,10 +162,28 @@ enum eNetPacketType : uint8_t
 	                                  answer to the challenge (cNetAuth) */
 	eNetPacketType_Challenge = 28, /* host -> guest, right after CONNECT and
 	                                  before anything else (cNetChallenge) */
-	/* 29 is reserved for voice (v16). Keep cNetworkManager::IsAllowedFrom
-	   (NetworkManager.cpp) in step with every new type: a type the table
-	   does not know is DROPPED from either direction. */
+	/* v16 — VOICE. Keep cNetworkManager::IsAllowedFrom (NetworkManager.cpp)
+	   in step with every new type: a type the table does not know is
+	   DROPPED from either direction. */
+	eNetPacketType_Voice = 29,       /* v16, UNSEQUENCED ch1, both directions
+	                                    (host relays a guest's voice to the
+	                                    other guests with the author id
+	                                    stamped from the PEER, like
+	                                    PlayerState): cNetVoice +
+	                                    1..kNetVoiceMaxFramesPerPacket Opus
+	                                    frames. A lost packet is concealed by
+	                                    the decoder (PLC), never resent. */
 };
+
+/** v16 voice: fixed codec parameters — both ends must agree, so they are
+    protocol, not tuning. 16 kHz mono, 20 ms frames (320 samples). */
+static const int kNetVoiceSampleRate = 16000;
+static const int kNetVoiceFrameSamples = 320; /* 20 ms at 16 kHz */
+static const int kNetVoiceMaxFramesPerPacket = 2; /* 40 ms per packet */
+/** Upper bound on the Opus bytes after the cNetVoice header (all frames,
+    length prefixes included). 24 kbps VBR peaks well under 100 B/frame.
+    ValidateEventPacket refuses anything longer. */
+static const size_t kNetVoiceMaxPayload = 400;
 
 /** eNetPacketType_ScriptEvent ops. */
 enum eNetScriptOp : uint8_t
@@ -309,6 +333,20 @@ struct cNetPlayerName
 	uint8_t mType; /**< eNetPacketType_PlayerName */
 	uint8_t mPlayerID;
 	char msName[kNetPlayerNameMaxChars];
+};
+
+/** v16 voice packet header. Payload layout after the header, mFrames
+    times: uint16_t length, then that many Opus bytes (one 20 ms frame).
+    A zero length = the encoder produced nothing for that frame (the
+    receiver runs PLC for it). Total payload <= kNetVoiceMaxPayload.
+    mSeq counts PACKETS per author (wraps); the receiver drops stale or
+    duplicate ones (unsequenced delivery reorders) and conceals gaps. */
+struct cNetVoice
+{
+	uint8_t mType; /**< eNetPacketType_Voice */
+	uint8_t mPlayerID; /**< author (the host overwrites it with the peer id on relay) */
+	uint16_t mSeq;
+	uint8_t mFrames; /**< 1..kNetVoiceMaxFramesPerPacket */
 };
 
 /** A level transition happened; everyone follows. Fixed-size NUL-padded
@@ -701,6 +739,7 @@ static inline void NetAuthDigest(const char *apPassword, size_t alPasswordLen,
 static_assert(sizeof(cNetPlayerJoin) == 2, "");
 static_assert(sizeof(cNetPlayerLeave) == 2, "");
 static_assert(sizeof(cNetPlayerName) == 26, ""); /* v13 */
+static_assert(sizeof(cNetVoice) == 5, "");       /* v16 */
 static_assert(sizeof(cNetPlayerState) == 30, ""); /* v7: +mSeq; v11: +vel/flags; v12: +mHealth */
 static_assert(sizeof(cNetDiscoveryPing) == 7, "");
 static_assert(sizeof(cNetDiscoveryPong) == 75, "");

@@ -31,6 +31,8 @@ menu. You need to own Penumbra: Overture (Steam).
 - Party level transitions: one player takes an exit, everyone follows
 - Hardened for real internet: version-gated handshake, out-of-order packet
   rejection, animation smoothing at jitter
+- **Proximity voice chat**: hold **V** to talk; friends hear you from where
+  your character stands, fading with distance (Opus, ~3 KB/s)
 - Borderless fullscreen at native resolution
 
 ### Known limits (roadmap)
@@ -39,6 +41,33 @@ menu. You need to own Penumbra: Overture (Steam).
   scripted sequences assume vanilla senses); they still position-sync
 - Enemies cannot *hear* guests yet, only see them
 - Notebook/journal entries are per-player by design
+
+## Voice chat
+
+Push-to-talk: hold **V** while in a session. Everyone else hears you as a
+3D sound coming from your character's head — full volume within 2 m,
+fading with distance (inverse-distance, clamped at 25 m), so two players
+across a mine hall have to shout... or walk over. The party panel shows
+`(talking)` after the name of whoever is heard and `[MIC]` on your own line
+while your microphone is live. Audio is Opus (16 kHz mono, 20 ms frames,
+24 kbps VBR, two frames per packet, unreliable — a lost packet is concealed,
+never resent) and travels through the host like everything else. The
+microphone is opened the first time you press V in a session (the default
+OpenAL capture device — pick it in Windows sound settings); nothing is
+opened in single-player.
+
+`multiplayer.cfg` keys (all optional):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `voice_enabled=` | `1` | `0` disables voice chat entirely on this machine (no microphone, no playback). |
+| `voice_volume=` | `1.0` | Playback gain for other players' voices, `0`..`2`. |
+| `voice_open_mic=` | `0` | `1` = no key needed: the mic streams whenever its level is above -40 dBFS (with a 0.4 s hold). |
+
+Build side: voice needs the vcpkg `opus` package (listed in
+`Overture/vcpkg.json`); CMake option `PENUMBRA_VOICE` (default ON) turns
+into `PENUMBRA_VOICE=1` when opus is found and quietly compiles the stubs
+otherwise. `-DPENUMBRA_VOICE=OFF` builds without it.
 
 ## Repository layout
 

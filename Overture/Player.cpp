@@ -1890,6 +1890,12 @@ void cPlayer::DrawPartyPanel()
 		tWString sName = cString::To16Char(pNet->GetPlayerName((uint8_t)lId));
 		if(lId == 1) sName += _W(" (host)");
 		if(fHealth <= 0) sName += _W("  dead");
+		/* v16 voice: who is heard right now; our own line shows the live mic */
+		if(lId == lLocalId)
+		{
+			if(pNet->IsMicOpen()) sName += _W("  [MIC]");
+		}
+		else if(pNet->IsPlayerTalking((uint8_t)lId)) sName += _W("  (talking)");
 		const cColor col = (fHealth > 0) ? cColor(1,1,1,0.9f) : cColor(1,0.3f,0.3f,0.9f);
 
 		mpFont->Draw(cVector3f(fX+1, fY+1, fZ+1),vFontSize,cColor(0,0,0,0.7f),eFontAlign_Left,_W("%ls"),sName.c_str());

@@ -11,6 +11,7 @@
 
 class cInit;
 class cBodySync;
+class cVoiceChat;
 namespace hpl { class iPhysicsBody; }
 
 //-----------------------------------------------------------------------
@@ -568,6 +569,41 @@ private:
 	bool DiscoveryPongAllowed(uint32_t alAddr);
 	/** Host: forget every per-peer record (HostGame / Disconnect). */
 	void ResetPeerGuards();
+#endif
+
+	//---------------- v16: proximity voice chat — appended, impl at the file tail ----------------
+	/* cVoiceChat (multiplayer/VoiceChat.h) owns Opus + the OpenAL capture
+	   device and streaming sources; this class owns the object, feeds it
+	   the push-to-talk key ("VoiceTalk", V), the ghosts' head positions
+	   and the incoming type-29 packets, sends its outbox unsequenced on
+	   ch1 and, as host, relays a guest's voice to the other guests with the
+	   author id stamped (same trust rule as PlayerState). The object is
+	   created in Startup() when voice_enabled=1 and the build has
+	   PENUMBRA_VOICE; Opus/AL are initialised only while a session is live
+	   (UpdateVoice) and torn down in Disconnect — single-player never
+	   touches the microphone or the AL context. */
+public:
+	/** HUD: that player's voice is being heard right now (our own id: the
+	    microphone is open). Always false offline / without voice. */
+	bool IsPlayerTalking(uint8_t alId) const;
+	/** HUD: our microphone is live (PTT held / open-mic gate open). */
+	bool IsMicOpen() const;
+	/** Voice compiled in and voice_enabled=1 (the panel can show hints). */
+	bool IsVoiceAvailable() const;
+private:
+	cVoiceChat *mpVoice;   /**< NULL: voice off (cfg) or not compiled in */
+	bool mbVoiceEnabled;   /**< multiplayer.cfg voice_enabled (default 1) */
+	bool mbVoiceOpenMic;   /**< multiplayer.cfg voice_open_mic (default 0) */
+	float mfVoiceVolume;   /**< multiplayer.cfg voice_volume (default 1.0) */
+#ifdef PENUMBRA_MULTIPLAYER
+	/** Per frame after UpdateGhosts: (de)initialise with the session,
+	    positions, PTT, capture/encode/playback, send the outbox. */
+	void UpdateVoice(float afTimeStep);
+	/** Unreliable twin of SendReliableEvent (ch1, unsequenced). */
+	void SendUnreliableEvent(const void *apData, size_t alLen);
+	/** Host: a guest's voice packet — stamp the author, relay to the other
+	    guests, play it here. */
+	void RelayVoice(struct _ENetPeer *apFrom, uint8_t alAuthor, const void *apData, size_t alLen);
 #endif
 };
 //-----------------------------------------------------------------------

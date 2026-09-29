@@ -2,11 +2,11 @@
 # syntax_check.sh - compile-check (no link) Overture / HPL1 C++ sources on Linux.
 #
 # Runs  $CXX -std=c++14 -fsyntax-only -w  over each given .cpp with
-#   -DPENUMBRA_MULTIPLAYER=1 -D__stdcall=
+#   -DPENUMBRA_MULTIPLAYER=1 -DPENUMBRA_VOICE=1 -D__stdcall=
 #   -I<stubs> -IOverture -IOverture/multiplayer -IHPL1Engine/include
 # where <stubs> = Overture/multiplayer/tools/syntax_stubs/ holds minimal fake
 # third-party headers (angelscript, Newton, GLee/gl/glu, SDL, SDL_ttf, theora,
-# enet, Cg). _WIN32 is NOT defined by default: files are checked in their
+# enet, Cg, opus + AL/al.h + AL/alc.h for the v16 voice chat). _WIN32 is NOT defined by default: files are checked in their
 # non-Windows branch, except the ones in WIN32_FILES (see below). The stubs dir
 # is put FIRST on the include path so stubs/GL/GLee.h shadows
 # HPL1Engine/include/GL/GLee.h (which needs a real glx.h).
@@ -16,6 +16,10 @@
 #   -v          -> print full compiler diagnostics (default: first 20 lines)
 #   --win32     -> also -D_WIN32 -DWIN32 and add syntax_stubs/win32/ (fake
 #                  windows.h / winsock2.h / iphlpapi.h) for every file given
+#   --no-voice  -> leave PENUMBRA_VOICE undefined (the no-opus CMake
+#                  configuration: VoiceChat.cpp compiles its stub half)
+#   --no-mp     -> leave PENUMBRA_MULTIPLAYER undefined too (single-player
+#                  build: every multiplayer file compiles its stub half)
 #   CXX=clang++ -> use clang instead of g++
 # Exit status: 0 if every file passed, 1 otherwise.
 #
@@ -57,6 +61,8 @@ DEFAULT_FILES=(
   Overture/multiplayer/GhostPlayer.cpp
   Overture/multiplayer/NetworkManager.cpp
   Overture/multiplayer/BodySync.cpp
+  Overture/multiplayer/VoiceChat.cpp
+  Overture/Player.cpp
   Overture/GameEnemy.cpp
   Overture/GameEnemy_Dog.cpp
   Overture/GameEnemy_Spider.cpp
@@ -70,11 +76,15 @@ WIN32_FILES=(
 
 VERBOSE=0
 WIN32ALL=0
+VOICE=1
+MP=1
 FILES=()
 for a in "$@"; do
   case "$a" in
     -v|--verbose) VERBOSE=1 ;;
     --win32) WIN32ALL=1 ;;
+    --no-voice) VOICE=0 ;;
+    --no-mp) MP=0; VOICE=0 ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) FILES+=("$a") ;;
   esac
@@ -82,8 +92,10 @@ done
 [ ${#FILES[@]} -eq 0 ] && FILES=("${DEFAULT_FILES[@]}")
 
 FLAGS=(-std=c++14 -fsyntax-only -w
-  -DPENUMBRA_MULTIPLAYER=1 "-D__stdcall=" -include cstdint
+  "-D__stdcall=" -include cstdint
   -I"$STUBS" -I"$ROOT/Overture" -I"$ROOT/Overture/multiplayer" -I"$ROOT/HPL1Engine/include")
+[ $MP -eq 1 ] && FLAGS+=(-DPENUMBRA_MULTIPLAYER=1)
+[ $VOICE -eq 1 ] && FLAGS+=(-DPENUMBRA_VOICE=1)
 WIN32_FLAGS=(-D_WIN32 -DWIN32 -I"$STUBS/win32")
 
 is_win32_file() {

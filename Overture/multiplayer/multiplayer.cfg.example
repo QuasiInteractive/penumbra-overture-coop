@@ -85,6 +85,21 @@ ghost_models=malik.dae,phillip.dae
 #                  death menu. 0 = vanilla death menu online too.
 coop_respawn=1
 
+# ---- Voice chat (v16) -------------------------------------------------------
+# Hold V to talk. Friends hear you as a 3D sound from your character's head:
+# full volume within 2 m, fading with distance, quietest at 25 m and beyond.
+# The party panel shows "(talking)" after whoever is heard and "[MIC]" on your
+# own line while your microphone is live. The default OpenAL capture device
+# (Windows default recording device) is opened on the first press, only in a
+# session. Opus 16 kHz, ~3 KB/s while talking.
+# voice_enabled=1   — 0 = no voice on this machine (no microphone, no playback)
+# voice_volume=1.0  — playback gain for the others' voices (0..2)
+# voice_open_mic=0  — 1 = no key: the mic streams whenever its level is above
+#                     -40 dBFS (0.4 s hold). Push-to-talk is the default.
+voice_enabled=1
+voice_volume=1.0
+voice_open_mic=0
+
 # ---- Ghost animation (v11) ------------------------------------------------
 # ghost_interp_ms=100   — render remote players this far behind their newest
 #                         state (3 packets at 30 Hz). Lower = snappier, higher

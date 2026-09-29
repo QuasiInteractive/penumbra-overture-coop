@@ -6,6 +6,7 @@
 #include "StdAfx.h"
 #include "NetworkManager.h"
 #include "BodySync.h"
+#include "VoiceChat.h" /* v16: proximity voice chat */
 #include "system/String.h"
 #include "Init.h"
 #include "MapHandler.h"
@@ -323,6 +324,10 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbAuthSent(false)
 	  , mlGuestViolationsLogged(0)
 	  , mvFreeGuestIds()
+	  , mpVoice(NULL)       /* v16: voice chat (created in Startup) */
+	  , mbVoiceEnabled(true)
+	  , mbVoiceOpenMic(false)
+	  , mfVoiceVolume(1.0f)
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -334,8 +339,11 @@ cNetworkManager::~cNetworkManager()
 {
 	hpl::gpScriptVarNetCallback = NULL;
 	gpNetMgrForScript = NULL;
-	Disconnect();
+	Disconnect(); /* v16: also shuts the voice chat down (AL context still alive: cGame dies later) */
 	ClearGhostsInternal();
+	if (mpVoice)
+		hplDelete(mpVoice);
+	mpVoice = NULL;
 	delete mpBodySync;
 	mpBodySync = NULL;
 	delete mpImpl;
@@ -401,6 +409,8 @@ void cNetworkManager::ClearGhostsInternal()
 	m_mapGhostHealth.clear();
 	m_mapPlayerNames.clear(); /* v13: names + "joined" bookkeeping are per session */
 	m_setJoinAnnounced.clear();
+	if (mpVoice)
+		mpVoice->DropAllPlayers(); /* v16: every remote decoder + AL source */
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
@@ -421,6 +431,8 @@ void cNetworkManager::DropRemotePlayer(uint8_t id)
 	m_mapGhostMoveState.erase(id);
 	m_mapGhostHealth.erase(id); /* v12: gone = not alive for the respawn rule */
 	ForgetPlayerName(id);       /* v13: "<name> left" + name table entry */
+	if (mpVoice)
+		mpVoice->DropPlayer(id); /* v16: decoder + AL source freed */
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
 	if (it != m_mapGhosts.end())
 	{
@@ -903,6 +915,10 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbAuthSent(false)
 	  , mlGuestViolationsLogged(0)
 	  , mvFreeGuestIds()
+	  , mpVoice(NULL)       /* v16: voice chat (created in Startup) */
+	  , mbVoiceEnabled(true)
+	  , mbVoiceOpenMic(false)
+	  , mfVoiceVolume(1.0f)
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -914,8 +930,11 @@ cNetworkManager::~cNetworkManager()
 {
 	hpl::gpScriptVarNetCallback = NULL;
 	gpNetMgrForScript = NULL;
-	Disconnect();
+	Disconnect(); /* v16: also shuts the voice chat down (AL context still alive: cGame dies later) */
 	ClearGhostsInternal();
+	if (mpVoice)
+		hplDelete(mpVoice);
+	mpVoice = NULL;
 	delete mpBodySync;
 	mpBodySync = NULL;
 	delete mpImpl;
@@ -939,7 +958,9 @@ void cNetworkManager::RegisterInputActions()
 	inp->AddAction(hplNew(cActionKeyboard, ("GhostPreviewPrev", inp, eKey_F7)));
 	inp->AddAction(hplNew(cActionKeyboard, ("GhostPreviewCrouch", inp, eKey_F8)));
 	inp->AddAction(hplNew(cActionKeyboard, ("GhostPreviewTreadmill", inp, eKey_F2)));
-	Log(" multiplayer: F11=toggle HOST :%u — F10=JOIN 127.0.0.1:%u — F9=LAN discovery — menu Multiplayer · multiplayer.cfg\n",
+	/* v16: push-to-talk. V is unbound in the vanilla key map. */
+	inp->AddAction(hplNew(cActionKeyboard, ("VoiceTalk", inp, eKey_v)));
+	Log(" multiplayer: F11=toggle HOST :%u — F10=JOIN 127.0.0.1:%u — F9=LAN discovery — V=push-to-talk — menu Multiplayer · multiplayer.cfg\n",
 		(unsigned)mlDefaultPort, (unsigned)mlDefaultPort);
 }
 
@@ -1113,6 +1134,18 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 			mbPublicExplicit = true;
 		}
 		/* server_password= / join_password= are raw-line keys handled above (v15) */
+		/* v16 voice chat */
+		else if (strcmp(key, "voice_enabled") == 0)
+			mbVoiceEnabled = (atoi(val) != 0);
+		else if (strcmp(key, "voice_open_mic") == 0)
+			mbVoiceOpenMic = (atoi(val) != 0);
+		else if (strcmp(key, "voice_volume") == 0)
+		{
+			float v = static_cast<float>(atof(val));
+			if (v < 0.0f) v = 0.0f;
+			else if (v > 2.0f) v = 2.0f;
+			mfVoiceVolume = v;
+		}
 	}
 	fclose(fp);
 
@@ -1144,6 +1177,19 @@ void cNetworkManager::Startup()
 		mpBodySync->SetGrabTuning(
 			mpInit->mpGameConfig->GetFloat("Interaction_Grab", "MaxPidForce", 80.0f),
 			mpInit->mpGameConfig->GetFloat("Interaction_Grab", "MaxThrowImpulse", 13.0f));
+	/* v16: the voice object is cheap (no Opus/AL until a session is live —
+	   UpdateVoice). voice_enabled=0 or a build without opus: no object. */
+	if (mpVoice == NULL && mbVoiceEnabled && cVoiceChat::IsCompiledIn())
+	{
+		mpVoice = hplNew(cVoiceChat, ());
+		mpVoice->SetEnabled(true);
+		mpVoice->SetOpenMic(mbVoiceOpenMic);
+		mpVoice->SetVolume(mfVoiceVolume);
+		Log(" multiplayer: voice chat on (hold V to talk%s, voice_volume=%.2f)\n",
+			mbVoiceOpenMic ? " — voice_open_mic=1: level-gated open mic" : "", mfVoiceVolume);
+	}
+	else if (cVoiceChat::IsCompiledIn())
+		Log(" multiplayer: voice chat off (voice_enabled=0)\n");
 }
 
 //-----------------------------------------------------------------------
@@ -1417,6 +1463,8 @@ void cNetworkManager::ClearGhostsInternal()
 	m_mapGhostHealth.clear();
 	m_mapPlayerNames.clear(); /* v13: names + "joined" bookkeeping are per session */
 	m_setJoinAnnounced.clear();
+	if (mpVoice)
+		mpVoice->DropAllPlayers(); /* v16: every remote decoder + AL source */
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
@@ -1429,6 +1477,8 @@ void cNetworkManager::DropRemotePlayer(uint8_t id)
 	m_mapGhostMoveState.erase(id);
 	m_mapGhostHealth.erase(id); /* v12: gone = not alive for the respawn rule */
 	ForgetPlayerName(id);       /* v13: "<name> left" + name table entry */
+	if (mpVoice)
+		mpVoice->DropPlayer(id); /* v16: decoder + AL source freed */
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
 	if (it != m_mapGhosts.end())
 	{
@@ -1525,6 +1575,20 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 	{
 		const cNetPlayerLeave *lv = (const cNetPlayerLeave *)data;
 		DropRemotePlayer(lv->mPlayerID);
+		return;
+	}
+
+	if (t == eNetPacketType_Voice)
+	{
+		/* v16: guest side = the host's own voice (id 1) or a relayed guest
+		   (author stamped by the host); host side = arrives via RelayVoice
+		   with the peer id stamped. cVoiceChat validates the frame table. */
+		if (mpVoice && len >= sizeof(cNetVoice))
+		{
+			cNetVoice hdr;
+			memcpy(&hdr, data, sizeof(hdr));
+			mpVoice->OnVoicePacket(hdr.mPlayerID, data, len);
+		}
 		return;
 	}
 
@@ -2108,6 +2172,12 @@ void cNetworkManager::Service(int timeoutMs)
 				{
 					/* v14: needs the peer to answer with the snapshot */
 					HandleMapReady(ev.peer, pk->data, (size_t)pk->dataLength);
+				}
+				else if (author >= 2 && lFirst == eNetPacketType_Voice)
+				{
+					/* v16: author stamped from the PEER (never trusted from
+					   the packet), relayed unsequenced to the other guests */
+					RelayVoice(ev.peer, author, pk->data, (size_t)pk->dataLength);
 				}
 				else if (author >= 2 && (lFirst == eNetPacketType_MapChange ||
 					lFirst == eNetPacketType_ItemPickup ||
@@ -2839,6 +2909,8 @@ void cNetworkManager::Disconnect()
 	ClearGhostsInternal();
 	if (mbHosting)
 		SendMasterUnregister(); /* before the discovery socket goes away */
+	if (mpVoice)
+		mpVoice->Shutdown(); /* v16: mic closed, encoder/decoders/sources freed */
 	CloseHostDiscovery();
 	StopDiscovery(); /* keeps results; frees the browse socket + its net ref */
 	StopInternetRefresh();
@@ -3046,6 +3118,11 @@ void cNetworkManager::Update(float afTimeStep)
 	/* v11: every ghost interpolates/animates once per tick, AFTER the last
 	   Service(0) so this tick's states are already in the buffers. */
 	UpdateGhosts(afTimeStep);
+
+	/* v16: voice after the ghosts moved (sources follow the drawn heads);
+	   its outbox goes out right away, not at the 30 Hz tick — 40 ms of
+	   audio per packet already paces it. */
+	UpdateVoice(afTimeStep);
 
 	mpBodySync->LogStatsTick(afTimeStep);
 }
@@ -5105,6 +5182,7 @@ bool cNetworkManager::IsAllowedFrom(uint8_t alType, bool abFromHost)
 	case eNetPacketType_ScriptEvent:
 	case eNetPacketType_EntityDamage:
 	case eNetPacketType_PlayerName:
+	case eNetPacketType_Voice: /* v16: guest -> host, host relays / host -> guests */
 		return true;
 	/* host -> guest only */
 	case eNetPacketType_PlayerJoin:
@@ -5580,6 +5658,33 @@ bool cNetworkManager::ValidateEventPacket(unsigned char *apData, size_t alLen, b
 	}
 	case eNetPacketType_PlayerName:
 		return alLen >= sizeof(cNetPlayerName); /* SanitizePlayerName on apply */
+	case eNetPacketType_Voice:
+	{
+		/* v16: header + 1..2 length-prefixed Opus frames, payload bounded
+		   (kNetVoiceMaxPayload); the frame table must add up EXACTLY to the
+		   packet — trailing bytes are as malformed as missing ones. The
+		   author byte is not checked here: the host restamps it from the
+		   peer (RelayVoice), the guest trusts the host's stamp. */
+		if (alLen < sizeof(cNetVoice) || alLen > sizeof(cNetVoice) + kNetVoiceMaxPayload)
+			return false;
+		cNetVoice vh;
+		memcpy(&vh, apData, sizeof(vh));
+		if (vh.mFrames == 0 || vh.mFrames > kNetVoiceMaxFramesPerPacket)
+			return false;
+		size_t at = sizeof(cNetVoice);
+		for (int f = 0; f < (int)vh.mFrames; ++f)
+		{
+			if (alLen - at < 2)
+				return false;
+			uint16_t l = 0;
+			memcpy(&l, apData + at, 2);
+			at += 2;
+			if (alLen - at < (size_t)l)
+				return false;
+			at += l;
+		}
+		return at == alLen;
+	}
 	case eNetPacketType_MapReady:
 		return alLen >= sizeof(cNetMapReady);
 	case eNetPacketType_Auth:
@@ -5763,6 +5868,132 @@ bool cNetworkManager::DiscoveryPongAllowed(uint32_t alAddr)
 	bk.mlCount = 1;
 	++mpImpl->mlPongGlobalCount;
 	return true;
+}
+
+#endif /* PENUMBRA_MULTIPLAYER */
+
+//======================================================================
+// v16: proximity voice chat — APPENDED (see the NetworkManager.h tail).
+// The HUD accessors are shared by both builds; the transport half lives
+// under PENUMBRA_MULTIPLAYER. The codec/AL work is all in cVoiceChat.
+//======================================================================
+
+bool cNetworkManager::IsPlayerTalking(uint8_t alId) const
+{
+	if (!mpVoice || alId == 0)
+		return false;
+	return mpVoice->IsTalking(alId);
+}
+
+bool cNetworkManager::IsMicOpen() const
+{
+	return mpVoice ? mpVoice->IsMicOpen() : false;
+}
+
+bool cNetworkManager::IsVoiceAvailable() const
+{
+	return mpVoice != NULL;
+}
+
+#ifdef PENUMBRA_MULTIPLAYER
+
+namespace
+{
+/** Ghost render feet -> mouth: the shipped meshes stand ~1.75 m, the
+    sender's camera sits ~1.6 m up (game.cfg Player Height). */
+const float kVoiceHeadHeight = 1.6f;
+}
+
+void cNetworkManager::SendUnreliableEvent(const void *apData, size_t alLen)
+{
+	if (!mpImpl || !mpImpl->mpHost || !apData || alLen == 0)
+		return;
+	if (mbHosting)
+	{
+		for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+		{
+			ENetPeer *pd = &mpImpl->mpHost->peers[i];
+			if (PeerLive(pd)) /* v15: accepted peers only */
+				SendStructToPeer(pd, apData, alLen, false);
+		}
+	}
+	else if (mbClientConnected && mbHadJoinPacket && mpImpl->mpServerPeer &&
+		mpImpl->mpServerPeer->state == ENET_PEER_STATE_CONNECTED)
+	{
+		SendStructToPeer(mpImpl->mpServerPeer, apData, alLen, false);
+	}
+}
+
+void cNetworkManager::RelayVoice(ENetPeer *apFrom, uint8_t alAuthor, const void *apData, size_t alLen)
+{
+	if (!mpImpl || !mpImpl->mpHost || !apData || alAuthor < 2)
+		return;
+	if (alLen < sizeof(cNetVoice) || alLen > sizeof(cNetVoice) + kNetVoiceMaxPayload)
+		return; /* oversized = not ours; a guest cannot make us forward garbage */
+	uint8_t buf[sizeof(cNetVoice) + kNetVoiceMaxPayload];
+	memcpy(buf, apData, alLen);
+	cNetVoice hdr;
+	memcpy(&hdr, buf, sizeof(hdr));
+	hdr.mPlayerID = alAuthor; /* the peer is the truth, never the byte it sent */
+	memcpy(buf, &hdr, sizeof(hdr));
+	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+	{
+		ENetPeer *dst = &mpImpl->mpHost->peers[i];
+		if (dst == apFrom || !PeerLive(dst)) /* v15: accepted peers only */
+			continue;
+		SendStructToPeer(dst, buf, alLen, false);
+	}
+	DispatchIncoming(buf, alLen); /* and we hear it too */
+}
+
+void cNetworkManager::UpdateVoice(float afTimeStep)
+{
+	if (!mpVoice)
+		return;
+
+	/* Opus/AL live exactly as long as a session: nothing in single-player,
+	   nothing while hosting an empty lobby is fine too (cheap), torn down
+	   by Disconnect. */
+	const bool bLive = mbHosting || (mbClientConnected && mbHadJoinPacket);
+	if (!bLive)
+	{
+		if (mpVoice->IsInitialized())
+			mpVoice->Shutdown();
+		return;
+	}
+	if (!mpVoice->IsInitialized() && !mpVoice->Init())
+		return; /* failed: logged once, retried after the next Disconnect */
+
+	mpVoice->SetLocalPlayerId(mlLocalPlayerId);
+
+	/* every drawn ghost's mouth this frame (interpolated render pose) */
+	for (tGhostMap::const_iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
+	{
+		if (!it->second)
+			continue;
+		cVector3f vFeet;
+		if (it->second->GetRenderFeetPos(&vFeet))
+			mpVoice->SetRemoteHeadPos(it->first, vFeet + cVector3f(0, kVoiceHeadHeight, 0), true);
+	}
+
+	/* push-to-talk (ignored by the open-mic gate inside) */
+	bool bTalk = false;
+	hpl::cInput *inp = (mpInit && mpInit->mpGame) ? mpInit->mpGame->GetInput() : NULL;
+	if (inp)
+		bTalk = inp->IsTriggerd("VoiceTalk");
+
+	mpVoice->Update(afTimeStep, bTalk);
+
+	/* outbox -> wire (host: every guest; guest: the host, which relays) */
+	const size_t n = mpVoice->GetOutgoingCount();
+	for (size_t i = 0; i < n; ++i)
+	{
+		const std::vector<uint8_t> &pkt = mpVoice->GetOutgoing(i);
+		if (!pkt.empty())
+			SendUnreliableEvent(&pkt[0], pkt.size());
+	}
+	if (n > 0)
+		mpVoice->ClearOutgoing();
 }
 
 #endif /* PENUMBRA_MULTIPLAYER */

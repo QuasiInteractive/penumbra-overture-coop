@@ -19,6 +19,11 @@ unset(SDL_LIBRARY CACHE)
 unset(SDLMAIN_LIBRARY CACHE)
 
 option(PENUMBRA_MULTIPLAYER "Phase 1 ghost sync (requires vcpkg enet)" ON)
+# v16 proximity voice chat: Opus (vcpkg 'opus', target Opus::opus) + the OpenAL
+# the game already links (capture + streaming sources, raw <AL/al.h>). ON by
+# default; silently OFF when opus is not found or PENUMBRA_MULTIPLAYER is OFF
+# (multiplayer/VoiceChat.cpp then compiles its stub half).
+option(PENUMBRA_VOICE "Proximity voice chat (requires PENUMBRA_MULTIPLAYER + vcpkg opus)" ON)
 
 set(OAL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../OALWrapper" CACHE PATH "Frictional OALWrapper clone")
 set(HPL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../HPL1Engine" CACHE PATH "Frictional HPL1Engine clone")
@@ -172,6 +177,39 @@ if(PENUMBRA_MULTIPLAYER)
 	endif()
 endif()
 
+# v16 voice: vcpkg opus exports Opus::opus (OpusConfig.cmake). OpenAL is
+# already on the link line (OpenAL32 / openal below, and through OALWrapper);
+# vcpkg's openal-soft additionally exports OpenAL::OpenAL, which carries the
+# include dir for <AL/alc.h> capture — used when present, otherwise the
+# HPL/OALWrapper include dir resolved above (_penumb_al_inc) is reused.
+set(PENUMBRA_OPUS_TARGET "")
+if(PENUMBRA_VOICE AND NOT PENUMBRA_MULTIPLAYER)
+	message(STATUS "PENUMBRA_VOICE needs PENUMBRA_MULTIPLAYER — voice chat off")
+	set(PENUMBRA_VOICE OFF CACHE BOOL "" FORCE)
+endif()
+if(PENUMBRA_VOICE)
+	find_package(Opus CONFIG QUIET)
+	if(TARGET Opus::opus)
+		set(PENUMBRA_OPUS_TARGET Opus::opus)
+	else()
+		find_package(PkgConfig QUIET)
+		if(PKG_CONFIG_FOUND)
+			pkg_check_modules(PENUMBRA_OPUS_PC QUIET IMPORTED_TARGET opus)
+			if(TARGET PkgConfig::PENUMBRA_OPUS_PC)
+				set(PENUMBRA_OPUS_TARGET PkgConfig::PENUMBRA_OPUS_PC)
+			endif()
+		endif()
+	endif()
+	if(NOT PENUMBRA_OPUS_TARGET)
+		message(WARNING
+			"vcpkg package 'opus' not found (target Opus::opus) — building without voice chat.\n"
+			"Add it with the vcpkg toolchain (Overture/vcpkg.json lists it) or set -DPENUMBRA_VOICE=OFF.")
+		set(PENUMBRA_VOICE OFF CACHE BOOL "" FORCE)
+	else()
+		message(STATUS "Voice chat: opus via ${PENUMBRA_OPUS_TARGET}")
+	endif()
+endif()
+
 add_executable(Overture ${PENUMBRA_SRC} ${PENUMBRA_MP_SRC})
 if(WIN32)
 	set_target_properties(Overture PROPERTIES WIN32_EXECUTABLE TRUE)
@@ -194,6 +232,19 @@ if(PENUMBRA_MULTIPLAYER)
 	if(WIN32)
 		# iphlpapi: GetAdaptersInfo for per-subnet discovery broadcast (Hamachi et al.)
 		target_link_libraries(Overture PRIVATE ws2_32 winmm iphlpapi)
+	endif()
+	if(PENUMBRA_VOICE AND PENUMBRA_OPUS_TARGET)
+		target_compile_definitions(Overture PRIVATE PENUMBRA_VOICE=1)
+		target_link_libraries(Overture PRIVATE ${PENUMBRA_OPUS_TARGET})
+		# <AL/al.h> + <AL/alc.h> (capture) for multiplayer/VoiceChat.cpp: the
+		# vcpkg openal-soft config target when it exists, else the include dir
+		# OALWrapper found (same headers the engine compiles against).
+		find_package(OpenAL CONFIG QUIET)
+		if(TARGET OpenAL::OpenAL)
+			target_link_libraries(Overture PRIVATE OpenAL::OpenAL)
+		elseif(_penumb_al_inc)
+			target_include_directories(Overture BEFORE PRIVATE "${_penumb_al_inc}")
+		endif()
 	endif()
 endif()
 

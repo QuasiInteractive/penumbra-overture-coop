@@ -13,7 +13,9 @@ All dedicated multiplayer source lives in this folder. Work here first; game glu
 | `tools/master_server.py` | Reference master server (Python 3, stdlib only) for the Internet tab — see 'Public servers'. |
 | `BodySync.h` / `.cpp` | Shared physics: host-authoritative body replication. Name-hash identity, map-load census (host/guest verify), host state batches, guest apply. |
 | `GhostPlayer.h` / `.cpp` | Remote peer visuals (skinned mesh + marker light + flashlight). Interpolation buffer on the sender's clock, clip selection from the wire velocity/flags, weight-preserving crossfades, gait-scaled playback. Not a real `cPlayer`. |
+| `VoiceChat.h` / `.cpp` | v16 proximity voice chat: OpenAL capture (push-to-talk / level-gated open mic) -> Opus 16 kHz 20 ms frames -> `cNetVoice` packets; per-remote-player Opus decoder + OpenAL streaming source at the ghost's head with a 3-packet jitter buffer, PLC and inverse-distance gain. Raw `<AL/al.h>` on the engine's context; stubbed without `PENUMBRA_VOICE`. |
 | `multiplayer.cfg.example` | Copy next to `overture.exe` as `multiplayer.cfg`. |
+| `tools/syntax_check.sh` + `tools/syntax_stubs/` | Linux `g++ -fsyntax-only` harness with fake third-party headers (enet, Newton, AngelScript, GL, SDL, opus, AL) — `--no-voice` / `--no-mp` check the stub halves. |
 | `models/` | Ghost `.dae` meshes + `<name>_<clip>.dae` clips + `<name>_clips.json` (gait table); runtime resource dir is `multiplayer/models` (cwd = exe folder). |
 
 Build flag: `PENUMBRA_MULTIPLAYER` (CMake option, default ON when vcpkg `enet` is found). Without it, `NetworkManager` is a stub.
@@ -30,7 +32,7 @@ writes, entity activation, door locks, item pickups/drops/consumption and
 breakable damage are replicated as reliable events; map changes move the
 whole party). Player state, bodies and enemies stream at **30 Hz**
 (`kNetSendPeriodSeconds`); every wire layout change bumps
-`kNetProtocolVersion` (currently **15**), and the connect handshake refuses
+`kNetProtocolVersion` (currently **16**), and the connect handshake refuses
 mismatched builds (then the v15 password challenge, see **Security**).
 
 Remote players are drawn as **ghosts** (`cGhostPlayer`): each `cNetPlayerState`
@@ -289,12 +291,82 @@ to. The host is fully trusted by guests for game state (by design; it owns
 the simulation). No brute-force delay on the password: the 5 s timeout and
 one attempt per connection are the only throttle.
 
+## Voice chat (protocol v16)
+
+`cVoiceChat` (`VoiceChat.h/.cpp`), owned by `cNetworkManager`, created in
+`Startup()` when `voice_enabled=1` and the build has `PENUMBRA_VOICE`
+(CMake: vcpkg `opus` found). Opus and OpenAL are initialised only while a
+session is live (`UpdateVoice`, called from `Update` after `UpdateGhosts`)
+and torn down in `Disconnect` — single-player never touches the
+microphone, and everything dies before `cGame` (the AL context) does
+(`cInit::Exit` deletes the network manager first).
+
+**Send.** `VoiceTalk` (**V**, `cActionKeyboard`, registered next to the
+F9-F11 actions) is polled with `IsTriggerd` every frame. On the first press
+the default OpenAL capture device is opened lazily
+(`alcCaptureOpenDevice(NULL, 16000, AL_FORMAT_MONO16, 4096)`; failure is
+logged once and PTT stays off for the session) and started; while held,
+`alcCaptureSamples` drains the ring every frame into a pending PCM buffer
+(capped at 1 s — a frame stall while talking drops the oldest audio, logged
+once) which is cut into 320-sample frames and Opus-encoded (VOIP, 24 kbps
+VBR, complexity 5, wideband; at most 10 frames per Update). Two frames go
+into one `cNetVoice` packet (a lone frame waits at most 30 ms for its
+twin, and the last partial packet is flushed on release), total payload
+<= `kNetVoiceMaxPayload` (400 B). Release stops and drains the capture ring;
+the device stays open for the next press. `voice_open_mic=1` skips the key:
+the mic runs continuously and frames go out while the RMS level is above
+-40 dBFS (0.4 s hold). Packets go out unsequenced on ch1 immediately
+(`SendUnreliableEvent`; guest -> host, host -> every guest).
+
+**Relay.** The host stamps the author from the **peer** id (`RelayVoice`,
+the byte in the packet is never trusted — same rule as `PlayerState`),
+forwards the packet to the other accepted guests (`PeerLive`) and plays it
+itself. Voice passes the v15 gate like every other packet: type 29 is
+both-direction in `IsAllowedFrom`, and `ValidateEventPacket` refuses a
+packet whose payload exceeds `kNetVoiceMaxPayload`, whose frame count is
+not 1..2, or whose frame table does not add up exactly to the packet
+length (a strike on the host side, a once-logged drop on the guest side).
+Voice rides ch1, so the reliable-packet rate limit never sees it.
+
+**Receive.** `OnVoicePacket` validates the frame table (count 1..2,
+per-frame `uint16` lengths within the packet), then per author: a stale or
+duplicate `mSeq` (int16 difference <= 0 while the burst is running) is
+dropped; a gap of 1..3 packets is concealed with `opus_decode(NULL)` PLC
+frames; a bigger gap, or the first packet after > 0.5 s of silence, resets
+the decoder state and the jitter buffer. Decoded frames wait in a per-player
+queue (max 25); playback starts when 6 frames (3 packets) are in, or after
+150 ms for a short utterance, or as soon as the sender goes quiet. Every
+frame `Update` unqueues processed AL buffers (8 per source, 160 ms),
+queues waiting frames, restarts a source that stopped (underrun), and,
+when the queue is empty while the sender is still active, generates up to 5
+PLC frames before letting the stream idle (the next packet re-primes).
+Each stream is one `AL_FORMAT_MONO16` streaming source with
+`AL_SOURCE_RELATIVE` off, placed every frame at the ghost's render feet +
+1.6 m (`SetRemoteHeadPos`). The gain is computed in software —
+`voice_volume * ref / (ref + (clamp(d, 2, 25) - 2))`, ref 2 m, max 25 m —
+because the engine runs the AL context with the distance model set to NONE
+(`LowLevelSoundOpenAL.cpp`, it attenuates its own sounds itself); AL still
+pans by position. Where `AL_EXT_source_distance_model` exists the source is
+pinned to NONE so a future wrapper change cannot double-attenuate.
+`alGetError` is checked after every gen/queue/unqueue/play; the first error
+is logged, the affected stream is freed (re-created by its next packet),
+and after three such failures voice is off for the session.
+
+**HUD.** `IsPlayerTalking(id)` (packet within the last 0.35 s; our own id
+= mic live) and `IsMicOpen()` feed `cPlayer::DrawPartyPanel`: `(talking)`
+after a friend's name, `[MIC]` on our line.
+
+**Cfg.** `voice_enabled=1`, `voice_volume=1.0` (0..2), `voice_open_mic=0`.
+Wire: `eNetPacketType_Voice` = 29 (27/28 belong to the v15 auth
+handshake), `cNetVoice` = 5 bytes, constants `kNetVoice*` in
+`NetworkPackets.h`.
+
 ## Game glue (outside this folder — edit carefully)
 
 | Location | What |
 |----------|------|
 | `../Init.cpp` / `Init.h` | Owns `mpNetworkManager`; `Startup()` after input exists; `Update()` each frame; config port load/save. |
-| `../Player.cpp` / `Player.h` | `DrawPartyHud()` — world-anchored party health bars in `OnDraw`; `DrawPartyPanel()` — top-left names/health panel + event feed (v13). |
+| `../Player.cpp` / `Player.h` | `DrawPartyHud()` — world-anchored party health bars in `OnDraw`; `DrawPartyPanel()` — top-left names/health panel + event feed (v13), `(talking)` / `[MIC]` voice indicators (v16). |
 | `../PlayerHelper.cpp` / `.h` | `cPlayerDeath` co-op respawn branch (`CoopRespawnApplies`, `UpdateCoopRespawn`). |
 | `../Inventory.cpp` / `.h` | `DrawParty()` — inventory party health list. |
 | `../GameEnemy.cpp`, `../TriggerHandler.cpp` | Host senses read `GetGhostHealth` (focus health, sight candidates, ghost footsteps). |
@@ -304,16 +376,17 @@ one attempt per connection are the only throttle.
 | `../GameSwingDoor.h`, `../GameLamp.h`, `../Inventory.h`, `../MapHandler.h` | `IsLocked()`, `IsLit()`/`GetLitChangeCallback()`, `friend class cNetworkManager` (party items, local timers) for the world snapshot. |
 | `../../HPL1Engine/sources/game/ScriptFuncs.cpp` | `gpScriptVarNetCallback` — fired for var writes; Add ops fire AFTER the increment (v14). |
 | `../MainMenu.cpp` / `MainMenu.h` | Multiplayer menu states, host/join UI, IP typing widget (`#ifdef PENUMBRA_MULTIPLAYER`). |
-| `../CMakeLists.txt` | Globs `multiplayer/*.cpp`, links ENet, defines `PENUMBRA_MULTIPLAYER`. |
-| `../vcpkg.json` | Declares `enet` (+ SDL/OpenAL audio deps). |
+| `../CMakeLists.txt` | Globs `multiplayer/*.cpp`, links ENet, defines `PENUMBRA_MULTIPLAYER`; option `PENUMBRA_VOICE` (default ON): finds `Opus::opus`, defines `PENUMBRA_VOICE=1`, links opus + `OpenAL::OpenAL` (v16). |
+| `../vcpkg.json` | Declares `enet`, `opus` (+ SDL/OpenAL audio deps). |
 
 ## Runtime controls
 
 - **F11** — toggle host on default port (7777).
 - **F10** — join `127.0.0.1:<port>`.
 - **F9** — LAN/Hamachi discovery scan (~1.5s window; results logged, feed the server browser).
+- **V** (hold) — push-to-talk voice chat (v16); heard from your character's head, fading with distance.
 - **Menu** — Multiplayer → Host / Server browser (Internet · LAN) / Direct connect / Change name (asks for a username the first time).
-- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=` (enforced at CONNECT since v15), `server_password=` / `join_password=` (v15, see Security), `ghost_models=a.dae,b.dae`, `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`, `master_server=HOST:PORT`, `public=0|1` (internet browser, see 'Public servers'). See `multiplayer.cfg.example`.
+- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=` (enforced at CONNECT since v15), `server_password=` / `join_password=` (v15, see Security), `ghost_models=a.dae,b.dae`, `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `voice_enabled=1`, `voice_volume=1.0`, `voice_open_mic=0` (v16), `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`, `master_server=HOST:PORT`, `public=0|1` (internet browser, see 'Public servers'). See `multiplayer.cfg.example`.
 
 ### Ghost preview (offline animation check)
 
