@@ -517,10 +517,12 @@ struct cNetObjectStateBatch
 	uint8_t mType;   /**< eNetPacketType_ObjectState */
 	uint8_t mCount;  /**< cNetObjectState entries that follow */
 	uint8_t mMapGen; /**< host map generation (wraps; equality only) */
-	uint16_t mSeq;   /**< host batch counter (wraps): guards PURE-MOVING batches
-	    against unsequenced-channel reordering (a stale batch pops every body
-	    in it backward for a frame). Batches carrying rest poses and snapshot
-	    chunks travel reliably and are always applied. */
+	uint16_t mSeq;   /**< host batch counter (wraps). The guest keeps the last
+	    sequence it applied PER BODY and drops any older entry for that body
+	    (a reliable rest pose delayed by a retransmit no longer pins a body
+	    the host has thrown since); a census resets that memory. Rest-flagged
+	    keyframes of sleeping bodies also ride the unreliable batches (up to
+	    2 per tick) so guest-side drift gets corrected. */
 };
 
 /** Host -> guest once per map load (reliable): what the host's physics world

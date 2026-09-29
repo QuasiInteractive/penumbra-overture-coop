@@ -27,6 +27,7 @@ cBodySync::cBodySync()
 	: mpWorld(NULL)
 	  , mlWorldBodyCount(-1)
 	  , mlRoundRobinCursor(0)
+	  , mlKeyframeCursor(0)
 	  , mbCensusDone(false)
 	  , mlCensusCount(0)
 	  , mlCensusChecksum(0)
@@ -38,11 +39,10 @@ cBodySync::cBodySync()
 	  , mlStatApplied(0)
 	  , mlStatBytesOut(0)
 	  , mlBatchSeqOut(0)
-	  , mlBatchSeqIn(0)
-	  , mbBatchSeqInKnown(false)
 	  , mlMapGen(0)
 	  , mlRemoteMapGen(0)
 	  , mbRemoteMapGenKnown(false)
+	  , mfGuestClock(0)
 	  , mlGuestHeldHash(0)
 	  , mbGuestHeldPick(false)
 	  , mvGuestHeldRelPick(0, 0, 0)
@@ -70,6 +70,18 @@ bool cBodySync::IsReplicable(iPhysicsBody *apBody)
 	return apBody->GetName().empty() == false;
 }
 
+/** Ragdoll bones (Mesh.cpp creates "<entity>_<bone>" bodies, mass 1, for
+    every enemy at load) stay in the census — both sides load them, and the
+    census must not change meaning between builds — but are NOT indexed:
+    the enemy code owns them (inactive while alive, the LOCAL death ragdoll
+    after), and driving each bone toward a host pose one by one fights the
+    ragdoll joints (the bones spin/jitter). Not indexed also means a guest's
+    grab on a corpse bone is not forwarded: it moves the local ragdoll. */
+bool cBodySync::IsStreamable(iPhysicsBody *apBody)
+{
+	return IsReplicable(apBody) && !apBody->IsRagDoll();
+}
+
 //-----------------------------------------------------------------------
 
 bool cBodySync::Update(cWorld3D *apWorld)
@@ -84,15 +96,16 @@ bool cBodySync::Update(cWorld3D *apWorld)
 		m_mapSent.clear();
 		m_mapRemoteGrabs.clear(); /* held bodies died with their world */
 		m_mapHolders.clear();
-		m_mapGuestTargets.clear();
+		m_mapPendingRestore.clear();
+		m_mapGuestBodies.clear(); /* per-body seq knowledge dies with the world too */
 		mlGuestHeldHash = 0;
 		mbGuestHeldHasTarget = false;
 		mlWorldBodyCount = -1;
 		mlRoundRobinCursor = 0;
+		mlKeyframeCursor = 0;
 		mbCensusDone = false;
 		mbCensusPairChecked = false;
 		mbCensusMatched = false;
-		mbBatchSeqInKnown = false;
 		++mlMapGen; /* stale-map packets identify themselves by this */
 	}
 
@@ -155,6 +168,13 @@ void cBodySync::OnCensusReceived(const cNetBodyCensus &aCensus)
 	mlRemoteMapGen = aCensus.mMapGen; /* state batches must match this now */
 	mbRemoteMapGenKnown = true;
 	mbCensusPairChecked = false;
+	/* A census starts a new pairing (map load, reconnect, a restarted host
+	   whose batch counter began again at 1): forget the per-body sequence
+	   knowledge so the first states of the new pairing are never mistaken
+	   for stale ones. */
+	for (std::map<uint32_t, cGuestBody>::iterator it = m_mapGuestBodies.begin();
+		 it != m_mapGuestBodies.end(); ++it)
+		it->second.mfRecvClock = -1.0e9f;
 	VerifyCensus();
 }
 
@@ -225,7 +245,7 @@ void cBodySync::RebuildIndexIfNeeded()
 	while (it.HasNext())
 	{
 		iPhysicsBody *pBody = it.Next();
-		if (IsReplicable(pBody) == false)
+		if (IsStreamable(pBody) == false)
 			continue;
 		const tString &sName = pBody->GetName();
 		const uint32_t lHash = NetHashName(sName.c_str());
@@ -330,6 +350,52 @@ void cBodySync::BuildStateBatches(unsigned char *apMoving, size_t *apMovingLen,
 		mlRoundRobinCursor = lHash;
 	}
 
+	/* Keyframe trickle: re-announce a couple of SLEEPING bodies per tick in
+	   the moving batch's spare slots (unreliable — the next sweep repeats
+	   it). Before this, a guest copy that drifted from a host body that is
+	   asleep (a guest-only character bump, a body the host never woke, a
+	   rest pose applied before the guest's own load settle finished) stayed
+	   wrong until the host happened to move it — then it popped, or the
+	   host's pose appeared inside/through geometry. Guests pin these like
+	   any rest pose; one already pinned at that pose is left untouched.
+	   Never touches m_mapSent: the delta stream's bookkeeping is unchanged. */
+	if (lMoving < kMaxStatesPerBatch)
+	{
+		tBodyIt kit = m_mapBodies.upper_bound(mlKeyframeCursor);
+		int lKeys = 0;
+		for (size_t n = 0; n < lBodies && lKeys < kKeyframesPerTick &&
+			 lMoving < kMaxStatesPerBatch; ++n)
+		{
+			if (kit == m_mapBodies.end())
+				kit = m_mapBodies.begin();
+			const uint32_t lHash = kit->first;
+			iPhysicsBody *pBody = kit->second;
+			++kit;
+			mlKeyframeCursor = lHash;
+
+			if (pBody->GetEnabled() || !pBody->IsActive())
+				continue; /* awake: the delta stream covers it */
+			std::map<uint32_t, cSendRecord>::const_iterator ri = m_mapSent.find(lHash);
+			if (ri != m_mapSent.end() && ri->second.mbWasEnabled)
+				continue; /* its reliable sleep edge is still due */
+
+			const cMatrixf mtx = pBody->GetWorldMatrix();
+			const cVector3f vPos = mtx.GetTranslation();
+			cQuaternion qRot;
+			qRot.FromRotationMatrix(mtx.GetRotation());
+
+			cNetObjectState st;
+			st.mlNameHash = lHash;
+			st.mfPosX = vPos.x; st.mfPosY = vPos.y; st.mfPosZ = vPos.z;
+			st.mfRotX = qRot.v.x; st.mfRotY = qRot.v.y; st.mfRotZ = qRot.v.z; st.mfRotW = qRot.w;
+			st.mFlags = kNetObjectFlag_Sleeping;
+			memcpy(apMoving + sizeof(cNetObjectStateBatch) + (size_t)lMoving * sizeof(cNetObjectState),
+				&st, sizeof(st));
+			++lMoving;
+			++lKeys;
+		}
+	}
+
 	cNetObjectStateBatch hdr;
 	hdr.mType = eNetPacketType_ObjectState;
 	hdr.mMapGen = mlMapGen;
@@ -410,45 +476,151 @@ size_t cBodySync::BuildSnapshotChunk(unsigned char *apBuf, uint32_t *apCursor)
 }
 
 //-----------------------------------------------------------------------
+// Guest apply. The host's world is the truth; ours only has to LOOK like
+// it, without fighting our own Newton. Tuning in seconds / metres / radians.
+//-----------------------------------------------------------------------
+
+namespace
+{
+/* P term: the velocity that closes the error in this long (~6 frames) —
+   stiff enough to track a thrown object, soft enough that contacts win. */
+const float kDriveTime = 0.1f;
+/* Speed clamps. Free bodies 10 m/s = 17 cm per 60 Hz step, under the wall
+   thickness of these maps (Newton 1.x runs without CCD). Jointed bodies get
+   gentle clamps: a pose the local joint cannot reach (lock state, limits)
+   must never turn into a constraint force big enough to break the joint. */
+const float kMaxDriveSpeed = 10.0f;
+const float kMaxDriveOmega = 20.0f;
+const float kMaxJointSpeed = 4.0f;
+const float kMaxJointOmega = 6.0f;
+/* Feed-forward: host motion estimated from consecutive states. */
+const float kMaxFfSpeed = 20.0f;
+const float kMaxFfOmega = 25.0f;
+const int kMaxFfSeqGap = 6;     /* a sample pair further apart says nothing */
+const float kExtrapMax = 0.1f;  /* dead-reckon the target at most 3 ticks */
+/* Hard snaps: pose set, motion zeroed. */
+const float kSnapDist = 1.5f;   /* teleport-sized: no sliding across the room */
+const float kSnapAngle = 2.6f;  /* ~150 deg, also where the axis degenerates */
+const float kStuckDist = 0.35f;
+const float kStuckAngle = 1.0f;
+const float kStuckTime = 0.5f;  /* blocked by something only we have */
+const float kStuckTimeJoint = 1.5f;
+/* Rest handling. */
+const float kStaleTime = 1.0f;  /* host silent on an awake body = holding still */
+const float kPinDist = 0.02f;
+const float kPinAngle = 0.035f; /* ~2 deg */
+const float kSettleTime = 0.75f;
+const float kDisturbGrace = 0.5f;
+const float kQuietDist = 0.005f;
+const float kQuietAngle = 0.009f;
+const float kSamePoseDist = 0.002f;
+const float kSamePoseDot = 0.99999f; /* |q.q'| ~ 0.5 deg */
+/* Per-body seq guard: a reorder never spans this long; past it the uint16
+   counter may have wrapped (~18 min at 30 Hz), so the new arrival wins. */
+const float kSeqWindow = 10.0f;
+/* Held prediction. */
+const float kHeldGain = 14.0f;
+const float kMaxHeldSpeed = 8.0f;
+
+/* cVector3f::Length() is not const-qualified in this engine. */
+float VecLen(const cVector3f &avV)
+{
+	return sqrtf(avV.x * avV.x + avV.y * avV.y + avV.z * avV.z);
+}
+
+cVector3f ClampLength(const cVector3f &avV, float afMax)
+{
+	const float fLen = VecLen(avV);
+	if (fLen > afMax && fLen > 0.0f)
+		return avV * (afMax / fLen);
+	return avV;
+}
+
+/* Wire floats are untrusted: NaN/inf/absurd positions never reach Newton. */
+bool IsSaneCoord(float afX)
+{
+	return afX == afX && afX < 1.0e5f && afX > -1.0e5f;
+}
+
+/** Axis-angle of the WORLD-frame rotation taking aCur's orientation onto
+    aTgt's: E = Rt * Rc^T (HPL matrices act on column vectors, v' = M v, the
+    same convention cQuaternion::To/FromRotationMatrix use). Axis from the
+    skew part, angle via atan2: sign-agnostic (q and -q are one matrix, so
+    no hemisphere flip can make it spin the long way) and well-conditioned
+    at every angle; near 180 deg the axis is undefined and comes back zero
+    (callers hard-snap there). Newton's omega is world-space, right-handed:
+    axis * angle / T turns aCur toward aTgt. */
+void RotationError(const cMatrixf &aTgt, const cMatrixf &aCur, cVector3f *apAxis, float *apAngle)
+{
+	float e[3][3];
+	for (int i = 0; i < 3; ++i)
+		for (int j = 0; j < 3; ++j)
+			e[i][j] = aTgt.m[i][0] * aCur.m[j][0] + aTgt.m[i][1] * aCur.m[j][1] +
+				aTgt.m[i][2] * aCur.m[j][2];
+	const cVector3f vSkew(e[2][1] - e[1][2], e[0][2] - e[2][0], e[1][0] - e[0][1]);
+	const float fSkew = VecLen(vSkew); /* = 2 sin(angle) */
+	float fCos = 0.5f * (e[0][0] + e[1][1] + e[2][2] - 1.0f);
+	if (fCos > 1.0f)
+		fCos = 1.0f;
+	if (fCos < -1.0f)
+		fCos = -1.0f;
+	*apAngle = atan2f(0.5f * fSkew, fCos);
+	if (fSkew > 1.0e-6f)
+		*apAxis = vSkew / fSkew;
+	else
+		*apAxis = cVector3f(0, 0, 0);
+}
+
+/** aRot turned by the world-space rotation vector avRotVec (axis * angle). */
+cMatrixf RotateWorld(const cMatrixf &aRot, const cVector3f &avRotVec)
+{
+	const float fAngle = VecLen(avRotVec);
+	if (fAngle < 1.0e-6f)
+		return aRot;
+	cQuaternion q;
+	q.FromAngleAxis(fAngle, avRotVec / fAngle);
+	return cMath::MatrixMul(cMath::MatrixQuaternion(q), aRot);
+}
+
+float QuatAbsDot(const cQuaternion &a, const cQuaternion &b)
+{
+	return fabsf(a.v.x * b.v.x + a.v.y * b.v.y + a.v.z * b.v.z + a.w * b.w);
+}
+} // namespace
+
+//-----------------------------------------------------------------------
+
+void cBodySync::PinGuestBody(iPhysicsBody *apBody, cGuestBody &aRec)
+{
+	cMatrixf mtx = cMath::MatrixQuaternion(aRec.mqRot);
+	mtx.SetTranslation(aRec.mvPos);
+	apBody->SetMatrix(mtx);
+	apBody->SetLinearVelocity(cVector3f(0, 0, 0));
+	apBody->SetAngularVelocity(cVector3f(0, 0, 0));
+	apBody->SetEnabled(false); /* Newton freeze: exactly where the host has it */
+	aRec.mbPinned = true;
+	aRec.mfSettleTime = 0;
+	aRec.mfStuckTime = 0;
+	aRec.mfDisturbTime = 0;
+}
 
 void cBodySync::ApplyStateBatch(const void *apData, size_t alLen)
 {
 	if (!apData || alLen < sizeof(cNetObjectStateBatch))
 		return;
 
-	const cNetObjectStateBatch *pHdr = (const cNetObjectStateBatch *)apData;
+	cNetObjectStateBatch hdr;
+	memcpy(&hdr, apData, sizeof(hdr));
 	/* Stale-map guard (v4): only apply batches from the generation the
 	   census verified. Packets in flight across a level change die here. */
-	if (mbRemoteMapGenKnown && pHdr->mMapGen != mlRemoteMapGen)
+	if (mbRemoteMapGenKnown && hdr.mMapGen != mlRemoteMapGen)
 		return;
 
 	const unsigned char *pRaw = (const unsigned char *)apData;
-	size_t lCount = pHdr->mCount;
+	size_t lCount = hdr.mCount;
 	const size_t lWhole = (alLen - sizeof(cNetObjectStateBatch)) / sizeof(cNetObjectState);
 	if (lCount > lWhole)
 		lCount = lWhole; /* truncated/corrupt length: apply only whole entries */
-
-	/* v7 reorder guard. Only PURE-MOVING batches (unreliable channel) are
-	   droppable — the next tick replaces them anyway. Anything carrying a
-	   rest pose, and the reliable snapshot chunks, is always applied. */
-	{
-		bool bPureMoving = true;
-		for (size_t i = 0; i < lCount && bPureMoving; ++i)
-		{
-			cNetObjectState st;
-			memcpy(&st, pRaw + sizeof(cNetObjectStateBatch) + i * sizeof(cNetObjectState), sizeof(st));
-			if (st.mFlags & kNetObjectFlag_Sleeping)
-				bPureMoving = false;
-		}
-		if (bPureMoving && mbBatchSeqInKnown &&
-			(int16_t)(pHdr->mSeq - mlBatchSeqIn) <= 0)
-			return; /* stale reordered batch: applying it pops bodies backward */
-		if (!mbBatchSeqInKnown || (int16_t)(pHdr->mSeq - mlBatchSeqIn) > 0)
-		{
-			mlBatchSeqIn = pHdr->mSeq;
-			mbBatchSeqInKnown = true;
-		}
-	}
 
 	RebuildIndexIfNeeded();
 	if (m_mapBodies.empty())
@@ -461,14 +633,16 @@ void cBodySync::ApplyStateBatch(const void *apData, size_t alLen)
 
 		std::map<uint32_t, iPhysicsBody *>::iterator bi = m_mapBodies.find(st.mlNameHash);
 		if (bi == m_mapBodies.end())
-			continue; /* unknown hash: map mismatch or a destroyed body */
+			continue; /* unknown hash: map mismatch, destroyed body or a ragdoll bone */
 		iPhysicsBody *pBody = bi->second;
 
-		/* Wire floats are untrusted: a degenerate quaternion would scale the
-		   body's rotation matrix. Normalize; drop the entry if it's garbage. */
+		/* A degenerate quaternion would scale the body's rotation matrix,
+		   a NaN position would poison Newton. Normalize / drop. */
 		const float fQLen = sqrtf(st.mfRotX * st.mfRotX + st.mfRotY * st.mfRotY +
 			st.mfRotZ * st.mfRotZ + st.mfRotW * st.mfRotW);
 		if (!(fQLen > 0.5f && fQLen < 2.0f))
+			continue;
+		if (!IsSaneCoord(st.mfPosX) || !IsSaneCoord(st.mfPosY) || !IsSaneCoord(st.mfPosZ))
 			continue;
 		cQuaternion qRot;
 		qRot.v.x = st.mfRotX / fQLen;
@@ -477,35 +651,100 @@ void cBodySync::ApplyStateBatch(const void *apData, size_t alLen)
 		qRot.w = st.mfRotW / fQLen;
 		const cVector3f vPos(st.mfPosX, st.mfPosY, st.mfPosZ);
 
-		if (st.mFlags & kNetObjectFlag_Sleeping)
+		/* PER-BODY reorder guard. Moving batches ride the unsequenced
+		   channel, rest poses / snapshot chunks the reliable one, keyframes
+		   the unsequenced one again — all stamped from one host counter. The
+		   old whole-batch guard only protected pure-moving batches, so a
+		   reliable rest pose delayed by a retransmit re-pinned (and froze) a
+		   body the host had long since thrown again, and a snapshot chunk of
+		   all-awake bodies could be dropped whole. Newest per body wins. */
+		std::map<uint32_t, cGuestBody>::iterator gi = m_mapGuestBodies.find(st.mlNameHash);
+		const bool bKnown = gi != m_mapGuestBodies.end();
+		if (bKnown && (mfGuestClock - gi->second.mfRecvClock) < kSeqWindow &&
+			(int16_t)(hdr.mSeq - gi->second.mlSeq) <= 0)
+			continue;
+		cGuestBody &rec = bKnown ? gi->second : m_mapGuestBodies[st.mlNameHash];
+
+		const bool bRest = (st.mFlags & kNetObjectFlag_Sleeping) != 0;
+		const bool bHeldByUs = st.mlNameHash == mlGuestHeldHash && !mbGuestHeldPick;
+		/* the body was following a live stream until now (not a snapshot,
+		   keyframe or first contact) */
+		const bool bWasStreaming = bKnown && !rec.mbRest && rec.mfAge < kStaleTime;
+		const bool bRecentSample = bKnown && (mfGuestClock - rec.mfRecvClock) < 1.0f;
+		const int lSeqGap = (int16_t)(hdr.mSeq - rec.mlSeq);
+
+		if (bRest)
 		{
-			/* Rest pose (reliable, sent once): pin it exactly, right now. */
-			cMatrixf mtx = cMath::MatrixQuaternion(qRot);
-			mtx.SetTranslation(vPos);
-			pBody->SetMatrix(mtx);
-			pBody->SetLinearVelocity(cVector3f(0, 0, 0));
-			pBody->SetAngularVelocity(cVector3f(0, 0, 0));
-			pBody->SetEnabled(false);
-			m_mapGuestTargets.erase(st.mlNameHash);
+			const bool bSamePose = bKnown && rec.mbRest && rec.mbPinned &&
+				VecLen(vPos - rec.mvPos) < kSamePoseDist &&
+				QuatAbsDot(qRot, rec.mqRot) > kSamePoseDot;
+			rec.mvPos = vPos;
+			rec.mqRot = qRot;
+			rec.mvVel = cVector3f(0, 0, 0);
+			rec.mvOmega = cVector3f(0, 0, 0);
+			rec.mbHaveMotion = false;
+			rec.mbRest = true;
+			if (!bSamePose)
+			{
+				/* keyframe of an already pinned pose: leave the body alone */
+				rec.mbPinned = false;
+				rec.mfSettleTime = 0;
+				rec.mfStuckTime = 0;
+				rec.mfDisturbTime = 0;
+			}
+			/* Not being driven (late-join snapshot, keyframe correction, first
+			   word about this body): pin right now instead of sliding into
+			   place. A body that was streaming a moment ago eases the last
+			   centimetres in UpdateGuestBlend and pins there. */
+			if (!rec.mbPinned && !bWasStreaming && !bHeldByUs && pBody->IsActive())
+				PinGuestBody(pBody, rec);
 		}
 		else
 		{
-			/* Moving: becomes a blend target — UpdateGuestBlend eases the
-			   body onto it each frame, so 20 Hz packets over an internet
-			   link render smooth instead of steppy. Our own predicted held
-			   body ignores the (round-trip lagged) host echo entirely. */
-			if (st.mlNameHash == mlGuestHeldHash && !mbGuestHeldPick)
-				continue;
-			cGuestTarget &tgt = m_mapGuestTargets[st.mlNameHash];
-			tgt.mvPos = vPos;
-			tgt.mqRot = qRot;
-			tgt.mfAge = 0;
-			if (pBody->GetEnabled() == false)
-				pBody->SetEnabled(true); /* remote says it moves — wake the twin */
+			/* Feed-forward sample: host motion between this state and the
+			   previous one, over the HOST's clock (batch seq x send period;
+			   receive-time deltas would carry all the internet jitter). */
+			if (bRecentSample && lSeqGap >= 1 && lSeqGap <= kMaxFfSeqGap)
+			{
+				const float fDt = (float)lSeqGap * kNetSendPeriodSeconds;
+				const cVector3f vVel = ClampLength((vPos - rec.mvPos) / fDt, kMaxFfSpeed);
+				cVector3f vAxis;
+				float fAngle;
+				RotationError(cMath::MatrixQuaternion(qRot), cMath::MatrixQuaternion(rec.mqRot),
+					&vAxis, &fAngle);
+				const cVector3f vOmega = ClampLength(vAxis * (fAngle / fDt), kMaxFfOmega);
+				if (rec.mbHaveMotion)
+				{
+					rec.mvVel = (rec.mvVel + vVel) * 0.5f; /* light low-pass */
+					rec.mvOmega = (rec.mvOmega + vOmega) * 0.5f;
+				}
+				else
+				{
+					rec.mvVel = vVel;
+					rec.mvOmega = vOmega;
+				}
+				rec.mbHaveMotion = true;
+			}
+			else
+			{
+				rec.mvVel = cVector3f(0, 0, 0);
+				rec.mvOmega = cVector3f(0, 0, 0);
+				rec.mbHaveMotion = false;
+			}
+			rec.mvPos = vPos;
+			rec.mqRot = qRot;
+			rec.mbRest = false;
+			rec.mbPinned = false;
+			rec.mfSettleTime = 0;
+			rec.mfDisturbTime = 0;
+			/* waking happens in the drive, which needs the body awake */
 		}
+		rec.mlSeq = hdr.mSeq;
+		rec.mfRecvClock = mfGuestClock;
+		rec.mfAge = 0;
 
 		++mlStatApplied;
-		/* NOTE: no per-entry Log here on purpose — at 20 Hz x N bodies the old
+		/* NOTE: no per-entry Log here on purpose — at 30 Hz x N bodies the old
 		   trace wrote hundreds of lines/second into hpl.log (OneDrive-synced!)
 		   and could hitch the frame. The 1 Hz stats line is the health signal. */
 	}
@@ -513,90 +752,181 @@ void cBodySync::ApplyStateBatch(const void *apData, size_t alLen)
 
 //-----------------------------------------------------------------------
 
-/** Normalized lerp between two quaternions (shortest arc) — plenty for the
-    small per-frame steps the blender takes. */
-static cQuaternion QuatNlerp(const cQuaternion &a, const cQuaternion &b, float t)
-{
-	float fDot = a.v.x * b.v.x + a.v.y * b.v.y + a.v.z * b.v.z + a.w * b.w;
-	const float fSign = fDot < 0 ? -1.0f : 1.0f;
-	cQuaternion q;
-	q.v.x = a.v.x + (b.v.x * fSign - a.v.x) * t;
-	q.v.y = a.v.y + (b.v.y * fSign - a.v.y) * t;
-	q.v.z = a.v.z + (b.v.z * fSign - a.v.z) * t;
-	q.w = a.w + (b.w * fSign - a.w) * t;
-	const float fLen = sqrtf(q.v.x * q.v.x + q.v.y * q.v.y + q.v.z * q.v.z + q.w * q.w);
-	if (fLen > 0.0001f)
-	{
-		q.v.x /= fLen; q.v.y /= fLen; q.v.z /= fLen; q.w /= fLen;
-	}
-	return q;
-}
-
 void cBodySync::UpdateGuestBlend(float afTimeStep)
 {
+	mfGuestClock += afTimeStep;
+	if (afTimeStep <= 0.0f || mpWorld == NULL)
+		return;
+	if (m_mapGuestBodies.empty() && mlGuestHeldHash == 0)
+		return;
+	iPhysicsWorld *pPhysics = mpWorld->GetPhysicsWorld();
+	if (pPhysics == NULL)
+		return;
+	/* ONE index probe per frame (GetBodyByHash per record would recount the
+	   whole physics world for every body). */
+	RebuildIndexIfNeeded();
+	/* Newton adds g*dt to every gravity body in the coming step; commanding
+	   (v - g*dt) makes the body move at exactly v instead of sagging. */
+	const cVector3f vGravityStep = pPhysics->GetGravity() * afTimeStep;
+
 	/* ---- held-object prediction: our copy tracks OUR crosshair target ---- */
 	if (mlGuestHeldHash != 0 && !mbGuestHeldPick && mbGuestHeldHasTarget)
 	{
-		iPhysicsBody *pBody = GetBodyByHash(mlGuestHeldHash);
-		if (pBody)
+		std::map<uint32_t, iPhysicsBody *>::iterator hb = m_mapBodies.find(mlGuestHeldHash);
+		iPhysicsBody *pBody = hb == m_mapBodies.end() ? NULL : hb->second;
+		if (pBody && pBody->IsActive())
 		{
-			/* same "current pick point" math as the grab spring */
-			const cMatrixf mtx = pBody->GetWorldMatrix();
-			cVector3f vCurrent = cMath::MatrixMul(mtx, pBody->GetMassCentre())
-				+ mvGuestHeldRelPick;
-			const cVector3f vDelta = mvGuestHeldTarget - vCurrent;
-			const float k = 1.0f - expf(-afTimeStep * 14.0f); /* snappy but not teleporty */
-			cMatrixf mtxNew = mtx;
-			mtxNew.SetTranslation(mtx.GetTranslation() + vDelta * k);
-			pBody->SetMatrix(mtxNew);
-			pBody->SetLinearVelocity(cVector3f(0, 0, 0));
-			pBody->SetAngularVelocity(pBody->GetAngularVelocity() * 0.9f);
+			/* Same "current pick point" math as the grab spring — but driven
+			   by VELOCITY. It used to SetMatrix the body toward the crosshair:
+			   a teleport is not swept, so aiming behind a wall pulled the box
+			   straight through it. Now Newton's contacts stop it at the wall,
+			   exactly like the local grab. */
+			const cVector3f vCurrent = cMath::MatrixMul(pBody->GetWorldMatrix(),
+				pBody->GetMassCentre()) + mvGuestHeldRelPick;
+			cVector3f vVel = ClampLength((mvGuestHeldTarget - vCurrent) * kHeldGain, kMaxHeldSpeed);
+			if (pBody->GetGravity())
+				vVel -= vGravityStep; /* the free grab turned it off; belt and braces */
 			pBody->SetEnabled(true);
+			pBody->SetLinearVelocity(vVel);
+			pBody->SetAngularVelocity(pBody->GetAngularVelocity() * 0.85f);
 		}
 	}
 
-	/* ---- everything else eases onto the latest received state ---- */
-	if (m_mapGuestTargets.empty())
-		return;
-	const float k = 1.0f - expf(-afTimeStep * 15.0f);
-	for (std::map<uint32_t, cGuestTarget>::iterator it = m_mapGuestTargets.begin();
-		 it != m_mapGuestTargets.end();)
+	/* ---- everything else follows the host ---- */
+	for (std::map<uint32_t, cGuestBody>::iterator it = m_mapGuestBodies.begin();
+		 it != m_mapGuestBodies.end();)
 	{
-		cGuestTarget &tgt = it->second;
-		tgt.mfAge += afTimeStep;
-		iPhysicsBody *pBody = GetBodyByHash(it->first);
-		/* Stale (host quiet > 1 s: lost sleep edge or lost body) — release the
-		   body to plain local physics; it settles where it stands. */
-		if (pBody == NULL || tgt.mfAge > 1.0f)
+		const uint32_t lHash = it->first;
+		cGuestBody &rec = it->second;
+		std::map<uint32_t, iPhysicsBody *>::iterator bi = m_mapBodies.find(lHash);
+		if (bi == m_mapBodies.end())
 		{
-			m_mapGuestTargets.erase(it++);
+			m_mapGuestBodies.erase(it++); /* body destroyed */
 			continue;
 		}
 		++it;
+		iPhysicsBody *pBody = bi->second;
+		rec.mfAge += afTimeStep;
 
-		const cMatrixf mtx = pBody->GetWorldMatrix();
-		const cVector3f vCur = mtx.GetTranslation();
-		const cVector3f vErr = tgt.mvPos - vCur;
-		const float fErrSq = vErr.x * vErr.x + vErr.y * vErr.y + vErr.z * vErr.z;
+		if (lHash == mlGuestHeldHash && !mbGuestHeldPick)
+			continue; /* our prediction owns it; rec keeps the host's latest */
+		if (!pBody->IsActive())
+			continue; /* hidden/disabled entity: not ours to move */
 
-		cQuaternion qCur;
-		qCur.FromRotationMatrix(mtx.GetRotation());
-
-		cMatrixf mtxNew;
-		if (fErrSq > 1.5f * 1.5f)
+		/* Pinned: frozen at the host's rest pose. If OUR physics woke it (the
+		   guest's character bumped it, a local-only contact) the host never
+		   saw that — let the bump play out briefly, then bring it back. */
+		if (rec.mbPinned)
 		{
-			/* teleport-sized error: snap, no easing across the room */
-			mtxNew = cMath::MatrixQuaternion(tgt.mqRot);
-			mtxNew.SetTranslation(tgt.mvPos);
+			if (!pBody->GetEnabled())
+			{
+				rec.mfDisturbTime = 0;
+				continue;
+			}
+			rec.mfDisturbTime += afTimeStep;
+			if (rec.mfDisturbTime < kDisturbGrace)
+				continue;
+			rec.mbPinned = false;
+			rec.mfSettleTime = 0;
+			rec.mfStuckTime = 0;
 		}
+
+		/* Host silent on an awake body for a second: it moves < 1 cm/tick,
+		   i.e. it is holding still there (held in the air, wedged, about to
+		   sleep). Hold it at that pose. This used to RELEASE the body to
+		   local physics — often already auto-frozen by Newton (its velocity
+		   was zeroed every frame), so it stayed floating mid-air. */
+		if (!rec.mbRest && rec.mfAge > kStaleTime)
+		{
+			rec.mbRest = true;
+			rec.mbHaveMotion = false;
+			rec.mvVel = cVector3f(0, 0, 0);
+			rec.mvOmega = cVector3f(0, 0, 0);
+			rec.mfSettleTime = 0;
+		}
+
+		const bool bJointed = pBody->GetJointNum() > 0;
+		const bool bMotion = !rec.mbRest && rec.mbHaveMotion;
+		const bool bFeedForward = bMotion && rec.mfAge < kExtrapMax;
+		const float fExtrap = bMotion ? (rec.mfAge < kExtrapMax ? rec.mfAge : kExtrapMax) : 0.0f;
+
+		/* Target = host pose dead-reckoned to now (bounded). */
+		cMatrixf mtxTgt = cMath::MatrixQuaternion(rec.mqRot);
+		if (fExtrap > 0.0f)
+			mtxTgt = RotateWorld(mtxTgt, rec.mvOmega * fExtrap);
+		mtxTgt.SetTranslation(rec.mvPos + rec.mvVel * fExtrap);
+
+		/* Errors at the CENTRE OF MASS: Newton's velocity is the COM's and
+		   its omega turns about the COM, so this is what they close. */
+		const cMatrixf mtxCur = pBody->GetWorldMatrix();
+		const cVector3f vMassCentre = pBody->GetMassCentre();
+		const cVector3f vErr = cMath::MatrixMul(mtxTgt, vMassCentre) -
+			cMath::MatrixMul(mtxCur, vMassCentre);
+		const float fDist = VecLen(vErr);
+		cVector3f vAxis;
+		float fAngle;
+		RotationError(mtxTgt, mtxCur, &vAxis, &fAngle);
+
+		bool bSnap = fDist > kSnapDist || fAngle > kSnapAngle;
+		if (fDist > kStuckDist || fAngle > kStuckAngle)
+			rec.mfStuckTime += afTimeStep;
 		else
+			rec.mfStuckTime = 0;
+		if (rec.mfStuckTime > (bJointed ? kStuckTimeJoint : kStuckTime))
+			bSnap = true;
+
+		if (rec.mbRest)
 		{
-			mtxNew = cMath::MatrixQuaternion(QuatNlerp(qCur, tgt.mqRot, k));
-			mtxNew.SetTranslation(vCur + vErr * k);
+			rec.mfSettleTime += afTimeStep;
+			if (bSnap || (fDist < kPinDist && fAngle < kPinAngle) || rec.mfSettleTime > kSettleTime)
+			{
+				PinGuestBody(pBody, rec);
+				continue;
+			}
 		}
-		pBody->SetMatrix(mtxNew);
-		pBody->SetLinearVelocity(cVector3f(0, 0, 0));
-		pBody->SetAngularVelocity(cVector3f(0, 0, 0));
+		else if (bSnap)
+		{
+			/* Teleport-sized or stuck: the host's pose is collision-free in
+			   the host's world (same static geometry), so snap — and zero
+			   the motion so Newton starts clean from it. */
+			pBody->SetMatrix(mtxTgt);
+			pBody->SetLinearVelocity(cVector3f(0, 0, 0));
+			pBody->SetAngularVelocity(cVector3f(0, 0, 0));
+			pBody->SetEnabled(true);
+			rec.mfStuckTime = 0;
+			continue;
+		}
+
+		/* Velocity drive: P term + host motion, clamped. Newton integrates it
+		   WITH collision, so the body can be blocked but never tunnels, and
+		   there is no teleport into penetration for the contact solver to
+		   blow apart (the old per-frame SetMatrix + zeroed velocity: the
+		   barrel "break dance", the spinning, the auto-freeze mid-air). */
+		cVector3f vVel = vErr * (1.0f / kDriveTime);
+		cVector3f vOmega = vAxis * (fAngle / kDriveTime);
+		if (bFeedForward)
+		{
+			vVel += rec.mvVel;
+			vOmega += rec.mvOmega;
+		}
+		vVel = ClampLength(vVel, bJointed ? kMaxJointSpeed : kMaxDriveSpeed);
+		vOmega = ClampLength(vOmega, bJointed ? kMaxJointOmega : kMaxDriveOmega);
+
+		if (!pBody->GetEnabled())
+		{
+			/* Newton put it to sleep right on target and the host shows no
+			   motion: nothing to do. Otherwise wake it — a frozen body
+			   ignores velocities. */
+			const bool bQuiet = fDist < kQuietDist && fAngle < kQuietAngle &&
+				(!bFeedForward || (VecLen(rec.mvVel) < 0.05f && VecLen(rec.mvOmega) < 0.05f));
+			if (bQuiet)
+				continue;
+			pBody->SetEnabled(true);
+		}
+		if (pBody->GetGravity())
+			vVel -= vGravityStep;
+		pBody->SetLinearVelocity(vVel);
+		pBody->SetAngularVelocity(vOmega);
 	}
 }
 
@@ -606,8 +936,8 @@ void cBodySync::SetGuestHeld(uint32_t alHash, bool abPickAtPoint, const cVector3
 	mbGuestHeldPick = abPickAtPoint;
 	mvGuestHeldRelPick = avRelPick;
 	mbGuestHeldHasTarget = false;
-	if (!abPickAtPoint)
-		m_mapGuestTargets.erase(alHash); /* prediction owns it while held */
+	/* The host-state record stays: while the prediction owns the body it
+	   keeps collecting the host's echo, which takes over on release. */
 }
 
 void cBodySync::UpdateGuestHeldTarget(const cVector3f &avTarget)
@@ -618,6 +948,8 @@ void cBodySync::UpdateGuestHeldTarget(const cVector3f &avTarget)
 
 void cBodySync::ClearGuestHeld()
 {
+	/* No body mutation to undo: the prediction only ever set velocities
+	   (the grab state itself restores gravity/mass/auto-disable). */
 	mlGuestHeldHash = 0;
 	mbGuestHeldHasTarget = false;
 }
@@ -687,6 +1019,10 @@ void cBodySync::RemoteGrabBegin(uint32_t alHash, uint8_t alPeerId, bool abPickAt
 	if (pBody == NULL)
 		return;
 
+	/* The host player snatched this body from a guest earlier and has let go
+	   since: put the true defaults back BEFORE capturing them below. */
+	ApplyPendingRestore(alHash, pBody);
+
 	/* A snatch may land on a body another guest still "holds" — restore that
 	   grab's body mutations before stacking new ones. */
 	std::map<uint32_t, cRemoteGrab>::iterator old = m_mapRemoteGrabs.find(alHash);
@@ -706,6 +1042,7 @@ void cBodySync::RemoteGrabBegin(uint32_t alHash, uint8_t alPeerId, bool abPickAt
 	grab.mfMassMul = afMassMul < 0.1f ? 0.1f : (afMassMul > 20.0f ? 20.0f : afMassMul);
 	grab.mfDefaultMass = pBody->GetMass();
 	grab.mbHadGravity = pBody->GetGravity();
+	grab.mbHadAutoDisable = pBody->GetAutoDisable();
 	grab.mGrabPid.SetErrorNum(10);
 	grab.mGrabPid.Reset();
 	/* Same gains the grab state uses (PlayerState_Interact.cpp OnUpdate). */
@@ -745,8 +1082,23 @@ void cBodySync::RestoreGrabbedBody(iPhysicsBody *apBody, const cRemoteGrab &aGra
 		apBody->SetGravity(aGrab.mbHadGravity);
 		apBody->SetMass(aGrab.mfDefaultMass);
 	}
-	apBody->SetAutoDisable(true);
+	apBody->SetAutoDisable(aGrab.mbHadAutoDisable);
 	apBody->SetEnabled(true);
+}
+
+void cBodySync::ApplyPendingRestore(uint32_t alHash, iPhysicsBody *apBody)
+{
+	std::map<uint32_t, cPendingRestore>::iterator it = m_mapPendingRestore.find(alHash);
+	if (it == m_mapPendingRestore.end())
+		return;
+	if (apBody)
+	{
+		apBody->SetGravity(it->second.mbGravity);
+		apBody->SetMass(it->second.mfMass);
+		apBody->SetAutoDisable(it->second.mbAutoDisable);
+		apBody->SetEnabled(true); /* fall now if gravity just came back */
+	}
+	m_mapPendingRestore.erase(it);
 }
 
 bool cBodySync::RemoteGrabEnd(uint32_t alHash, uint8_t alPeerId, const cVector3f &avImpulse)
@@ -758,7 +1110,23 @@ bool cBodySync::RemoteGrabEnd(uint32_t alHash, uint8_t alPeerId, const cVector3f
 		return false; /* stale end from a peer that already lost the body */
 
 	iPhysicsBody *pBody = GetBodyByHash(alHash);
-	if (pBody)
+	/* HOST SNATCH: NetGrabBegin marks the host as holder, THEN ends the
+	   guest's grab — from inside cPlayerState_Grab::EnterState, which has
+	   already recorded the body's "defaults" (gravity + mass) with this
+	   grab's gravity-off and mass/5 still applied, and will write them back
+	   on LeaveState: the body used to end up floating, at a fifth of its
+	   mass, for the rest of the map. Leave the host's hold alone now and
+	   re-apply the true defaults once the host lets go (UpdateRemoteGrabs). */
+	const bool bHostSnatch = GetHolder(alHash) == 1 && !it->second.mbPickAtPoint;
+	if (pBody && bHostSnatch)
+	{
+		cPendingRestore pend;
+		pend.mfMass = it->second.mfDefaultMass;
+		pend.mbGravity = it->second.mbHadGravity;
+		pend.mbAutoDisable = it->second.mbHadAutoDisable;
+		m_mapPendingRestore[alHash] = pend;
+	}
+	else if (pBody)
 	{
 		RestoreGrabbedBody(pBody, it->second);
 
@@ -857,6 +1225,19 @@ int cBodySync::ReleaseAllHeldBy(uint8_t alPeerId)
 
 void cBodySync::UpdateRemoteGrabs(float afTimeStep)
 {
+	/* Host snatches whose hold has ended: the grab state's LeaveState has
+	   run (it clears the holder first thing, in the same call), so the
+	   wrong "defaults" it wrote back can be corrected now. */
+	for (std::map<uint32_t, cPendingRestore>::iterator pit = m_mapPendingRestore.begin();
+		 pit != m_mapPendingRestore.end();)
+	{
+		const uint32_t lHash = pit->first;
+		++pit; /* ApplyPendingRestore erases the entry */
+		if (GetHolder(lHash) == 1)
+			continue; /* host still holding */
+		ApplyPendingRestore(lHash, GetBodyByHash(lHash));
+	}
+
 	if (m_mapRemoteGrabs.empty())
 		return;
 

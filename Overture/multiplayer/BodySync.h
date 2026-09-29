@@ -15,9 +15,31 @@
  *
  * RUNG 1: identity + census.
  * RUNG 2: host streams awake dynamic bodies (pose-only deltas, sleep-edge
- * final states, reliable full snapshot for late joiners); the guest snaps
- * pose + zeroes motion — its Newton only settles bodies between packets.
+ * final states, reliable full snapshot for late joiners, and a slow
+ * unreliable keyframe trickle of sleeping bodies).
  * Guest intent forwarding (grabs/pushes acting on the host sim) is RUNG 3.
+ *
+ * Guest apply (rewritten after the first internet test: "barrel break
+ * dancing", spinning, phasing through walls, floating objects). The guest
+ * NEVER teleports a moving body every frame any more — that fought its own
+ * Newton (gravity + contact penetration recovery -> jitter/spin), dragged
+ * bodies through walls (a SetMatrix is not swept) and let Newton auto-freeze
+ * bodies whose velocity was zeroed every frame (-> frozen mid-air). Instead:
+ *  - moving states are velocity TARGETS: each frame the body gets the
+ *    linear/angular velocity that closes the error (P term at the centre of
+ *    mass + a host-motion feed-forward, clamped, gravity pre-compensated),
+ *    so Newton's own collision keeps it out of walls. Hard snap (motion
+ *    zeroed) only on a teleport-sized error or when stuck > 0.5 s.
+ *  - rest poses pin: exact pose, zero motion, frozen. A pinned body the
+ *    guest's local physics wakes (character bump) is eased back after a
+ *    short grace — the host never saw that bump.
+ *  - a body the host goes silent on (> 1 s) is holding still there: it is
+ *    pinned at the last host pose rather than released to local physics.
+ *  - per-body sequence guard: an older state (unsequenced reorder, a late
+ *    reliable rest pose) never overwrites a newer one for that body.
+ *  - jointed bodies (doors, levers, chains) get gentler velocity clamps so
+ *    the drive never out-muscles (or breaks) the joint.
+ *  - ragdoll bodies are not streamed (the enemy code owns them).
  */
 #ifndef BODY_SYNC_H
 #define BODY_SYNC_H
@@ -35,6 +57,11 @@ public:
 	    (2 + 12*33 = 398 bytes) and spreads a mass upset (shelf collapse) over
 	    a few ticks; the round-robin cursor keeps that fair. */
 	enum { kMaxStatesPerBatch = 12 };
+	/** Sleeping bodies re-announced per tick (unreliable, Sleeping flag) in
+	    the moving batch's spare slots: repairs any guest copy that drifted
+	    from the host's rest pose (a guest-only bump, a body the host never
+	    woke). 2/tick at 30 Hz sweeps 300 bodies in 5 s for ~2 KB/s. */
+	enum { kKeyframesPerTick = 2 };
 	enum { kMaxBatchBytes = sizeof(cNetObjectStateBatch) +
 		kMaxStatesPerBatch * sizeof(cNetObjectState) };
 
@@ -70,13 +97,15 @@ public:
 	size_t BuildSnapshotChunk(unsigned char *apBuf, uint32_t *apCursor);
 
 	/** Guest: ingest one received eNetPacketType_ObjectState payload.
-	    Rest poses pin immediately; moving states become blend TARGETS —
-	    UpdateGuestBlend eases the local bodies onto them every frame, so
-	    20 Hz packets at internet latency render smooth instead of steppy. */
+	    Per-body sequence guard first (older than what we have = dropped).
+	    Rest poses pin (immediately when the body is not being driven);
+	    moving states become velocity-drive TARGETS for UpdateGuestBlend. */
 	void ApplyStateBatch(const void *apData, size_t alLen);
 
-	/** Guest, every frame: ease replicated bodies toward their latest
-	    received states (snaps only on teleport-sized error). */
+	/** Guest, every frame: drive replicated bodies toward their latest
+	    received states with velocities (collision-aware), pin rest poses,
+	    ease locally disturbed rest bodies back. Hard snaps only on a
+	    teleport-sized or stuck error. */
 	void UpdateGuestBlend(float afTimeStep);
 
 	/** Guest, rung 3 at high ping — held-object PREDICTION: while WE hold a
@@ -147,9 +176,11 @@ private:
 	void ComputeCensus(hpl::iPhysicsWorld *apPhysics);
 	void VerifyCensus();
 
-	/** Streamable = something physics can toss around (see the .cpp note on
-	    why mass>0 alone almost — but not quite — covers it). */
+	/** Census member = something physics can toss around (see the .cpp note
+	    on why mass>0 alone almost — but not quite — covers it). */
 	static bool IsReplicable(hpl::iPhysicsBody *apBody);
+	/** Indexed + streamed = replicable minus ragdoll bones (census unchanged). */
+	static bool IsStreamable(hpl::iPhysicsBody *apBody);
 
 	struct cSendRecord
 	{
@@ -165,6 +196,7 @@ private:
 	std::map<uint32_t, cSendRecord> m_mapSent;           /**< sender bookkeeping per hash */
 	int mlWorldBodyCount;        /**< total body count when m_mapBodies was built; -1 = dirty */
 	uint32_t mlRoundRobinCursor; /**< last hash written — the per-tick cap starves nobody */
+	uint32_t mlKeyframeCursor;   /**< host: last sleeping body re-announced (keyframe trickle) */
 
 	/** Map-load census: taken ONCE per world, on the first frame its physics
 	    world exists (map load is synchronous, so every load-time entity is
@@ -189,21 +221,37 @@ private:
 	/** Map generation: bumped on every world change; the HOST's value rides
 	    the census + state batches so a guest can drop stale-map packets. */
 	uint16_t mlBatchSeqOut;   /**< host: stamped on every state batch */
-	uint16_t mlBatchSeqIn;    /**< guest: newest batch seq applied */
-	bool mbBatchSeqInKnown;
 	uint8_t mlMapGen;
 	uint8_t mlRemoteMapGen; /**< guest: host generation we verified against */
 	bool mbRemoteMapGenKnown;
 
-	/** Guest blend target: the latest received pose for one awake body. */
-	struct cGuestTarget
+	/** Guest: what the host last said about one body, and how our local
+	    copy is being brought onto it. */
+	struct cGuestBody
 	{
-		hpl::cVector3f mvPos;
+		hpl::cVector3f mvPos;   /* latest host pose (body origin, world) */
 		hpl::cQuaternion mqRot;
-		float mfAge; /* seconds since last packet; stale targets get dropped */
-		cGuestTarget() : mvPos(0, 0, 0), mfAge(0) {}
+		hpl::cVector3f mvVel;   /* host motion estimate from consecutive */
+		hpl::cVector3f mvOmega; /* moving states (feed-forward), world   */
+		bool mbHaveMotion;
+		uint16_t mlSeq;         /* batch seq of the state above */
+		float mfRecvClock;      /* mfGuestClock when it was applied */
+		float mfAge;            /* seconds since the last state */
+		float mfStuckTime;      /* large error that the drive cannot close */
+		float mfSettleTime;     /* rest pose not pinned yet */
+		float mfDisturbTime;    /* pinned but woken by local physics */
+		bool mbRest;            /* host: asleep (or silent = holding still) */
+		bool mbPinned;          /* rest pose applied exactly + frozen */
+		cGuestBody()
+			: mvPos(0, 0, 0), mvVel(0, 0, 0), mvOmega(0, 0, 0), mbHaveMotion(false)
+			  , mlSeq(0), mfRecvClock(0), mfAge(0), mfStuckTime(0), mfSettleTime(0)
+			  , mfDisturbTime(0), mbRest(false), mbPinned(false) {}
 	};
-	std::map<uint32_t, cGuestTarget> m_mapGuestTargets;
+	std::map<uint32_t, cGuestBody> m_mapGuestBodies;
+	float mfGuestClock; /**< guest: seconds of UpdateGuestBlend, for the seq window */
+
+	/** Guest: exact pose, zero motion, frozen. */
+	void PinGuestBody(hpl::iPhysicsBody *apBody, cGuestBody &aRec);
 
 	/** Guest held-object prediction state (0 = not holding). */
 	uint32_t mlGuestHeldHash;
@@ -224,16 +272,32 @@ private:
 		float mfMassMul;
 		float mfDefaultMass;  /* restored on end (grab halves control mass) */
 		bool mbHadGravity;
+		bool mbHadAutoDisable;
 		hpl::cPidControllerVec3 mGrabPid;
 		cRemoteGrab()
 			: mlPeerId(0), mbPickAtPoint(false), mvTarget(0, 0, 0)
 			  , mbHasTarget(false), mfNoTargetTime(0), mfMassMul(1.0f)
-			  , mfDefaultMass(0), mbHadGravity(true) {}
+			  , mfDefaultMass(0), mbHadGravity(true), mbHadAutoDisable(true) {}
 	};
 	std::map<uint32_t, cRemoteGrab> m_mapRemoteGrabs;
 	std::map<uint32_t, uint8_t> m_mapHolders; /**< hash -> player id, both local + remote */
 	float mfMaxPidForce;
 	float mfMaxThrowImpulse;
+
+	/** Host: the HOST player snatched a body out of a guest's free grab.
+	    cPlayerState_Grab::EnterState had already captured the remote grab's
+	    gravity-off + mass/5 as the body's "defaults" (NetGrabBegin runs at
+	    its end), so its LeaveState would leave the body floating at a fifth
+	    of its mass forever. The true defaults wait here and are re-applied
+	    once the host lets go (or a guest grabs it first). */
+	struct cPendingRestore
+	{
+		float mfMass;
+		bool mbGravity;
+		bool mbAutoDisable;
+	};
+	std::map<uint32_t, cPendingRestore> m_mapPendingRestore;
+	void ApplyPendingRestore(uint32_t alHash, hpl::iPhysicsBody *apBody);
 
 	/** Restore mass/gravity/autodisable after a remote grab. */
 	void RestoreGrabbedBody(hpl::iPhysicsBody *apBody, const cRemoteGrab &aGrab);
