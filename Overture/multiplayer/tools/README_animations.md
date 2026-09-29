@@ -6,13 +6,17 @@ from the Motifect BVH locomotion pack by `bvh_to_hpl_clip.py` in this folder.
 Each run also writes `<name>_clips.json`, the per-slot sidecar the runtime
 reads for gait speeds (`gait_speed_mps`).
 
+Making or upgrading a character (Blender model -> `<name>.dae` + these
+clips, one command): see [README_characters.md](README_characters.md).
+
 Files in this folder:
 
 | file | role |
 |---|---|
 | `bvh_to_hpl_clip.py` | the converter (pure Python 3, no numpy); imports `retarget_clip_dae.py` for its DAE parser and matrix helpers |
 | `retarget_clip_dae.py` | older in-place retargeter for the 2026-07 clip package; only its `Doc` parser / `rot_zyx` / `euler_zyx` helpers are used now |
-| `hpl_dae_export.py` | Blender script that produced the base `<name>.dae` (mesh + skin + JOINT tree); its clip layout is what the converter reproduces byte-for-byte in structure |
+| `hpl_dae_export.py` | Blender script that produces the base `<name>.dae` (mesh + skin + JOINT tree) + `<name>.tga`/`.mat` and a validation report; clips from FBX are optional (`-` / `--no-clips`); its clip layout is what the converter reproduces byte-for-byte in structure |
+| `build_character.ps1` | Windows one-command pipeline: Blender export + this converter + install into redist folders (`README_characters.md`) |
 | `anim_viewer.html` | offline viewer that renders exactly what `cMeshEntity` computes (drop base + clips + BVH + sidecar on it) |
 
 ## Regenerate
