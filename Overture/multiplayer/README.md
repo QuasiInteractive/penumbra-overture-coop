@@ -492,20 +492,24 @@ microphone, and everything dies before `cGame` (the AL context) does
 
 **Send.** `VoiceTalk` (**V**, `cActionKeyboard`, registered next to the
 F9-F11 actions) is polled with `IsTriggerd` every frame. On the first press
-the default OpenAL capture device is opened lazily
-(`alcCaptureOpenDevice(NULL, 16000, AL_FORMAT_MONO16, 4096)`; failure is
-logged once and PTT stays off for the session) and started; while held,
-`alcCaptureSamples` drains the ring every frame into a pending PCM buffer
-(capped at 1 s — a frame stall while talking drops the oldest audio, logged
-once) which is cut into 320-sample frames and Opus-encoded (VOIP, 24 kbps
-VBR, complexity 5, wideband; at most 10 frames per Update). Two frames go
-into one `cNetVoice` packet (a lone frame waits at most 30 ms for its
-twin, and the last partial packet is flushed on release), total payload
-<= `kNetVoiceMaxPayload` (400 B). Release stops and drains the capture ring;
-the device stays open for the next press. `voice_open_mic=1` skips the key:
-the mic runs continuously and frames go out while the RMS level is above
--40 dBFS (0.4 s hold). Packets go out unsequenced on ch1 immediately
-(`SendUnreliableEvent`; guest -> host, host -> every guest).
+the capture device is opened lazily — `voice_capture_device` if set, else
+the system default (`alcCaptureOpenDevice(NULL, 16000, AL_FORMAT_MONO16,
+4096)`), then the default with a 1 s ring, then every enumerated capture
+device; each ALC error is logged, and with none open the mic is retried every
+5 s while the key is held (HUD hint "NO MIC") — and started
+(`alcCaptureStart`, its ALC error checked). While held, `alcCaptureSamples`
+drains the ring every frame (`ALC_CAPTURE_SAMPLES` counts sample frames)
+into a pending PCM buffer (capped at 1 s — a frame stall while talking drops
+the oldest audio, logged once) which is cut into 320-sample frames and
+Opus-encoded (VOIP, 24 kbps VBR, complexity 5, wideband; at most 10 frames
+per Update). Two frames go into one `cNetVoice` packet (a lone frame waits
+at most 30 ms for its twin, and the last partial packet is flushed on
+release), total payload <= `kNetVoiceMaxPayload` (400 B). Release stops and
+drains the capture ring; the device stays open for the next press.
+`voice_open_mic=1` skips the key: the mic runs continuously and frames go
+out while the RMS level is above `voice_gate_db` (default -45 dBFS, 0.4 s
+hold). Packets go out unsequenced on ch1 immediately (`SendUnreliableEvent`;
+guest -> host, host -> every guest).
 
 **Relay.** The host stamps the author from the **peer** id (`RelayVoice`,
 the byte in the packet is never trusted — same rule as `PlayerState`),
@@ -518,34 +522,66 @@ length (a strike on the host side, a once-logged drop on the guest side).
 Voice rides ch1, so the reliable-packet rate limit never sees it.
 
 **Receive.** `OnVoicePacket` validates the frame table (count 1..2,
-per-frame `uint16` lengths within the packet), then per author: a stale or
-duplicate `mSeq` (int16 difference <= 0 while the burst is running) is
-dropped; a gap of 1..3 packets is concealed with `opus_decode(NULL)` PLC
-frames; a bigger gap, or the first packet after > 0.5 s of silence, resets
-the decoder state and the jitter buffer. Decoded frames wait in a per-player
-queue (max 25); playback starts when 6 frames (3 packets) are in, or after
-150 ms for a short utterance, or as soon as the sender goes quiet. Every
-frame `Update` unqueues processed AL buffers (8 per source, 160 ms),
-queues waiting frames, restarts a source that stopped (underrun), and,
-when the queue is empty while the sender is still active, generates up to 5
-PLC frames before letting the stream idle (the next packet re-primes).
-Each stream is one `AL_FORMAT_MONO16` streaming source with
-`AL_SOURCE_RELATIVE` off, placed every frame at the ghost's render feet +
-1.6 m (`SetRemoteHeadPos`). The gain is computed in software —
-`voice_volume * ref / (ref + (clamp(d, 2, 25) - 2))`, ref 2 m, max 25 m —
-because the engine runs the AL context with the distance model set to NONE
+per-frame `uint16` lengths within the packet) and arms the HUD "(talking)"
+timer — independent of playback, so "(talking)" without sound points at the
+AL side. Then per author: a stale or duplicate `mSeq` (int16 difference <= 0
+while the burst is running) is dropped; a gap of 1..3 packets is concealed
+with `opus_decode(NULL)` PLC frames; a bigger gap, or the first packet after
+> 0.5 s of silence, resets the decoder state and the jitter buffer. Decoded
+frames wait in a per-player queue (max 25); playback starts when 6 frames
+(3 packets) are in, or after 150 ms for a short utterance, or as soon as the
+sender goes quiet. Every frame `Update` reads the source state first, then
+unqueues processed AL buffers (8 per source, 160 ms), queues waiting frames,
+`alSourcePlay`s a source that is not playing (burst start, or AL_STOPPED
+after an underrun), and, when the queue is empty while the sender is still
+active, generates up to 5 PLC frames before letting the stream idle (the
+next packet re-primes). Each stream is one `AL_FORMAT_MONO16` streaming
+source placed every frame at the ghost's render feet + 1.6 m
+(`SetRemoteHeadPos`, `AL_SOURCE_RELATIVE` off). While no head position is
+known (ghost not spawned yet, or none for 0.5 s: another map) the source is
+listener-relative at the origin — centered, at `voice_volume`, never silent
+because a ghost is missing. The gain is computed in software —
+`voice_volume * ref / (ref + (clamp(d, 2, 25) - 2))`, ref 2 m, max 25 m,
+`d` measured against the AL listener (the engine's camera) — because the
+engine runs the AL context with the distance model set to NONE
 (`LowLevelSoundOpenAL.cpp`, it attenuates its own sounds itself); AL still
-pans by position. Where `AL_EXT_source_distance_model` exists the source is
-pinned to NONE so a future wrapper change cannot double-attenuate.
-`alGetError` is checked after every gen/queue/unqueue/play; the first error
-is logged, the affected stream is freed (re-created by its next packet),
-and after three such failures voice is off for the session.
+pans by position. Our sources get `AL_ROLLOFF_FACTOR 0`, a no-op under every
+AL distance model, so a future global-model change cannot double-attenuate.
+(Until this fix the source was "pinned" with `alSourcei(src,
+AL_SOURCE_DISTANCE_MODEL, AL_NONE)`: 0x200 is the `alEnable` capability, not
+a source property — OpenAL Soft raised AL_INVALID_ENUM, the setup check
+freed the stream, and no remote voice ever played.)
+
+**Errors.** Source/buffer creation is judged by the names AL returns
+(`alIsSource` / `alIsBuffer`), not by `alGetError` alone: the wrapper's
+stream thread shares the context's error slot. A failed creation (e.g. no
+free source: the engine reserves its own — Init probes one and warns) is
+logged once and retried for that player every 2 s. A per-frame AL error is
+logged once and tolerated; the stream is rebuilt only when its source is
+gone or errors persist 10 frames, and after three rebuilds PLAYBACK is off
+for the session (hint "VOICE OFF") — the microphone keeps sending. No AL
+context / no Opus encoder at Init = voice off for the session.
+
+**Diagnostics.** Every stage logs once to `hpl.log` (` voice:` lines): the
+AL context/device and its mono-source count, the first push-to-talk press
+(proves the `VoiceTalk` action works; warns when not joined yet), the
+capture device list, the
+device opened (or each ALC error), capture started, first samples (or "NO
+samples" after 1 s = blocked by the Windows microphone privacy switch), the
+first packet handed to the network, the first three sent bursts with the
+mic level (pure digital silence is called out), the first packet received
+from each player, stream created, playback started (distance, gain,
+listener gain), the first underrun, the first three received bursts per
+player (packets, frames played, PLC, underruns, distance, gain) and a
+per-stream summary on close.
 
 **HUD.** `IsPlayerTalking(id)` (packet within the last 0.35 s; our own id
 = mic live) and `IsMicOpen()` feed `cPlayer::DrawPartyPanel`: `(talking)`
-after a friend's name, `[MIC]` on our line.
+after a friend's name, `[MIC]` on our line. `cVoiceChat::GetStatusHint()`
+returns "NO MIC" / "MIC SILENT" / "VOICE OFF" (or NULL) for our line.
 
-**Cfg.** `voice_enabled=1`, `voice_volume=1.0` (0..2), `voice_open_mic=0`.
+**Cfg.** `voice_enabled=1`, `voice_volume=1.0` (0..2), `voice_open_mic=0`,
+`voice_gate_db=-45` (-70..-10), `voice_capture_device=` (empty = default).
 Wire: `eNetPacketType_Voice` = 29 (27/28 belong to the v15 auth
 handshake), `cNetVoice` = 5 bytes, constants `kNetVoice*` in
 `NetworkPackets.h`.
@@ -575,7 +611,7 @@ handshake), `cNetVoice` = 5 bytes, constants `kNetVoice*` in
 - **F9** — LAN/Hamachi discovery scan (~1.5s window; results logged, feed the server browser).
 - **V** (hold) — push-to-talk voice chat (v16); heard from your character's head, fading with distance.
 - **Menu** — Multiplayer → Host / Server browser (Internet · LAN) / Direct connect / Change name (asks for a username the first time).
-- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `character=` (v18, the guest's preferred character by file base name, written by the menu's picker), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=` (enforced at CONNECT since v15; v17: capped at the number of characters), `server_password=` / `join_password=` (v15, see Security), `ghost_models=a.dae,b.dae` (optional: without it the characters in `multiplayer/models` are auto-discovered, see 'Characters'), `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `voice_enabled=1`, `voice_volume=1.0`, `voice_open_mic=0` (v16), `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`, `master_server=HOST:PORT`, `public=0|1` (internet browser, see 'Public servers'). See `multiplayer.cfg.example`.
+- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `character=` (v18, the guest's preferred character by file base name, written by the menu's picker), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=` (enforced at CONNECT since v15; v17: capped at the number of characters), `server_password=` / `join_password=` (v15, see Security), `ghost_models=a.dae,b.dae` (optional: without it the characters in `multiplayer/models` are auto-discovered, see 'Characters'), `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `voice_enabled=1`, `voice_volume=1.0`, `voice_open_mic=0` (v16), `voice_gate_db=-45`, `voice_capture_device=` (open mic threshold, microphone by name), `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`, `master_server=HOST:PORT`, `public=0|1` (internet browser, see 'Public servers'). See `multiplayer.cfg.example`.
 
 ### Ghost preview (offline animation check)
 

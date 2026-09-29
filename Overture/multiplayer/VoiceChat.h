@@ -28,9 +28,14 @@
     OALWrapper created for the engine's sound system — alcGetCurrentContext
     finds it without any wrapper header). The capture device is opened
     LAZILY on the first push-to-talk press (or the first Update with an open
-    mic), never in single-player, and every AL error is checked; an AL
-    failure is logged once and voice is switched off for the session rather
-    than spamming hpl.log.
+    mic), never in single-player, and every AL error is checked. Every stage
+    logs ONCE to hpl.log (" voice: ..." lines: context/device, capture
+    device opened or the ALC error, first samples, first packet out, first
+    packet in per player, source created/started, underrun restarts, a
+    per-burst summary for the first few bursts) so a silent test can be
+    pinpointed. A playback failure never turns the microphone off, and a
+    stray AL error (the wrapper's stream thread shares the context's error
+    slot) does not tear a healthy stream down.
 
     Without PENUMBRA_MULTIPLAYER + PENUMBRA_VOICE every method is a no-op
     that reports "unavailable", so the manager and the HUD need no #ifdefs. */
@@ -51,6 +56,14 @@ public:
 	bool IsEnabled() const { return mbEnabled; }
 	float GetVolume() const { return mfVolume; }
 	bool IsOpenMic() const { return mbOpenMic; }
+	/** multiplayer.cfg voice_gate_db (open mic only): frame RMS level in
+	    dBFS above which the gate opens. Clamped to -70..-10, default -45. */
+	void SetOpenMicThresholdDb(float afDbfs);
+	float GetOpenMicThresholdDb() const { return mfGateDbfs; }
+	/** multiplayer.cfg voice_capture_device: an OpenAL capture device name
+	    as hpl.log lists it (" voice: capture device: ..."); empty = the
+	    system default recording device. Takes effect on the next open. */
+	void SetCaptureDevice(const hpl::tString &asName) { msCaptureDevice = asName; }
 
 	/** Create the Opus encoder and check for an OpenAL context. Called when
 	    a session goes live (hosting, or a synced guest). Idempotent; returns
@@ -100,9 +113,15 @@ public:
 	/** HUD: the microphone is live right now (PTT held with a working
 	    capture device, or the open-mic gate is open). */
 	bool IsMicOpen() const { return mbMicOpen; }
-	/** Voice was disabled at runtime by an unrecoverable error (device or
-	    context missing, AL error) — the HUD can show "no mic". */
+	/** Voice was disabled at runtime by an unrecoverable error (no AL
+	    context, no Opus encoder) — the HUD can show "voice off". */
 	bool IsFailed() const { return mbFailed; }
+	/** HUD hint for our own line, or NULL when all is well: "NO MIC" (no
+	    capture device could be opened), "MIC SILENT" (the device delivers
+	    pure digital silence: Windows microphone privacy switch / wrong
+	    default recording device), "VOICE OFF" (Init failed or playback was
+	    switched off after repeated OpenAL errors). ASCII, static storage. */
+	const char *GetStatusHint() const;
 
 private:
 	cVoiceChat(const cVoiceChat &);            /* not copyable */
@@ -111,6 +130,8 @@ private:
 	bool mbEnabled;
 	bool mbOpenMic;
 	float mfVolume;
+	float mfGateDbfs;
+	hpl::tString msCaptureDevice;
 	bool mbInitialized;
 	bool mbFailed;
 	bool mbMicOpen;

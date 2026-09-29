@@ -649,6 +649,8 @@ public:
 	bool IsPlayerTalking(uint8_t alId) const;
 	/** HUD: our microphone is live (PTT held / open-mic gate open). */
 	bool IsMicOpen() const;
+	/** HUD: "NO MIC" / "MIC SILENT" / "VOICE OFF" or NULL. */
+	const char *GetVoiceStatusHint() const;
 	/** Voice compiled in and voice_enabled=1 (the panel can show hints). */
 	bool IsVoiceAvailable() const;
 private:
@@ -656,6 +658,8 @@ private:
 	bool mbVoiceEnabled;   /**< multiplayer.cfg voice_enabled (default 1) */
 	bool mbVoiceOpenMic;   /**< multiplayer.cfg voice_open_mic (default 0) */
 	float mfVoiceVolume;   /**< multiplayer.cfg voice_volume (default 1.0) */
+	float mfVoiceGateDb;               /**< multiplayer.cfg voice_gate_db (default -45) */
+	hpl::tString msVoiceCaptureDevice; /**< multiplayer.cfg voice_capture_device ("" = default) */
 #ifdef PENUMBRA_MULTIPLAYER
 	/** Per frame after UpdateGhosts: (de)initialise with the session,
 	    positions, PTT, capture/encode/playback, send the outbox. */

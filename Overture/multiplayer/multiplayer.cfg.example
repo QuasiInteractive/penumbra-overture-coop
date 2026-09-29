@@ -137,10 +137,20 @@ coop_respawn=1
 # voice_enabled=1   — 0 = no voice on this machine (no microphone, no playback)
 # voice_volume=1.0  — playback gain for the others' voices (0..2)
 # voice_open_mic=0  — 1 = no key: the mic streams whenever its level is above
-#                     -40 dBFS (0.4 s hold). Push-to-talk is the default.
+#                     voice_gate_db (0.4 s hold). Push-to-talk is the default.
+# voice_gate_db=-45 — open-mic gate in dBFS (-70..-10). hpl.log prints the
+#                     loudest level it saw if nothing ever passed the gate.
+# voice_capture_device= — record from this OpenAL capture device instead of
+#                     the Windows default recording device; hpl.log lists the
+#                     names (" voice: capture device: ..." lines). Empty = default.
+# Not heard / not sending? Search hpl.log for " voice:" — every stage logs once
+# (microphone opened, first samples, first packet out, first packet in, playback
+# started, per-burst mic level / distance / gain).
 voice_enabled=1
 voice_volume=1.0
 voice_open_mic=0
+voice_gate_db=-45
+voice_capture_device=
 
 # ---- Ghost animation (v11) ------------------------------------------------
 # ghost_interp_ms=100   — render remote players this far behind their newest

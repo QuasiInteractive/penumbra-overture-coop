@@ -1904,6 +1904,8 @@ void cPlayer::DrawPartyPanel()
 		if(lId == lLocalId)
 		{
 			if(pNet->IsMicOpen()) sName += _W("  [MIC]");
+			const char *sVoiceHint = pNet->GetVoiceStatusHint();
+			if(sVoiceHint) sName += _W("  [") + cString::To16Char(sVoiceHint) + _W("]");
 		}
 		else if(pNet->IsPlayerTalking((uint8_t)lId)) sName += _W("  (talking)");
 		vTexts.push_back(sName);

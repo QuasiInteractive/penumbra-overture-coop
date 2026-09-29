@@ -339,6 +339,8 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbVoiceEnabled(true)
 	  , mbVoiceOpenMic(false)
 	  , mfVoiceVolume(1.0f)
+	  , mfVoiceGateDb(-45.0f)
+	  , msVoiceCaptureDevice()
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -1059,6 +1061,8 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbVoiceEnabled(true)
 	  , mbVoiceOpenMic(false)
 	  , mfVoiceVolume(1.0f)
+	  , mfVoiceGateDb(-45.0f)
+	  , msVoiceCaptureDevice()
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -1152,7 +1156,8 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 		const bool bServerPw = bHaveKey && strcmp(rawKey, "server_password") == 0; /* v15 */
 		const bool bJoinPw = bHaveKey && strcmp(rawKey, "join_password") == 0;     /* v15 */
 		const bool bCharacter = bHaveKey && strcmp(rawKey, "character") == 0;      /* v18 */
-		if (bServerName || bPlayerName || bServerPw || bJoinPw || bCharacter)
+		const bool bVoiceDev = bHaveKey && strcmp(rawKey, "voice_capture_device") == 0; /* names have spaces */
+		if (bServerName || bPlayerName || bServerPw || bJoinPw || bCharacter || bVoiceDev)
 		{
 			char *eq = strchr(buf, '=');
 			size_t ln = 0;
@@ -1175,6 +1180,8 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 				SetJoinPassword(hpl::tString(nm, ln));   /* v15: sent on JoinGame */
 			else if (bCharacter)
 				msCharacterPref = SanitizeCharacterName(hpl::tString(nm, ln)); /* v18: "" = no preference */
+			else if (bVoiceDev)
+				msVoiceCaptureDevice = hpl::tString(nm, ln); /* "" = system default */
 			else
 			{
 				if (ln > 31)
@@ -1295,6 +1302,8 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 			else if (v > 2.0f) v = 2.0f;
 			mfVoiceVolume = v;
 		}
+		else if (strcmp(key, "voice_gate_db") == 0)
+			mfVoiceGateDb = static_cast<float>(atof(val)); /* cVoiceChat clamps -70..-10 */
 	}
 	fclose(fp);
 
@@ -1469,11 +1478,15 @@ void cNetworkManager::Startup()
 		mpVoice->SetEnabled(true);
 		mpVoice->SetOpenMic(mbVoiceOpenMic);
 		mpVoice->SetVolume(mfVoiceVolume);
+		mpVoice->SetOpenMicThresholdDb(mfVoiceGateDb);
+		mpVoice->SetCaptureDevice(msVoiceCaptureDevice);
 		Log(" multiplayer: voice chat on (hold V to talk%s, voice_volume=%.2f)\n",
 			mbVoiceOpenMic ? " — voice_open_mic=1: level-gated open mic" : "", mfVoiceVolume);
 	}
 	else if (cVoiceChat::IsCompiledIn())
 		Log(" multiplayer: voice chat off (voice_enabled=0)\n");
+	else
+		Log(" multiplayer: voice chat NOT in this build (compiled without PENUMBRA_VOICE / opus)\n");
 	/* v17: cfg host=1, now that the character list (the player cap) is final */
 	if (mbCfgAutoHost)
 	{
@@ -6599,6 +6612,11 @@ bool cNetworkManager::IsPlayerTalking(uint8_t alId) const
 bool cNetworkManager::IsMicOpen() const
 {
 	return mpVoice ? mpVoice->IsMicOpen() : false;
+}
+
+const char *cNetworkManager::GetVoiceStatusHint() const
+{
+	return mpVoice ? mpVoice->GetStatusHint() : NULL;
 }
 
 bool cNetworkManager::IsVoiceAvailable() const
