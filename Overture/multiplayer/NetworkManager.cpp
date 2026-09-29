@@ -16,6 +16,7 @@
 #include "GameSwingDoor.h" /* v14 world snapshot: door locks */
 #include "GameLamp.h"      /* v14 world snapshot: lamp lit */
 #include "Inventory.h"     /* v14 world snapshot: party item names */
+#include "resources/FileSearcher.h" /* v15: ItemDrop/MapChange file names must resolve */
 
 /* v9: the engine's script-var writes fire this (see engine ScriptFuncs.cpp) */
 namespace hpl { extern void (*gpScriptVarNetCallback)(int alOp, const char* asName, int alVal); }
@@ -41,6 +42,7 @@ static void ScriptVarNetThunk(int alOp, const char* asName, int alVal)
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <ctime> /* v15: nonce seed */
 
 //======================================================================
 // Shared by the real and the stub build.
@@ -295,6 +297,11 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbSnapBuffering(false)
 	  , mfSnapAge(0)
 	  , mlSnapIdOut(0)
+	  , msServerPassword()  /* v15: multiplayer.cfg server_password ("" = open) */
+	  , msJoinPassword()    /* v15: multiplayer.cfg join_password */
+	  , mbAuthSent(false)
+	  , mlGuestViolationsLogged(0)
+	  , mvFreeGuestIds()
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -471,6 +478,50 @@ struct cNetworkManager::Impl
 	bool mbPushStop;
 	bool mbPushAny;
 
+	/* v15: per-connection guard record, HOST side, keyed by ENet peer slot
+	   (created at CONNECT, erased at DISCONNECT / by the sweep). A peer has
+	   no wire id until mbAuthed; a refused one is only waiting for its
+	   disconnect to complete and everything it sends is dropped. */
+	struct cPeerGuard
+	{
+		uint8_t mNonce[16];
+		bool mbAuthed;
+		bool mbRefused;
+		float mfAge;            /* seconds since CONNECT (kNetAuthTimeoutSeconds) */
+		unsigned mlStrikes;
+		float mfStrikeDecay;    /* seconds since the last decay tick */
+		float mfRateWindow;     /* seconds into the current 1 s window */
+		unsigned mlReliableInWindow;
+		bool mbRateStruck;      /* one strike per window */
+		uint64_t mlLoggedTypes; /* log-once mask, bit = packet type */
+		bool mbHavePos;         /* newest validated PlayerState position */
+		hpl::cVector3f mvLastPos;
+
+		cPeerGuard()
+			: mbAuthed(false), mbRefused(false), mfAge(0), mlStrikes(0), mfStrikeDecay(0),
+			  mfRateWindow(0), mlReliableInWindow(0), mbRateStruck(false), mlLoggedTypes(0),
+			  mbHavePos(false), mvLastPos(0, 0, 0)
+		{
+			memset(mNonce, 0, sizeof(mNonce));
+		}
+	};
+	std::map<const ENetPeer *, cPeerGuard> m_mapGuards;
+	uint32_t mlNonceCounter;
+
+	/* v15: discovery reflector limiter — the kPongBuckets most recent
+	   source addresses, kMaxPongPerSource pongs each per 1 s window, and a
+	   global cap per window (aged in PollDiscovery). */
+	enum { kPongBuckets = 16, kMaxPongPerSource = 5, kMaxPongPerSecond = 60 };
+	struct cPongBucket
+	{
+		uint32_t mlAddr;
+		float mfWindowLeft;
+		unsigned mlCount;
+	};
+	cPongBucket mPong[kPongBuckets];
+	float mfPongGlobalWindow;
+	unsigned mlPongGlobalCount;
+
 	Impl()
 		: mpHost(NULL)
 		  , mpServerPeer(NULL)
@@ -485,7 +536,12 @@ struct cNetworkManager::Impl
 		  , mvPushPoint(0, 0, 0)
 		  , mbPushStop(false)
 		  , mbPushAny(false)
+		  , m_mapGuards()
+		  , mlNonceCounter(0)
+		  , mfPongGlobalWindow(0)
+		  , mlPongGlobalCount(0)
 	{
+		memset(mPong, 0, sizeof(mPong));
 	}
 
 	void ResetIntent()
@@ -661,8 +717,8 @@ static void BlastLeaves(ENetHost *host, uint8_t who, ENetPeer *skip)
 	for (size_t i = 0; i < host->peerCount; ++i)
 	{
 		ENetPeer *rp = &host->peers[i];
-		if (rp == skip || rp->state != ENET_PEER_STATE_CONNECTED)
-			continue;
+		if (rp == skip || rp->state != ENET_PEER_STATE_CONNECTED || PeerGetId(rp) == 0)
+			continue; /* v15: id 0 = still answering the challenge, gets nothing */
 		ENetPacket *pkg = enet_packet_create(&lv, sizeof(lv), ENET_PACKET_FLAG_RELIABLE);
 		if (pkg)
 			enet_peer_send(rp, 0, pkg);
@@ -705,6 +761,23 @@ static void CopyPacketString(char *dst, size_t dstSz, const char *src)
 {
 	strncpy(dst, src ? src : "", dstSz);
 	dst[dstSz - 1] = '\0';
+}
+
+/** v15: "a.b.c.d:port" of an ENet peer, for log lines. */
+static void FormatPeerAddr(const ENetPeer *apPeer, char *out, size_t outSz)
+{
+	if (!out || outSz == 0)
+		return;
+	if (!apPeer)
+	{
+		out[0] = '\0';
+		return;
+	}
+	const unsigned char *b = (const unsigned char *)&apPeer->address.host;
+	_snprintf(out, outSz, "%u.%u.%u.%u:%u",
+			  (unsigned)b[0], (unsigned)b[1], (unsigned)b[2], (unsigned)b[3],
+			  (unsigned)apPeer->address.port);
+	out[outSz - 1] = '\0';
 }
 }
 
@@ -768,6 +841,11 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbSnapBuffering(false)
 	  , mfSnapAge(0)
 	  , mlSnapIdOut(0)
+	  , msServerPassword()  /* v15: multiplayer.cfg server_password ("" = open) */
+	  , msJoinPassword()    /* v15: multiplayer.cfg join_password */
+	  , mbAuthSent(false)
+	  , mlGuestViolationsLogged(0)
+	  , mvFreeGuestIds()
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -842,7 +920,9 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 		const bool bHaveKey = (sscanf(buf, " %63[^=]", rawKey) == 1);
 		const bool bServerName = bHaveKey && strcmp(rawKey, "server_name") == 0;
 		const bool bPlayerName = bHaveKey && strcmp(rawKey, "player_name") == 0; /* v13 */
-		if (bServerName || bPlayerName)
+		const bool bServerPw = bHaveKey && strcmp(rawKey, "server_password") == 0; /* v15 */
+		const bool bJoinPw = bHaveKey && strcmp(rawKey, "join_password") == 0;     /* v15 */
+		if (bServerName || bPlayerName || bServerPw || bJoinPw)
 		{
 			char *eq = strchr(buf, '=');
 			size_t ln = 0;
@@ -859,6 +939,10 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 			}
 			if (bPlayerName)
 				msPlayerName = SanitizePlayerName(hpl::tString(nm, ln)); /* "" = ask in the menu */
+			else if (bServerPw)
+				SetServerPassword(hpl::tString(nm, ln)); /* v15: "" = open server */
+			else if (bJoinPw)
+				SetJoinPassword(hpl::tString(nm, ln));   /* v15: sent on JoinGame */
 			else
 			{
 				if (ln > 31)
@@ -1297,6 +1381,20 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		return;
 	uint8_t t = *(const uint8_t *)data;
 
+	if (t == eNetPacketType_Challenge)
+	{
+		/* v15, guest side: the host's FIRST packet — answer it (once) */
+		if (!mbHosting && len >= sizeof(cNetChallenge))
+		{
+			cNetChallenge ch;
+			memcpy(&ch, data, sizeof(ch));
+			SendAuthResponse(ch);
+		}
+		return;
+	}
+	if (t == eNetPacketType_Auth)
+		return; /* v15: host-only, consumed in Service before any dispatch */
+
 	if (t == eNetPacketType_VersionAck && len >= sizeof(cNetVersionAck))
 	{
 		cNetVersionAck ack;
@@ -1633,7 +1731,7 @@ void cNetworkManager::EmitLocalSnapshots()
 		for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 		{
 			ENetPeer *pd = &mpImpl->mpHost->peers[i];
-			if (pd->state != ENET_PEER_STATE_CONNECTED)
+			if (!PeerLive(pd)) /* v15: accepted peers only */
 				continue;
 			ENetPacket *pkt = enet_packet_create(&st, sizeof(st), ENET_PACKET_FLAG_UNSEQUENCED);
 			if (pkt)
@@ -1664,7 +1762,7 @@ void cNetworkManager::EmitObjectStates()
 	bool bAnyPeer = false;
 	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 	{
-		if (mpImpl->mpHost->peers[i].state == ENET_PEER_STATE_CONNECTED)
+		if (PeerLive(&mpImpl->mpHost->peers[i])) /* v15: accepted peers only */
 		{
 			bAnyPeer = true;
 			break;
@@ -1683,7 +1781,7 @@ void cNetworkManager::EmitObjectStates()
 	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 	{
 		ENetPeer *pd = &mpImpl->mpHost->peers[i];
-		if (pd->state != ENET_PEER_STATE_CONNECTED)
+		if (!PeerLive(pd))
 			continue;
 		if (lMovingLen > 0)
 			SendStructToPeer(pd, aMoving, lMovingLen, false); /* next tick replaces a loss */
@@ -1703,7 +1801,7 @@ void cNetworkManager::SendCensus(ENetPeer *apOnlyTo)
 	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 	{
 		ENetPeer *pd = &mpImpl->mpHost->peers[i];
-		if (pd->state != ENET_PEER_STATE_CONNECTED)
+		if (!PeerLive(pd)) /* v15: accepted peers only */
 			continue;
 		if (apOnlyTo && pd != apOnlyTo)
 			continue;
@@ -1727,39 +1825,50 @@ void cNetworkManager::Service(int timeoutMs)
 		case ENET_EVENT_TYPE_CONNECT:
 			if (mbHosting)
 			{
+				char sWho[64];
+				FormatPeerAddr(ev.peer, sWho, sizeof(sWho));
+				mpImpl->m_mapGuards.erase(ev.peer); /* v15: a reused slot starts clean */
+				PeerSetId(ev.peer, 0);
 				if (ev.data != kNetConnectData)
 				{
 					/* old exe (sends 0) or foreign client — refuse BEFORE any
 					   state flows; half-compatible is the worst outcome */
-					Log(" multiplayer: REFUSED incompatible peer (connect data 0x%08X, want 0x%08X)\n",
-						(unsigned)ev.data, (unsigned)kNetConnectData);
+					Log(" multiplayer: REFUSED incompatible peer %s (connect data 0x%08X, want 0x%08X)\n",
+						sWho, (unsigned)ev.data, (unsigned)kNetConnectData);
 					enet_peer_disconnect(ev.peer, kNetDisconnectBadVersion);
 					break;
 				}
-				if (mlNextGuestId == 0)
+				/* v15: max_players at CONNECT. Every connected slot counts —
+				   accepted or still answering the challenge — so a burst of
+				   half-open joins cannot exceed the cap either. ev.peer is
+				   already CONNECTED here, hence the "- 1". */
 				{
-					Log(" multiplayer: guest id overflow\n");
-					break;
+					const int lOthers = CountConnectedPeers(false) - 1;
+					if (lOthers >= (int)mlMaxPlayers - 1 ||
+						(mvFreeGuestIds.empty() && mlNextGuestId >= kPreviewGhostId))
+					{
+						Log(" multiplayer: REFUSED peer %s - server full (%d/%u guests)\n",
+							sWho, lOthers, (unsigned)mlMaxPlayers - 1u);
+						enet_peer_disconnect(ev.peer, kNetDisconnectFull);
+						break;
+					}
 				}
-				uint8_t aid = mlNextGuestId++;
-				PeerSetId(ev.peer, aid);
+				/* v15: challenge FIRST. The peer gets no id, no VersionAck, no
+				   PlayerJoin, no census/beacon/name table and nothing from the
+				   send loops until its cNetAuth is accepted (HostAcceptPeer);
+				   anything else it sends meanwhile is dropped, and silence
+				   is a disconnect after kNetAuthTimeoutSeconds. */
 				{
-					/* FIRST reliable packet: proves we speak their protocol
-					   (their join-handler refuses old hosts that skip this) */
-					cNetVersionAck ack;
-					ack.mType = eNetPacketType_VersionAck;
-					ack.mlVersion = kNetProtocolVersion;
-					SendStructToPeer(ev.peer, &ack, sizeof(ack), true);
+					Impl::cPeerGuard &guard = mpImpl->m_mapGuards[ev.peer];
+					guard = Impl::cPeerGuard();
+					MakeNonce(ev.peer, guard.mNonce);
+					cNetChallenge ch;
+					ch.mType = eNetPacketType_Challenge;
+					memcpy(ch.mNonce, guard.mNonce, sizeof(ch.mNonce));
+					SendStructToPeer(ev.peer, &ch, sizeof(ch), true);
 				}
-				SendPlayerJoin(ev.peer, aid);
-				SendCensus(ev.peer); /* late joiner gets the map-load census now */
-				SendMapBeacon(ev.peer); /* ...and where the party is, so a guest
-				    sitting in the menu launches straight into our map */
-				SendNameTable(ev.peer); /* v13: who is already here (listed silently) */
-				/* v14: NO world/body snapshot here — the guest has no world yet
-				   (or a stale one). It asks with MapReady once its census is
-				   paired with ours, and SendWorldSnapshot answers. */
-				Log(" multiplayer: peer connected id=%u\n", (unsigned)aid);
+				Log(" multiplayer: peer %s connected - challenge sent, waiting for auth%s\n",
+					sWho, msServerPassword.empty() ? " (open server)" : " (password)");
 			}
 			else if (ev.peer == mpImpl->mpServerPeer)
 			{
@@ -1776,9 +1885,27 @@ void cNetworkManager::Service(int timeoutMs)
 					msJoinFailReason = "Host REFUSED: version mismatch - you both need the same zip.";
 					Log(" multiplayer: host refused us - version mismatch\n");
 				}
+				else if (ev.data == kNetDisconnectBadAuth) /* v15 */
+				{
+					msJoinFailReason = mbAuthSent ?
+						"Host REFUSED: wrong password." :
+						"Host REFUSED: no password answer in time - check your connection.";
+					Log(" multiplayer: host refused us - bad auth (answer sent: %d)\n", mbAuthSent ? 1 : 0);
+				}
+				else if (ev.data == kNetDisconnectFull) /* v15 */
+				{
+					msJoinFailReason = "Host REFUSED: the server is full.";
+					Log(" multiplayer: host refused us - server full\n");
+				}
+				else if (ev.data == kNetDisconnectKicked) /* v15 */
+				{
+					msJoinFailReason = "Host dropped us: too many bad packets (see hpl.log on the host).";
+					Log(" multiplayer: host kicked us - protocol violations\n");
+				}
 				Log(" multiplayer: host disconnected\n");
 				mbClientConnected = false;
 				mbHadJoinPacket = false;
+				mbAuthSent = false; /* v15: a reconnect gets a new challenge */
 				mlLocalPlayerId = 0;
 				mpImpl->mpServerPeer = NULL;
 				ClearGhostsInternal();
@@ -1796,8 +1923,16 @@ void cNetworkManager::Service(int timeoutMs)
 					if (lFreed > 0)
 						Log(" multiplayer: guest %u left holding %d object(s) — released\n",
 							(unsigned)gone, lFreed);
+					FreeGuestId(gone); /* v15: the id goes back to the pool */
+				}
+				else
+				{
+					char sWho[64];
+					FormatPeerAddr(ev.peer, sWho, sizeof(sWho));
+					Log(" multiplayer: unaccepted peer %s gone\n", sWho);
 				}
 				PeerSetId(ev.peer, 0);
+				mpImpl->m_mapGuards.erase(ev.peer); /* v15: per-peer state dies with the slot */
 			}
 			break;
 
@@ -1807,17 +1942,68 @@ void cNetworkManager::Service(int timeoutMs)
 			if (!pk || pk->dataLength == 0)
 				break;
 
+			const uint8_t lFirst = *(const uint8_t *)pk->data;
 			if (mbHosting)
 			{
-				uint8_t author = PeerGetId(ev.peer);
-				const uint8_t lFirst = *(const uint8_t *)pk->data;
+				/* v15 gate, in this order: a known, not-refused peer ->
+				   authenticated (until then only cNetAuth is looked at) ->
+				   reliable rate limit -> role table -> payload validation,
+				   which clamps IN PLACE so the relays below forward the
+				   sanitised bytes. Every failure is a strike (NoteViolation);
+				   kNetMaxStrikes = kNetDisconnectKicked. */
+				std::map<const ENetPeer *, Impl::cPeerGuard>::iterator gi = mpImpl->m_mapGuards.find(ev.peer);
+				Impl::cPeerGuard *pGuard = (gi != mpImpl->m_mapGuards.end()) ? &gi->second : NULL;
+				if (pGuard == NULL || pGuard->mbRefused)
+				{
+					enet_packet_destroy(pk); /* refused at CONNECT / kicked / unknown slot */
+					break;
+				}
+				if (!pGuard->mbAuthed)
+				{
+					if (lFirst == eNetPacketType_Auth && (size_t)pk->dataLength >= sizeof(cNetAuth))
+					{
+						cNetAuth auth;
+						memcpy(&auth, pk->data, sizeof(auth));
+						HostAcceptPeer(ev.peer, auth);
+					}
+					else
+						NoteViolation(ev.peer, lFirst, "packet before authentication");
+					enet_packet_destroy(pk);
+					break;
+				}
+				if (ev.channelID == 0)
+				{
+					++pGuard->mlReliableInWindow;
+					if (pGuard->mlReliableInWindow > kNetMaxReliablePerSec)
+					{
+						if (!pGuard->mbRateStruck)
+						{
+							pGuard->mbRateStruck = true;
+							NoteViolation(ev.peer, lFirst, "reliable packet flood");
+						}
+						enet_packet_destroy(pk);
+						break;
+					}
+				}
+				if (!IsAllowedFrom(lFirst, false))
+				{
+					NoteViolation(ev.peer, lFirst, "type not allowed from a guest");
+					enet_packet_destroy(pk);
+					break;
+				}
+				if (!ValidateGuestPacket(ev.peer, pk->data, (size_t)pk->dataLength))
+				{
+					NoteViolation(ev.peer, lFirst, "malformed or out-of-bounds payload");
+					enet_packet_destroy(pk);
+					break;
+				}
+				const uint8_t author = PeerGetId(ev.peer); /* >= 2: accepted above */
 				if (lFirst >= eNetPacketType_BodyGrabBegin && lFirst <= eNetPacketType_BodyPush)
 				{
 					/* rung 3 intent needs to know WHICH guest sent it */
 					HandleBodyIntent(author, pk->data, (size_t)pk->dataLength);
 				}
-				else if ((size_t)pk->dataLength >= sizeof(cNetPlayerState) &&
-					lFirst == eNetPacketType_PlayerState && author >= 2)
+				else if (lFirst == eNetPacketType_PlayerState && author >= 2)
 				{
 					cNetPlayerState relay;
 					memcpy(&relay, pk->data, sizeof(relay));
@@ -1825,7 +2011,7 @@ void cNetworkManager::Service(int timeoutMs)
 					for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 					{
 						ENetPeer *dst = &mpImpl->mpHost->peers[i];
-						if (dst == ev.peer || dst->state != ENET_PEER_STATE_CONNECTED)
+						if (dst == ev.peer || !PeerLive(dst)) /* v15: accepted peers only */
 							continue;
 						ENetPacket *rp =
 							enet_packet_create(&relay, sizeof(relay), ENET_PACKET_FLAG_UNSEQUENCED);
@@ -1869,7 +2055,7 @@ void cNetworkManager::Service(int timeoutMs)
 					for (size_t i = 0; bRelay && i < mpImpl->mpHost->peerCount; ++i)
 					{
 						ENetPeer *dst = &mpImpl->mpHost->peers[i];
-						if (dst == ev.peer || dst->state != ENET_PEER_STATE_CONNECTED)
+						if (dst == ev.peer || !PeerLive(dst)) /* v15: accepted peers only */
 							continue;
 						SendStructToPeer(dst, pk->data, (size_t)pk->dataLength, true);
 					}
@@ -1879,7 +2065,29 @@ void cNetworkManager::Service(int timeoutMs)
 					DispatchIncoming(pk->data, (size_t)pk->dataLength);
 			}
 			else
-				DispatchIncoming(pk->data, (size_t)pk->dataLength);
+			{
+				/* v15 guest side: the host is the game's authority, but its
+				   packets still pass the role table and the shape/bounds
+				   checks (ValidateEventPacket clamps in place) — a hostile
+				   host cannot make us load "..\\x.dae" or spawn from a path.
+				   Log once per type per connection, no strikes: we simply
+				   drop what we do not understand. */
+				bool bOk = IsAllowedFrom(lFirst, true);
+				if (bOk)
+					bOk = ValidateEventPacket(pk->data, (size_t)pk->dataLength, true);
+				if (bOk)
+					DispatchIncoming(pk->data, (size_t)pk->dataLength);
+				else
+				{
+					const unsigned lBit = lFirst < 64 ? lFirst : 63;
+					if ((mlGuestViolationsLogged & (1ull << lBit)) == 0)
+					{
+						mlGuestViolationsLogged |= (1ull << lBit);
+						Log(" multiplayer: dropped host packet type %u (%u B) - not allowed or malformed (logged once)\n",
+							(unsigned)lFirst, (unsigned)pk->dataLength);
+					}
+				}
+			}
 
 			enet_packet_destroy(pk);
 			break;
@@ -1918,6 +2126,8 @@ void cNetworkManager::HostGame(uint16_t alPort)
 	m_setTakenItems.clear(); /* one-of-each bookkeeping is per session */
 	m_setPartyItems.clear();
 	mlNextGuestId = 2;
+	mvFreeGuestIds.clear(); /* v15: fresh id space */
+	ResetPeerGuards();
 	mbHadJoinPacket = true;
 	mlListenPort = alPort;
 	mbClientConnected = false;
@@ -1964,7 +2174,7 @@ void cNetworkManager::SendReliableEvent(const void *apData, size_t alLen)
 		for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 		{
 			ENetPeer *pd = &mpImpl->mpHost->peers[i];
-			if (pd->state == ENET_PEER_STATE_CONNECTED)
+			if (PeerLive(pd)) /* v15: nothing reaches a peer before its auth */
 				SendStructToPeer(pd, apData, alLen, true);
 		}
 	}
@@ -1979,11 +2189,7 @@ int cNetworkManager::GetConnectedGuestCount() const
 {
 	if (!mbHosting || !mpImpl || !mpImpl->mpHost)
 		return 0;
-	int n = 0;
-	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
-		if (mpImpl->mpHost->peers[i].state == ENET_PEER_STATE_CONNECTED)
-			++n;
-	return n;
+	return CountConnectedPeers(true); /* v15: accepted guests only */
 }
 
 /** Host: "the party is on THIS map" — sent to everyone on our census frame
@@ -2188,7 +2394,7 @@ void cNetworkManager::EmitEnemyStates()
 			for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 			{
 				ENetPeer *pd = &mpImpl->mpHost->peers[i];
-				if (pd->state != ENET_PEER_STATE_CONNECTED)
+				if (!PeerLive(pd)) /* v15: accepted peers only */
 					continue;
 				ENetPacket *pkt = enet_packet_create(aBuf, lLen, ENET_PACKET_FLAG_UNSEQUENCED);
 				if (pkt)
@@ -2534,6 +2740,8 @@ void cNetworkManager::JoinGame(const char *aszHostPort)
 	mbHadJoinPacket = false;
 	mbSpawnedAtHost = false; /* fresh session: walk to the host once */
 	mbGotVersionAck = false;
+	mbAuthSent = false;          /* v15: answer the next challenge */
+	mlGuestViolationsLogged = 0; /* v15: log-once per connection */
 	msJoinFailReason = "";
 	mbHavePendingMapChange = false;
 	mbLocalMapChangeArmed = false;
@@ -2580,9 +2788,13 @@ void cNetworkManager::Disconnect()
 	mbHadJoinPacket = false;
 	mlLocalPlayerId = 0;
 	mlNextGuestId = 2;
-	msDeferredJoinAddress = "";
+	mvFreeGuestIds.clear(); /* v15 */
+	mbAuthSent = false;
 	if (mpImpl)
+	{
+		ResetPeerGuards();      /* v15: the peer slots died with the host */
 		mpImpl->ResetIntent(); /* a dead session forwards nothing */
+	}
 	if (mpBodySync)
 		mpBodySync->ClearGuestHeld();
 }
@@ -2662,6 +2874,10 @@ void cNetworkManager::Update(float afTimeStep)
 			ResetSnapshotBuffer();
 		}
 	}
+
+	/* v15: auth timeouts, rate windows, strike decay, dead-slot sweep. */
+	if (mbHosting)
+		UpdatePeerGuards(afTimeStep);
 
 	/* Rung 3: drive the guests' grab springs in the authoritative sim. */
 	if (mbHosting)
@@ -3143,6 +3359,17 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 	/* --- Host: answer pings with live state ------------------------------ */
 	if (mbHosting && mpImpl->mDiscoveryListenSock != INVALID_SOCKET)
 	{
+		/* v15: age the reflector limiter windows (see DiscoveryPongAllowed) */
+		mpImpl->mfPongGlobalWindow += afTimeStep;
+		if (mpImpl->mfPongGlobalWindow >= 1.0f)
+		{
+			mpImpl->mfPongGlobalWindow = 0;
+			mpImpl->mlPongGlobalCount = 0;
+		}
+		for (int b = 0; b < Impl::kPongBuckets; ++b)
+			if (mpImpl->mPong[b].mfWindowLeft > 0)
+				mpImpl->mPong[b].mfWindowLeft -= afTimeStep;
+
 		for (;;)
 		{
 			char buf[128];
@@ -3164,11 +3391,14 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 			cNetDiscoveryPing ping;
 			memcpy(&ping, buf, sizeof(ping));
 			if (ping.mType != eNetPacketType_DiscoveryPing ||
-				ping.mlProtocolMagic != kNetProtocolMagic)
-				continue;
+				ping.mlProtocolMagic != kNetProtocolMagic ||
+				ping.mlProtocolVer != kNetProtocolVersion)
+				continue; /* v15: a reflector on the open internet answers ONLY
+				             its own protocol; a mismatched browser no longer
+				             gets a (greyed-out) row, it simply does not see us */
+			if (!DiscoveryPongAllowed((uint32_t)from.sin_addr.s_addr))
+				continue; /* v15: per-source + global pong rate limit */
 
-			/* Reply even on version mismatch — the browser shows WHY the join
-			   would fail instead of the server just not existing. */
 			cNetDiscoveryPong pong;
 			memset(&pong, 0, sizeof(pong));
 			pong.mType = eNetPacketType_DiscoveryPong;
@@ -4394,6 +4624,721 @@ void cNetworkManager::SendLocalName()
 	if (n > 0)
 		memcpy(pkt.msName, msPlayerName.data(), n);
 	SendReliableEvent(&pkt, sizeof(pkt)); /* no-op until connected + joined */
+}
+
+#endif /* PENUMBRA_MULTIPLAYER */
+
+//======================================================================
+// v15: internet hardening — APPENDED. Shared part first (both builds):
+// passwords, the role table, string/file-name checks, guest id pool.
+// The ENet-touching part (auth state machine, validation with clamps,
+// strikes, rate limits, discovery limiter) is under PENUMBRA_MULTIPLAYER.
+// README.md "Security" describes the flow.
+//======================================================================
+
+hpl::tString cNetworkManager::SanitizePassword(const hpl::tString &asPassword)
+{
+	hpl::tString sOut;
+	for (size_t i = 0; i < asPassword.size(); ++i)
+	{
+		const unsigned char c = (unsigned char)asPassword[i];
+		if (c < 32 || c > 126)
+			continue; /* control chars, DEL, non-ASCII */
+		if (c == ' ' && sOut.empty())
+			continue; /* leading blanks */
+		if (sOut.size() >= kNetPasswordMaxChars)
+			break;
+		sOut += (char)c;
+	}
+	while (!sOut.empty() && sOut[sOut.size() - 1] == ' ')
+		sOut.erase(sOut.size() - 1);
+	return sOut;
+}
+
+void cNetworkManager::SetJoinPassword(const hpl::tString &asPassword)
+{
+	msJoinPassword = SanitizePassword(asPassword);
+}
+
+void cNetworkManager::SetServerPassword(const hpl::tString &asPassword)
+{
+	msServerPassword = SanitizePassword(asPassword);
+}
+
+/* THE role table. Both directions share the event types the host relays;
+   everything else is one-way. Keep in step with eNetPacketType — an
+   unlisted type is dropped from EITHER side (the voice type 29 of v16
+   must be added here by whoever adds it). */
+bool cNetworkManager::IsAllowedFrom(uint8_t alType, bool abFromHost)
+{
+	switch (alType)
+	{
+	/* either direction (guest -> host, host relays / host -> guests) */
+	case eNetPacketType_PlayerState:
+	case eNetPacketType_MapChange:
+	case eNetPacketType_ItemPickup:
+	case eNetPacketType_ItemDrop:
+	case eNetPacketType_ScriptEvent:
+	case eNetPacketType_EntityDamage:
+	case eNetPacketType_PlayerName:
+		return true;
+	/* host -> guest only */
+	case eNetPacketType_PlayerJoin:
+	case eNetPacketType_PlayerLeave:
+	case eNetPacketType_VersionAck:
+	case eNetPacketType_ObjectState:
+	case eNetPacketType_BodyCensus:
+	case eNetPacketType_BodyGrabDeny:
+	case eNetPacketType_EnemyState:
+	case eNetPacketType_EnemyEvent:
+	case eNetPacketType_PlayerDamage:
+	case eNetPacketType_WorldSnapshot:
+	case eNetPacketType_Challenge:
+		return abFromHost;
+	/* guest -> host only */
+	case eNetPacketType_BodyGrabBegin:
+	case eNetPacketType_BodyGrabTarget:
+	case eNetPacketType_BodyGrabEnd:
+	case eNetPacketType_BodyPush:
+	case eNetPacketType_EnemyDamage:
+	case eNetPacketType_MapReady:
+	case eNetPacketType_Auth:
+		return !abFromHost;
+	/* ChatMessage (4, reserved), discovery 5/6 (never over ENet), unknown */
+	default:
+		return false;
+	}
+}
+
+bool cNetworkManager::NetStringOk(const char *apStr, size_t alCap, bool abAllowEmpty)
+{
+	if (!apStr)
+		return false;
+	size_t n = 0;
+	while (n < alCap && apStr[n] != '\0')
+	{
+		const unsigned char c = (unsigned char)apStr[n];
+		if (c < 32 || c > 126)
+			return false;
+		++n;
+	}
+	return n > 0 || abAllowEmpty;
+}
+
+bool cNetworkManager::NetBareFileNameOk(const char *apStr, size_t alCap, const char *asExt)
+{
+	if (!NetStringOk(apStr, alCap, false) || !asExt)
+		return false;
+	size_t n = 0;
+	while (n < alCap && apStr[n] != '\0')
+		++n;
+	const size_t lExt = strlen(asExt);
+	if (n < lExt + 2) /* at least "x." + ext */
+		return false;
+	if (apStr[0] == '.' || apStr[0] == ' ' || apStr[n - 1] == ' ')
+		return false;
+	for (size_t i = 0; i < n; ++i)
+	{
+		const char c = apStr[i];
+		if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+			c == '"' || c == '<' || c == '>' || c == '|')
+			return false;
+		if (c == '.' && i + 1 < n && apStr[i + 1] == '.')
+			return false; /* ".." anywhere */
+	}
+	if (apStr[n - lExt - 1] != '.')
+		return false;
+	for (size_t i = 0; i < lExt; ++i)
+	{
+		char a = apStr[n - lExt + i], b = asExt[i];
+		if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+		if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+		if (a != b)
+			return false;
+	}
+	return true;
+}
+
+uint8_t cNetworkManager::AllocGuestId()
+{
+	if (!mvFreeGuestIds.empty())
+	{
+		const uint8_t id = mvFreeGuestIds.back();
+		mvFreeGuestIds.pop_back();
+		return id;
+	}
+	if (mlNextGuestId < 2 || mlNextGuestId >= kPreviewGhostId)
+		return 0; /* the counter never reaches the preview id / wraps */
+	return mlNextGuestId++;
+}
+
+void cNetworkManager::FreeGuestId(uint8_t alId)
+{
+	if (alId < 2 || alId >= kPreviewGhostId)
+		return;
+	for (size_t i = 0; i < mvFreeGuestIds.size(); ++i)
+		if (mvFreeGuestIds[i] == alId)
+			return;
+	mvFreeGuestIds.push_back(alId);
+}
+
+#ifdef PENUMBRA_MULTIPLAYER
+
+namespace
+{
+/* Validation bounds. Penumbra levels are a few hundred metres across;
+   a guest reaches ~3 m, its throws are capped by the grab tuning anyway. */
+const float kNetMaxCoord = 20000.0f;     /* any world position component */
+const float kNetMaxAngle = 100.0f;       /* radians (pitch/yaw are < 2 pi) */
+const float kNetMaxReach = 50.0f;        /* grab target / push point from the guest */
+const float kNetMaxRelPick = 10.0f;      /* pick offset from a body's centre */
+const float kNetMaxDropImpulse = 15.0f;  /* ItemDrop toss */
+const float kNetMaxThrowImpulse = 30.0f; /* GrabEnd throw (BodySync clamps again) */
+const float kNetMaxPushImpulse = 50.0f;  /* one tick of move/push force */
+const float kNetMaxDamage = 200.0f;      /* enemy / entity / player damage per hit */
+const float kNetStrikeDecaySeconds = 5.0f;
+
+static bool NetFinite(float afX)
+{
+	return afX == afX && afX <= 3.0e38f && afX >= -3.0e38f;
+}
+
+static bool NetFiniteBounded(float afX, float afMaxAbs)
+{
+	return NetFinite(afX) && afX <= afMaxAbs && afX >= -afMaxAbs;
+}
+
+/** All three finite; |v| scaled down to afMaxLen when longer. false = NaN/inf. */
+static bool NetClampVec(float &x, float &y, float &z, float afMaxLen)
+{
+	if (!NetFinite(x) || !NetFinite(y) || !NetFinite(z))
+		return false;
+	const float fSq = x * x + y * y + z * z;
+	if (fSq > afMaxLen * afMaxLen && fSq > 0)
+	{
+		const float fScale = afMaxLen / sqrtf(fSq);
+		x *= fScale; y *= fScale; z *= fScale;
+	}
+	return true;
+}
+
+static bool NetClampDamage(float &afDamage)
+{
+	if (!NetFinite(afDamage))
+		return false;
+	if (afDamage < 0)
+		afDamage = 0;
+	else if (afDamage > kNetMaxDamage)
+		afDamage = kNetMaxDamage;
+	return true;
+}
+
+static bool NetPointNear(const hpl::cVector3f &avFrom, float x, float y, float z, float afMax)
+{
+	const float dx = x - avFrom.x, dy = y - avFrom.y, dz = z - avFrom.z;
+	return dx * dx + dy * dy + dz * dz <= afMax * afMax;
+}
+} // namespace
+
+bool cNetworkManager::PeerLive(const ENetPeer *apPeer)
+{
+	return apPeer && apPeer->state == ENET_PEER_STATE_CONNECTED && PeerGetId(apPeer) >= 2;
+}
+
+int cNetworkManager::CountConnectedPeers(bool abAcceptedOnly) const
+{
+	if (!mpImpl || !mpImpl->mpHost)
+		return 0;
+	int n = 0;
+	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+	{
+		const ENetPeer *pd = &mpImpl->mpHost->peers[i];
+		if (pd->state != ENET_PEER_STATE_CONNECTED)
+			continue;
+		if (abAcceptedOnly && PeerGetId(pd) < 2)
+			continue;
+		++n;
+	}
+	return n;
+}
+
+void cNetworkManager::ResetPeerGuards()
+{
+	if (!mpImpl)
+		return;
+	mpImpl->m_mapGuards.clear();
+	memset(mpImpl->mPong, 0, sizeof(mpImpl->mPong));
+	mpImpl->mfPongGlobalWindow = 0;
+	mpImpl->mlPongGlobalCount = 0;
+}
+
+/* Not a CSPRNG — the nonce only has to differ per connection so a captured
+   answer cannot be replayed: clock, ENet clock, the peer's address and
+   connect id, a counter and rand(), folded through the digest itself. */
+void cNetworkManager::MakeNonce(const ENetPeer *apPeer, uint8_t aOut[16])
+{
+	uint32_t aSeed[8];
+	aSeed[0] = (uint32_t)time(NULL);
+	aSeed[1] = enet_time_get();
+	aSeed[2] = apPeer ? apPeer->address.host : 0u;
+	aSeed[3] = apPeer ? ((uint32_t)apPeer->address.port | ((uint32_t)apPeer->connectID << 16)) : 0u;
+	aSeed[4] = ++mpImpl->mlNonceCounter;
+	aSeed[5] = (uint32_t)rand();
+	aSeed[6] = (uint32_t)(uintptr_t)apPeer;
+	aSeed[7] = (uint32_t)(uintptr_t)this ^ 0x5A17E5EDu;
+	uint8_t aPrev[16];
+	memcpy(aPrev, aOut, sizeof(aPrev)); /* whatever was there (zeros) adds nothing but hurts nothing */
+	NetAuthDigest((const char *)aSeed, sizeof(aSeed), aPrev, (uint16_t)(aSeed[4] & 0xFFFFu), aOut);
+}
+
+void cNetworkManager::HostAcceptPeer(ENetPeer *apPeer, const cNetAuth &aAuth)
+{
+	if (!mbHosting || !mpImpl || !mpImpl->mpHost || !apPeer)
+		return;
+	std::map<const ENetPeer *, Impl::cPeerGuard>::iterator gi = mpImpl->m_mapGuards.find(apPeer);
+	if (gi == mpImpl->m_mapGuards.end())
+		return;
+	Impl::cPeerGuard &guard = gi->second;
+	if (guard.mbAuthed || guard.mbRefused)
+		return;
+	char sWho[64];
+	FormatPeerAddr(apPeer, sWho, sizeof(sWho));
+
+	uint8_t aExpect[16];
+	NetAuthDigest(msServerPassword.c_str(), msServerPassword.size(), guard.mNonce,
+		kNetProtocolVersion, aExpect);
+	if (aAuth.mlVersion != kNetProtocolVersion || memcmp(aExpect, aAuth.mDigest, sizeof(aExpect)) != 0)
+	{
+		guard.mbRefused = true;
+		Log(" multiplayer: REFUSED peer %s - bad auth (version %u, %s)\n", sWho,
+			(unsigned)aAuth.mlVersion, msServerPassword.empty() ? "open server" : "wrong password");
+		enet_peer_disconnect(apPeer, kNetDisconnectBadAuth);
+		return;
+	}
+
+	const uint8_t aid = AllocGuestId();
+	if (aid == 0)
+	{
+		guard.mbRefused = true;
+		Log(" multiplayer: REFUSED peer %s - no guest id left\n", sWho);
+		enet_peer_disconnect(apPeer, kNetDisconnectFull);
+		return;
+	}
+	guard.mbAuthed = true;
+	guard.mlStrikes = 0;
+	PeerSetId(apPeer, aid);
+	{
+		/* FIRST game packet: proves we speak their protocol (their
+		   join-handler refuses old hosts that skip this) */
+		cNetVersionAck ack;
+		ack.mType = eNetPacketType_VersionAck;
+		ack.mlVersion = kNetProtocolVersion;
+		SendStructToPeer(apPeer, &ack, sizeof(ack), true);
+	}
+	SendPlayerJoin(apPeer, aid);
+	SendCensus(apPeer);    /* late joiner gets the map-load census now */
+	SendMapBeacon(apPeer); /* ...and where the party is, so a guest sitting
+	                          in the menu launches straight into our map */
+	/* v14: NO world/body snapshot here — the guest has no world yet (or a
+	   stale one). It asks with MapReady once its census is paired with
+	   ours, and SendWorldSnapshot answers. */
+	if (aAuth.msName[0] != '\0')
+		OnPlayerNameReceived(aid, aAuth.msName, sizeof(aAuth.msName)); /* sanitised inside */
+	SendNameTable(NULL); /* v13: who is here — the newcomer lists it silently */
+	Log(" multiplayer: peer %s accepted as id=%u%s\n", sWho, (unsigned)aid,
+		msServerPassword.empty() ? "" : " (password ok)");
+}
+
+void cNetworkManager::SendAuthResponse(const cNetChallenge &aChallenge)
+{
+	if (mbHosting || !mpImpl || !mpImpl->mpServerPeer)
+		return;
+	if (mbAuthSent)
+	{
+		Log(" multiplayer: second challenge from the host ignored\n");
+		return;
+	}
+	cNetAuth auth;
+	memset(&auth, 0, sizeof(auth));
+	auth.mType = eNetPacketType_Auth;
+	auth.mlVersion = kNetProtocolVersion;
+	NetAuthDigest(msJoinPassword.c_str(), msJoinPassword.size(), aChallenge.mNonce,
+		kNetProtocolVersion, auth.mDigest);
+	const size_t n = msPlayerName.size() < sizeof(auth.msName) ? msPlayerName.size() : sizeof(auth.msName);
+	if (n > 0)
+		memcpy(auth.msName, msPlayerName.data(), n);
+	SendStructToPeer(mpImpl->mpServerPeer, &auth, sizeof(auth), true);
+	mbAuthSent = true;
+	Log(" multiplayer: challenge answered (%s)\n", msJoinPassword.empty() ? "no password" : "with password");
+}
+
+void cNetworkManager::NoteViolation(ENetPeer *apPeer, uint8_t alType, const char *asWhy)
+{
+	if (!mpImpl || !apPeer)
+		return;
+	std::map<const ENetPeer *, Impl::cPeerGuard>::iterator gi = mpImpl->m_mapGuards.find(apPeer);
+	if (gi == mpImpl->m_mapGuards.end())
+		return;
+	Impl::cPeerGuard &guard = gi->second;
+	const unsigned lBit = alType < 64 ? alType : 63;
+	if ((guard.mlLoggedTypes & (1ull << lBit)) == 0)
+	{
+		guard.mlLoggedTypes |= (1ull << lBit);
+		char sWho[64];
+		FormatPeerAddr(apPeer, sWho, sizeof(sWho));
+		Log(" multiplayer: guest %u (%s): dropped packet type %u - %s (logged once per type)\n",
+			(unsigned)PeerGetId(apPeer), sWho, (unsigned)alType, asWhy ? asWhy : "");
+	}
+	++guard.mlStrikes;
+	guard.mfStrikeDecay = 0;
+	if (guard.mlStrikes >= kNetMaxStrikes && !guard.mbRefused)
+	{
+		guard.mbRefused = true; /* everything else from it is dropped until the slot dies */
+		char sWho[64];
+		FormatPeerAddr(apPeer, sWho, sizeof(sWho));
+		Log(" multiplayer: guest %u (%s) KICKED - %u protocol violations\n",
+			(unsigned)PeerGetId(apPeer), sWho, guard.mlStrikes);
+		enet_peer_disconnect(apPeer, kNetDisconnectKicked);
+	}
+}
+
+/* Shape + bounds of every packet either role applies, clamping in place.
+   Host->guest STREAMS (ObjectState, EnemyState, WorldSnapshot, census,
+   join/leave/ack/deny/event) keep their own length/generation checks in
+   the handlers; only the event payloads with strings/floats are looked at
+   here. A short packet of a known type is malformed: a real build never
+   sends one. */
+bool cNetworkManager::ValidateEventPacket(unsigned char *apData, size_t alLen, bool abFromHost)
+{
+	if (!apData || alLen < 1)
+		return false;
+	const uint8_t t = apData[0];
+	switch (t)
+	{
+	case eNetPacketType_PlayerState:
+	{
+		if (alLen < sizeof(cNetPlayerState))
+			return false;
+		cNetPlayerState st;
+		memcpy(&st, apData, sizeof(st));
+		return NetFiniteBounded(st.mfPosX, kNetMaxCoord) && NetFiniteBounded(st.mfPosY, kNetMaxCoord) &&
+			NetFiniteBounded(st.mfPosZ, kNetMaxCoord) && NetFiniteBounded(st.mfPitch, kNetMaxAngle) &&
+			NetFiniteBounded(st.mfYaw, kNetMaxAngle); /* velocities are int8, health is clamped on apply */
+	}
+	case eNetPacketType_MapChange:
+	{
+		if (alLen < sizeof(cNetMapChange))
+			return false;
+		const cNetMapChange *mc = (const cNetMapChange *)apData;
+		/* the start name may be empty (the beacon sends none) */
+		return NetBareFileNameOk(mc->msMap, sizeof(mc->msMap), "dae") &&
+			NetStringOk(mc->msPos, sizeof(mc->msPos), true);
+	}
+	case eNetPacketType_ItemPickup:
+	{
+		if (alLen < sizeof(cNetItemPickup))
+			return false;
+		const cNetItemPickup *ip = (const cNetItemPickup *)apData;
+		return NetStringOk(ip->msItemName, sizeof(ip->msItemName), true);
+	}
+	case eNetPacketType_ItemDrop:
+	{
+		if (alLen < sizeof(cNetItemDrop))
+			return false;
+		cNetItemDrop drop;
+		memcpy(&drop, apData, sizeof(drop));
+		if (!NetStringOk(drop.msName, sizeof(drop.msName), false) ||
+			!NetBareFileNameOk(drop.msFile, sizeof(drop.msFile), "ent"))
+			return false;
+		if (!NetFiniteBounded(drop.mfPosX, kNetMaxCoord) || !NetFiniteBounded(drop.mfPosY, kNetMaxCoord) ||
+			!NetFiniteBounded(drop.mfPosZ, kNetMaxCoord))
+			return false;
+		if (!NetClampVec(drop.mfImpX, drop.mfImpY, drop.mfImpZ, kNetMaxDropImpulse))
+			return false;
+		memcpy(apData, &drop, sizeof(drop));
+		return true;
+	}
+	case eNetPacketType_ScriptEvent:
+	{
+		if (alLen < sizeof(cNetScriptEvent))
+			return false;
+		const cNetScriptEvent *se = (const cNetScriptEvent *)apData;
+		switch (se->mOp)
+		{
+		case eNetScriptOp_LocalVarSet: case eNetScriptOp_LocalVarAdd:
+		case eNetScriptOp_GlobalVarSet: case eNetScriptOp_GlobalVarAdd:
+		case eNetScriptOp_EntityActive: case eNetScriptOp_DoorLocked:
+		case eNetScriptOp_RemoveItem: case eNetScriptOp_LampLit:
+			break;
+		default:
+			return false;
+		}
+		return NetStringOk(se->msName, sizeof(se->msName), false);
+	}
+	case eNetPacketType_EntityDamage:
+	{
+		if (alLen < sizeof(cNetEntityDamage))
+			return false;
+		cNetEntityDamage ed;
+		memcpy(&ed, apData, sizeof(ed));
+		if (!NetClampDamage(ed.mfDamage))
+			return false;
+		memcpy(apData, &ed, sizeof(ed));
+		return true;
+	}
+	case eNetPacketType_EnemyDamage:
+	{
+		if (alLen < sizeof(cNetEnemyDamage))
+			return false;
+		cNetEnemyDamage dmg;
+		memcpy(&dmg, apData, sizeof(dmg));
+		if (!NetClampDamage(dmg.mfDamage))
+			return false;
+		memcpy(apData, &dmg, sizeof(dmg));
+		return true;
+	}
+	case eNetPacketType_PlayerDamage:
+	{
+		if (alLen < sizeof(cNetPlayerDamage))
+			return false;
+		cNetPlayerDamage pd;
+		memcpy(&pd, apData, sizeof(pd));
+		if (!NetClampDamage(pd.mfDamage))
+			return false;
+		memcpy(apData, &pd, sizeof(pd));
+		return true;
+	}
+	case eNetPacketType_BodyGrabBegin:
+	{
+		if (alLen < sizeof(cNetBodyGrabBegin))
+			return false;
+		cNetBodyGrabBegin gb;
+		memcpy(&gb, apData, sizeof(gb));
+		if (!NetFiniteBounded(gb.mfRelX, kNetMaxRelPick) || !NetFiniteBounded(gb.mfRelY, kNetMaxRelPick) ||
+			!NetFiniteBounded(gb.mfRelZ, kNetMaxRelPick) || !NetFinite(gb.mfMassMul))
+			return false;
+		gb.mfMassMul = gb.mfMassMul < 0.1f ? 0.1f : (gb.mfMassMul > 20.0f ? 20.0f : gb.mfMassMul);
+		memcpy(apData, &gb, sizeof(gb));
+		return true;
+	}
+	case eNetPacketType_BodyGrabTarget:
+	{
+		if (alLen < sizeof(cNetBodyGrabTarget))
+			return false;
+		const cNetBodyGrabTarget *gt = (const cNetBodyGrabTarget *)apData;
+		return NetFiniteBounded(gt->mfX, kNetMaxCoord) && NetFiniteBounded(gt->mfY, kNetMaxCoord) &&
+			NetFiniteBounded(gt->mfZ, kNetMaxCoord);
+	}
+	case eNetPacketType_BodyGrabEnd:
+	{
+		if (alLen < sizeof(cNetBodyGrabEnd))
+			return false;
+		cNetBodyGrabEnd ge;
+		memcpy(&ge, apData, sizeof(ge));
+		if (!NetClampVec(ge.mfImpX, ge.mfImpY, ge.mfImpZ, kNetMaxThrowImpulse))
+			return false;
+		memcpy(apData, &ge, sizeof(ge));
+		return true;
+	}
+	case eNetPacketType_BodyPush:
+	{
+		if (alLen < sizeof(cNetBodyPush))
+			return false;
+		cNetBodyPush push;
+		memcpy(&push, apData, sizeof(push));
+		if (!NetFiniteBounded(push.mfPtX, kNetMaxCoord) || !NetFiniteBounded(push.mfPtY, kNetMaxCoord) ||
+			!NetFiniteBounded(push.mfPtZ, kNetMaxCoord))
+			return false;
+		if (!NetClampVec(push.mfImpX, push.mfImpY, push.mfImpZ, kNetMaxPushImpulse))
+			return false;
+		memcpy(apData, &push, sizeof(push));
+		return true;
+	}
+	case eNetPacketType_PlayerName:
+		return alLen >= sizeof(cNetPlayerName); /* SanitizePlayerName on apply */
+	case eNetPacketType_MapReady:
+		return alLen >= sizeof(cNetMapReady);
+	case eNetPacketType_Auth:
+		return alLen >= sizeof(cNetAuth);
+	case eNetPacketType_Challenge:
+		return alLen >= sizeof(cNetChallenge);
+	case eNetPacketType_PlayerJoin:
+	case eNetPacketType_PlayerLeave:
+		return alLen >= sizeof(cNetPlayerJoin);
+	case eNetPacketType_VersionAck:
+		return alLen >= sizeof(cNetVersionAck);
+	case eNetPacketType_BodyGrabDeny:
+		return alLen >= sizeof(cNetBodyGrabDeny);
+	case eNetPacketType_EnemyEvent:
+		return alLen >= sizeof(cNetEnemyEvent);
+	case eNetPacketType_BodyCensus:
+		return alLen >= sizeof(cNetBodyCensus);
+	case eNetPacketType_ObjectState:
+	case eNetPacketType_EnemyState:
+	case eNetPacketType_WorldSnapshot:
+		return abFromHost; /* host streams; the handlers check header + count */
+	default:
+		return false;
+	}
+}
+
+/* Host extras on top of ValidateEventPacket: file names must resolve
+   through the engine's file searcher (the same lookup the loaders use), and
+   physics intent must be within reach of where the guest last said it was
+   (a guest that never sent a state cannot push anything). */
+bool cNetworkManager::ValidateGuestPacket(ENetPeer *apPeer, unsigned char *apData, size_t alLen)
+{
+	if (!ValidateEventPacket(apData, alLen, false))
+		return false;
+	if (!mpImpl || !apPeer)
+		return false;
+	std::map<const ENetPeer *, Impl::cPeerGuard>::iterator gi = mpImpl->m_mapGuards.find(apPeer);
+	if (gi == mpImpl->m_mapGuards.end())
+		return false;
+	Impl::cPeerGuard &guard = gi->second;
+	hpl::cFileSearcher *pSearcher = (mpInit && mpInit->mpGame && mpInit->mpGame->GetResources()) ?
+		mpInit->mpGame->GetResources()->GetFileSearcher() : NULL;
+
+	const uint8_t t = apData[0];
+	switch (t)
+	{
+	case eNetPacketType_PlayerState:
+	{
+		const cNetPlayerState *st = (const cNetPlayerState *)apData;
+		guard.mvLastPos = cVector3f(st->mfPosX, st->mfPosY, st->mfPosZ);
+		guard.mbHavePos = true;
+		return true;
+	}
+	case eNetPacketType_ItemDrop:
+	{
+		const cNetItemDrop *drop = (const cNetItemDrop *)apData;
+		char sFile[sizeof(drop->msFile) + 1];
+		memcpy(sFile, drop->msFile, sizeof(drop->msFile));
+		sFile[sizeof(drop->msFile)] = '\0';
+		if (pSearcher == NULL || pSearcher->GetFilePath(tString(sFile)).empty())
+		{
+			Log(" multiplayer: guest %u drop of '%s' refused - no such entity file here\n",
+				(unsigned)PeerGetId(apPeer), sFile);
+			return false;
+		}
+		return true;
+	}
+	case eNetPacketType_MapChange:
+	{
+		const cNetMapChange *mc = (const cNetMapChange *)apData;
+		char sMap[sizeof(mc->msMap) + 1];
+		memcpy(sMap, mc->msMap, sizeof(mc->msMap));
+		sMap[sizeof(mc->msMap)] = '\0';
+		if (pSearcher == NULL || pSearcher->GetFilePath(tString(sMap)).empty())
+		{
+			Log(" multiplayer: guest %u map change to '%s' refused - no such map here\n",
+				(unsigned)PeerGetId(apPeer), sMap);
+			return false;
+		}
+		return true;
+	}
+	case eNetPacketType_BodyGrabTarget:
+	{
+		const cNetBodyGrabTarget *gt = (const cNetBodyGrabTarget *)apData;
+		return guard.mbHavePos && NetPointNear(guard.mvLastPos, gt->mfX, gt->mfY, gt->mfZ, kNetMaxReach);
+	}
+	case eNetPacketType_BodyPush:
+	{
+		const cNetBodyPush *push = (const cNetBodyPush *)apData;
+		return guard.mbHavePos && NetPointNear(guard.mvLastPos, push->mfPtX, push->mfPtY, push->mfPtZ, kNetMaxReach);
+	}
+	case eNetPacketType_BodyGrabBegin:
+	case eNetPacketType_BodyGrabEnd:
+		return guard.mbHavePos; /* a guest that never stood anywhere holds nothing */
+	default:
+		return true;
+	}
+}
+
+void cNetworkManager::UpdatePeerGuards(float afTimeStep)
+{
+	if (!mbHosting || !mpImpl || !mpImpl->mpHost)
+		return;
+	std::map<const ENetPeer *, Impl::cPeerGuard>::iterator it = mpImpl->m_mapGuards.begin();
+	while (it != mpImpl->m_mapGuards.end())
+	{
+		const ENetPeer *pPeer = it->first;
+		Impl::cPeerGuard &guard = it->second;
+		/* the slot died without us seeing the event (never for a normal
+		   enet_peer_disconnect, which reports one) — drop the record */
+		if (pPeer->state == ENET_PEER_STATE_DISCONNECTED || pPeer->state == ENET_PEER_STATE_ZOMBIE)
+		{
+			std::map<const ENetPeer *, Impl::cPeerGuard>::iterator dead = it++;
+			mpImpl->m_mapGuards.erase(dead);
+			continue;
+		}
+		guard.mfAge += afTimeStep;
+		if (!guard.mbAuthed && !guard.mbRefused && guard.mfAge > kNetAuthTimeoutSeconds)
+		{
+			guard.mbRefused = true;
+			char sWho[64];
+			FormatPeerAddr(pPeer, sWho, sizeof(sWho));
+			Log(" multiplayer: peer %s never answered the challenge (%.1f s) - dropped\n",
+				sWho, guard.mfAge);
+			enet_peer_disconnect(const_cast<ENetPeer *>(pPeer), kNetDisconnectBadAuth);
+		}
+		guard.mfRateWindow += afTimeStep;
+		if (guard.mfRateWindow >= 1.0f)
+		{
+			guard.mfRateWindow = 0;
+			guard.mlReliableInWindow = 0;
+			guard.mbRateStruck = false;
+		}
+		if (guard.mlStrikes > 0)
+		{
+			guard.mfStrikeDecay += afTimeStep;
+			if (guard.mfStrikeDecay >= kNetStrikeDecaySeconds)
+			{
+				guard.mfStrikeDecay = 0;
+				--guard.mlStrikes; /* a flaky-but-honest client never accumulates */
+			}
+		}
+		++it;
+	}
+}
+
+/* Windows are aged once per frame in PollDiscovery. A source keeps its
+   bucket for the 1 s window; a new source takes an expired bucket, else the
+   one closest to expiry (a flood from 17+ spoofed sources is then capped by
+   the global limit alone, which is the point of having one). */
+bool cNetworkManager::DiscoveryPongAllowed(uint32_t alAddr)
+{
+	if (!mpImpl)
+		return false;
+	if (mpImpl->mlPongGlobalCount >= (unsigned)Impl::kMaxPongPerSecond)
+		return false;
+	int lFree = -1;
+	float fOldest = 2.0f;
+	for (int b = 0; b < Impl::kPongBuckets; ++b)
+	{
+		Impl::cPongBucket &bk = mpImpl->mPong[b];
+		if (bk.mfWindowLeft > 0 && bk.mlAddr == alAddr)
+		{
+			if (bk.mlCount >= (unsigned)Impl::kMaxPongPerSource)
+				return false;
+			++bk.mlCount;
+			++mpImpl->mlPongGlobalCount;
+			return true;
+		}
+		if (bk.mfWindowLeft < fOldest)
+		{
+			fOldest = bk.mfWindowLeft;
+			lFree = b;
+		}
+	}
+	if (lFree < 0)
+		return false;
+	Impl::cPongBucket &bk = mpImpl->mPong[lFree];
+	bk.mlAddr = alAddr;
+	bk.mfWindowLeft = 1.0f;
+	bk.mlCount = 1;
+	++mpImpl->mlPongGlobalCount;
+	return true;
 }
 
 #endif /* PENUMBRA_MULTIPLAYER */

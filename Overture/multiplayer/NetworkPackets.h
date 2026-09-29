@@ -44,8 +44,18 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
         the host answers with script vars, entity actives/locks/lit, taken +
         party items, resting body poses, the enemy roster and local timers,
         applied atomically. Also LampLit script op 9 and the enemy stream's
-        map-gen byte, which was reserved (0) until now. */
-static const uint16_t kNetProtocolVersion = 14;
+        map-gen byte, which was reserved (0) until now.
+    v15: internet hardening — challenge/response join: the host answers
+        CONNECT with cNetChallenge (28, a 16-byte nonce) and the guest's
+        FIRST packet must be cNetAuth (27: version + a 128-bit digest of
+        server_password + nonce + its name). Nothing else is processed or
+        sent to a peer until it is accepted; no/wrong answer within
+        kNetAuthTimeoutSeconds -> kNetDisconnectBadAuth. max_players is
+        enforced at CONNECT (kNetDisconnectFull). Packet types are role
+        gated (IsAllowedFrom) and every guest-authored payload is validated
+        before the host applies or relays it. The digest input includes the
+        version, so a v14 build can never answer a v15 challenge. */
+static const uint16_t kNetProtocolVersion = 15;
 
 
 /** v13: cNetPlayerName::msName capacity. A name is at most this many
@@ -141,6 +151,14 @@ enum eNetPacketType : uint8_t
 	                                    name, right after PlayerJoin), host ->
 	                                    every guest (the full table, one
 	                                    packet per player; the host is id 1) */
+	/* v15 — JOIN AUTHENTICATION (reliable ch0). */
+	eNetPacketType_Auth = 27,      /* guest -> host, the guest's FIRST packet:
+	                                  answer to the challenge (cNetAuth) */
+	eNetPacketType_Challenge = 28, /* host -> guest, right after CONNECT and
+	                                  before anything else (cNetChallenge) */
+	/* 29 is reserved for voice (v16). Keep cNetworkManager::IsAllowedFrom
+	   (NetworkManager.cpp) in step with every new type: a type the table
+	   does not know is DROPPED from either direction. */
 };
 
 /** eNetPacketType_ScriptEvent ops. */
@@ -194,6 +212,20 @@ static const unsigned kNetSnapMaxChunkPayload = 1200;
     "grab the same zip". */
 static const uint32_t kNetConnectData = kNetProtocolMagic ^ (uint32_t)kNetProtocolVersion;
 static const uint32_t kNetDisconnectBadVersion = 0xBADF00D5u;
+/** v15 disconnect reasons (ENet disconnect data, shown by the join screen). */
+static const uint32_t kNetDisconnectBadAuth = 0xBADAC0DEu; /* wrong/missing password, or no cNetAuth within kNetAuthTimeoutSeconds */
+static const uint32_t kNetDisconnectFull = 0x5E12FA11u;    /* max_players reached (the browser row already shows counts) */
+static const uint32_t kNetDisconnectKicked = 0xC1C0FFEEu;  /* too many protocol violations (kNetMaxStrikes) */
+
+/** v15 join authentication. The host answers CONNECT with a 16-byte nonce;
+    the guest replies with NetAuthDigest(password, nonce, version) and its
+    name. server_password= empty means an OPEN server — the exchange still
+    runs (with the empty password) so the state machine is one path, and a
+    peer that never answers is dropped after kNetAuthTimeoutSeconds. */
+static const size_t kNetPasswordMaxChars = 48;   /* cfg server_password / join_password */
+static const float kNetAuthTimeoutSeconds = 5.0f;
+static const unsigned kNetMaxStrikes = 20;       /* violations before kNetDisconnectKicked */
+static const unsigned kNetMaxReliablePerSec = 200; /* reliable (ch0) packets per peer per second before a strike */
 
 /** Wire encoding of cNetPlayerState::mMoveState. The values are FROZEN for v2
     compatibility: they equal the engine's ePlayerMoveState order (GameTypes.h),
@@ -575,7 +607,96 @@ struct cNetSnapTimer
 	float mfTime;
 	uint8_t mbPaused;
 };
+
+/** v15, host -> guest, the host's FIRST packet (before VersionAck). */
+struct cNetChallenge
+{
+	uint8_t mType; /**< eNetPacketType_Challenge */
+	uint8_t mNonce[16];
+};
+
+/** v15, guest -> host, the guest's FIRST packet. mDigest =
+    NetAuthDigest(join_password, mNonce, mlVersion); msName is the guest's
+    player name (same NUL-padded rules as cNetPlayerName — the guest still
+    sends cNetPlayerName after PlayerJoin, this copy only lets the host
+    log/announce it at accept time). */
+struct cNetAuth
+{
+	uint8_t mType; /**< eNetPacketType_Auth */
+	uint16_t mlVersion; /**< kNetProtocolVersion of the guest */
+	uint8_t mDigest[16];
+	char msName[kNetPlayerNameMaxChars];
+};
 #pragma pack(pop)
+
+/** v15: 128-bit digest of (nonce || version || password || lengths) for the
+    join challenge. NOT a cryptographic hash: four independent FNV-1a-style
+    lanes with cross-lane rotation feedback and a murmur3 finalizer, then
+    two full re-mix rounds. It makes replaying a captured answer against a
+    fresh nonce impossible and keeps a password out of the packets in the
+    clear; an attacker who captures (nonce, digest) pairs can still test
+    password guesses offline, exactly like any unsalted challenge scheme —
+    pick a real password for a public server. No external libs, same
+    result on both machines (byte-wise, endian-free). */
+static inline uint32_t NetAuthRotl(uint32_t x, unsigned r)
+{
+	return (x << r) | (x >> (32u - r));
+}
+static inline uint32_t NetAuthFmix(uint32_t h)
+{
+	h ^= h >> 16; h *= 0x85EBCA6Bu;
+	h ^= h >> 13; h *= 0xC2B2AE35u;
+	h ^= h >> 16;
+	return h;
+}
+static inline void NetAuthDigest(const char *apPassword, size_t alPasswordLen,
+	const uint8_t aNonce[16], uint16_t alVersion, uint8_t aOut[16])
+{
+	uint32_t h[4] = { 2166136261u ^ 0xA5A5A5A5u, 2166136261u ^ 0x3C3C3C3Cu,
+	                  2166136261u ^ 0x0F0F0F0Fu, 2166136261u ^ 0x96969696u };
+	static const uint32_t kPrime[4] = { 16777619u, 0x01000193u * 3u + 2u, 0x9E3779B1u, 0x27D4EB2Fu };
+	/* input stream: nonce, version (2 bytes), password, then both lengths */
+	uint8_t aHead[18];
+	for (int i = 0; i < 16; ++i)
+		aHead[i] = aNonce ? aNonce[i] : 0;
+	aHead[16] = (uint8_t)(alVersion & 0xFFu);
+	aHead[17] = (uint8_t)(alVersion >> 8);
+	uint8_t aTail[8];
+	for (int i = 0; i < 4; ++i)
+	{
+		aTail[i] = (uint8_t)((uint32_t)alPasswordLen >> (8 * i));
+		aTail[4 + i] = (uint8_t)(16u >> (8 * i));
+	}
+	const uint8_t *aPart[3] = { aHead, (const uint8_t *)apPassword, aTail };
+	const size_t aPartLen[3] = { sizeof(aHead), apPassword ? alPasswordLen : 0, sizeof(aTail) };
+	unsigned lLane = 0;
+	for (int p = 0; p < 3; ++p)
+	{
+		for (size_t i = 0; i < aPartLen[p]; ++i)
+		{
+			const uint32_t b = aPart[p][i];
+			h[lLane] ^= b;
+			h[lLane] *= kPrime[lLane];
+			h[(lLane + 1u) & 3u] += NetAuthRotl(h[lLane], 13u) ^ (b * 0x9E3779B9u);
+			lLane = (lLane + 1u) & 3u;
+		}
+	}
+	for (int round = 0; round < 2; ++round)
+	{
+		for (int i = 0; i < 4; ++i)
+		{
+			h[i] = NetAuthFmix(h[i] + NetAuthRotl(h[(i + 3) & 3], 7u) + (uint32_t)(round * 4 + i + 1));
+			h[(i + 1) & 3] ^= NetAuthRotl(h[i], 21u);
+		}
+	}
+	for (int i = 0; i < 4; ++i)
+	{
+		aOut[i * 4 + 0] = (uint8_t)(h[i] & 0xFFu);
+		aOut[i * 4 + 1] = (uint8_t)((h[i] >> 8) & 0xFFu);
+		aOut[i * 4 + 2] = (uint8_t)((h[i] >> 16) & 0xFFu);
+		aOut[i * 4 + 3] = (uint8_t)((h[i] >> 24) & 0xFFu);
+	}
+}
 
 static_assert(sizeof(cNetPlayerJoin) == 2, "");
 static_assert(sizeof(cNetPlayerLeave) == 2, "");
@@ -607,5 +728,7 @@ static_assert(sizeof(cNetSnapshotHdr) == 6, "");   /* v14 */
 static_assert(sizeof(cNetSnapVar) == 52, "");      /* v14 */
 static_assert(sizeof(cNetSnapEntity) == 10, "");   /* v14 */
 static_assert(sizeof(cNetSnapTimer) == 101, "");   /* v14 */
+static_assert(sizeof(cNetChallenge) == 17, "");    /* v15 */
+static_assert(sizeof(cNetAuth) == 43, "");         /* v15 */
 
 #endif /* NETWORK_PACKETS_H */

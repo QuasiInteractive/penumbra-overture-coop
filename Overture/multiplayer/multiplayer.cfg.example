@@ -28,10 +28,25 @@ player_name=
 # server_name=  — shown in the LAN server browser (spaces OK, 31 chars max).
 #                 Empty / not set = "<player_name>'s game" ("Penumbra Server"
 #                 when there is no player_name either).
-# max_players=  — advertised in discovery pongs (2..31, default 4)
+# max_players=  — advertised in discovery pongs AND enforced at connect
+#                 (2..31, default 4): the (max_players)th player and later
+#                 are refused with "server full".
 # server_name=Penumbra Server
 max_players=4
 port=7777
+
+# ---- Passwords (v15) --------------------------------------------------------
+# server_password= — what a HOST demands. Empty (or out) = open server: anyone
+#                   with the address can join. Set one before forwarding the
+#                   game port to the internet or listing the server in a
+#                   public lobby. Printable ASCII, spaces OK, 48 chars max.
+#                   Never sent in the clear: the guest answers a per-connection
+#                   challenge with a digest of it (README "Security").
+# join_password=   — what a GUEST sends when joining (the join screen / lobby
+#                   can set it too). Wrong or missing = "Host REFUSED: wrong
+#                   password" on the join screen.
+server_password=
+join_password=
 # join=127.0.0.1:7777
 # Host (id 1) appears as malik.dae to others; client (id 2) phillip — more peers rotate.
 ghost_models=malik.dae,phillip.dae

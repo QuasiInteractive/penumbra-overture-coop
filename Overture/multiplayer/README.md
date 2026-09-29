@@ -8,8 +8,8 @@ All dedicated multiplayer source lives in this folder. Work here first; game glu
 |------|------|
 | `NetworkPackets.h` | Packed ENet payloads (player state, bodies, enemies, script/item events, join/leave) + discovery ping/pong, protocol magic/version (`kNetProtocolVersion`), `kNetSendPeriodSeconds`, `kNetDiscoveryPort`. |
 | `NetworkManager.h` / `.cpp` | Listen-server host, client join, 30 Hz state relay, LAN/Hamachi discovery (raw UDP broadcast), `multiplayer.cfg` (read + the `player_name` writer), F9/F10/F11, per-frame ghost updates, the ghost preview mode, player names + the party event feed (v13). |
-| `NetworkPackets.h` | Packed ENet payloads (player state, bodies, enemies, script/item events, join/leave, v14 MapReady + WorldSnapshot sections) + discovery ping/pong, protocol magic/version (`kNetProtocolVersion`), `kNetSendPeriodSeconds`, `kNetDiscoveryPort`. |
-| `NetworkManager.h` / `.cpp` | Listen-server host, client join, 30 Hz state relay, LAN/Hamachi discovery (raw UDP broadcast), `multiplayer.cfg`, F9/F10/F11, per-frame ghost updates, the ghost preview mode. |
+| `NetworkPackets.h` | Packed ENet payloads (player state, bodies, enemies, script/item events, join/leave, v14 MapReady + WorldSnapshot sections, v15 Challenge/Auth + `NetAuthDigest`) + discovery ping/pong, protocol magic/version (`kNetProtocolVersion`), `kNetSendPeriodSeconds`, `kNetDiscoveryPort`, disconnect reasons. |
+| `NetworkManager.h` / `.cpp` | Listen-server host, client join, 30 Hz state relay, LAN/Hamachi discovery (raw UDP broadcast), `multiplayer.cfg`, F9/F10/F11, per-frame ghost updates, the ghost preview mode; v15 join authentication, role gating (`IsAllowedFrom`), payload validation, strikes, rate limits (see Security). |
 | `BodySync.h` / `.cpp` | Shared physics: host-authoritative body replication. Name-hash identity, map-load census (host/guest verify), host state batches, guest apply. |
 | `GhostPlayer.h` / `.cpp` | Remote peer visuals (skinned mesh + marker light + flashlight). Interpolation buffer on the sender's clock, clip selection from the wire velocity/flags, weight-preserving crossfades, gait-scaled playback. Not a real `cPlayer`. |
 | `multiplayer.cfg.example` | Copy next to `overture.exe` as `multiplayer.cfg`. |
@@ -29,9 +29,8 @@ writes, entity activation, door locks, item pickups/drops/consumption and
 breakable damage are replicated as reliable events; map changes move the
 whole party). Player state, bodies and enemies stream at **30 Hz**
 (`kNetSendPeriodSeconds`); every wire layout change bumps
-`kNetProtocolVersion` (currently **13**), and the connect handshake refuses
-`kNetProtocolVersion` (currently **14**), and the connect handshake refuses
-mismatched builds.
+`kNetProtocolVersion` (currently **15**), and the connect handshake refuses
+mismatched builds (then the v15 password challenge, see **Security**).
 
 Remote players are drawn as **ghosts** (`cGhostPlayer`): each `cNetPlayerState`
 carries the sender's feet position, view pitch/yaw, body-local planar
@@ -197,6 +196,98 @@ bytes (id=I gen=N; vars L/G, entities E, taken K, party P, enemies N,
 timers T, bodies B chunks, skipped S)`. Record the chunks/bytes line on the
 largest level to replace the design estimate (~25 KB in ~45 chunks).
 
+## Security (protocol v15: a listen server on the open internet)
+
+Before v15 the host trusted every byte from every peer: a guest could send
+`PlayerJoin`/`VersionAck` and rewrite the host's own id, spawn any `.ent`
+by file name, move the party to any map, deal unbounded damage, and the
+discovery port answered every ping (a UDP reflector). v15 closes that so a
+**port-forwarded public server** (game port + `kNetDiscoveryPort`) is an
+acceptable thing to run, with a public lobby listing it.
+
+**Join flow** (all reliable ch0, in this order):
+
+1. ENet CONNECT carries `kNetConnectData` (magic ^ version) — an old build
+   or a foreign client is refused with `kNetDisconnectBadVersion` before
+   anything flows. Then `max_players` is enforced *at CONNECT*: every
+   connected slot counts, accepted or still authenticating, so a burst of
+   half-open joins cannot exceed it either (`kNetDisconnectFull`).
+2. The host sends `cNetChallenge` (type **28**, a 16-byte per-connection
+   nonce) and nothing else. The peer has **no wire id yet**: it is left out
+   of every send loop (`PeerLive`), gets no census/beacon/name table, and
+   any packet from it other than the answer is dropped (and counted).
+3. The guest's FIRST packet is `cNetAuth` (type **27**): its
+   `kNetProtocolVersion`, its name, and `NetAuthDigest(join_password,
+   nonce, version)` — a 128-bit mix (four FNV-1a-style lanes with
+   cross-lane feedback, murmur3 finalizer, two re-mix rounds; no external
+   libs, same bytes on both machines). The password never travels in the
+   clear and a captured answer is useless against the next nonce. It is
+   *not* a cryptographic hash: with a captured (nonce, digest) pair the
+   password can be guessed offline like any unsalted challenge scheme, so
+   a public server wants a real password.
+4. The host compares against `NetAuthDigest(server_password, nonce,
+   version)`. Match: the guest gets its id (`AllocGuestId`, ids of departed
+   guests are reused first, so the `uint8_t` counter can never exhaust),
+   then the usual `VersionAck`, `PlayerJoin`, census, map beacon and name
+   table. Mismatch, or no answer within `kNetAuthTimeoutSeconds` (5 s):
+   `kNetDisconnectBadAuth`. `server_password=` empty means an **open**
+   server — the exchange still runs with the empty password so there is
+   one code path. The guest takes its password from `join_password=` or
+   `cNetworkManager::SetJoinPassword()` (the join screen / lobby).
+5. On DISCONNECT the per-peer record is erased and the id returned to the
+   pool; a refused or kicked peer's later packets are dropped until its
+   slot dies. The join screen shows the reason (`GetJoinFailReason`):
+   wrong password / server full / kicked.
+
+**Role gating.** `cNetworkManager::IsAllowedFrom(type, authorIsHost)` is
+the one table, consulted in `Service` before any dispatch or relay: the
+host drops `PlayerJoin`, `PlayerLeave`, `VersionAck`, `ObjectState`,
+`BodyCensus`, `BodyGrabDeny`, `EnemyState`, `EnemyEvent`, `PlayerDamage`,
+`WorldSnapshot` and `Challenge` from a guest; a guest drops `BodyGrab*`,
+`BodyPush`, `EnemyDamage`, `MapReady` and `Auth` from the host. Unknown
+types (and the reserved `ChatMessage`) are dropped from either side. **Add
+every new packet type to that table** (voice, type 29, included).
+
+**Validation** (`ValidateEventPacket`, both roles, clamps in place so the
+host relays the sanitised bytes; `ValidateGuestPacket` adds the host-only
+checks). Every wire string is printable ASCII within its field.
+`ItemDrop.msFile` and a guest's `MapChange.msMap` must be a *bare* file
+name (no `/`, `\`, `:`, `..`, no Windows-reserved characters) ending in
+`.ent` / `.dae`, and on the host must resolve through the engine's
+`cFileSearcher` (the same lookup `cWorld3D::CreateEntity` /
+`LoadWorld3D` use) or the packet is dropped, not relayed. All floats must
+be finite; positions within 20 km; drop impulse <= 15, throw <= 30, push
+<= 50 (scaled, not dropped); enemy/entity/player damage clamped to 0..200;
+`ScriptEvent.mOp` must be a known op; grab mass multiplier 0.1..20; a
+guest's grab target / push point must lie within 50 m of its last
+validated `PlayerState` position (a guest that never sent a state can not
+touch anything). A short packet of a known type is malformed. The host's
+own outgoing traffic is never validated, but guests apply the same shape
+checks to what the host sends (a hostile host cannot make a guest load
+`..\x.dae`).
+
+**Strikes + rate limit.** Every violation is logged once per (peer, type)
+in hpl.log — `guest N (a.b.c.d:port): dropped packet type T - why` —
+and counted; `kNetMaxStrikes` (20) = `kNetDisconnectKicked`. Strikes
+decay one per 5 s of clean traffic. More than `kNetMaxReliablePerSec`
+(200) reliable packets from one peer in a second is a strike and the
+excess is dropped for the rest of that second.
+
+**Discovery reflector.** The host answers only pings whose magic *and*
+version match (a mismatched browser no longer gets a greyed-out row; it
+does not see the server), at most 5 pongs per source address per second
+and 60 per second in total; the pong is one fixed-size packet, so the
+port can no longer amplify.
+
+**Left as is / known limits.** No encryption or integrity on the game
+stream (ENet has none): anyone who can sniff the link can read it. A guest
+with the password is still trusted for *its own* actions (it can kill an
+enemy fast with 200-damage hits, or pocket items it did not reach) — the
+validation bounds what a packet can do, not whether the player deserved
+to. The host is fully trusted by guests for game state (by design; it owns
+the simulation). No brute-force delay on the password: the 5 s timeout and
+one attempt per connection are the only throttle.
+
 ## Game glue (outside this folder — edit carefully)
 
 | Location | What |
@@ -221,7 +312,7 @@ largest level to replace the design estimate (~25 KB in ~45 chunks).
 - **F10** — join `127.0.0.1:<port>`.
 - **F9** — LAN/Hamachi discovery scan (~1.5s window; results logged, feed the server browser).
 - **Menu** — Multiplayer → Host / Join / Change name (asks for a username the first time).
-- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=`, `ghost_models=a.dae,b.dae`, `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`. See `multiplayer.cfg.example`.
+- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=` (enforced at CONNECT since v15), `server_password=` / `join_password=` (v15, see Security), `ghost_models=a.dae,b.dae`, `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`. See `multiplayer.cfg.example`.
 
 ### Ghost preview (offline animation check)
 
@@ -248,8 +339,10 @@ Browser broadcasts a ping to 255.255.255.255, 127.0.0.1, and every
 interface's directed broadcast (`ip | ~mask` via GetAdaptersInfo) — the last
 one is what makes Hamachi/Radmin/ZeroTier work, since the virtual LAN is its
 own interface and the global broadcast usually picks the wrong NIC. Hosts
-answer with name / map / players / real game port; version-mismatched servers
-are listed with `mbVersionMatch=false` so the UI can grey them out.
+answer with name / map / players / real game port. Since v15 a host answers
+only pings of its own protocol version (`mbVersionMatch` on the browser
+side is kept for pongs from older hosts) and rate-limits its pongs per
+source address and in total (see Security).
 
 ## Explicit non-goals
 

@@ -432,6 +432,76 @@ private:
 	/** Guest: forget any half-buffered snapshot. */
 	void ResetSnapshotBuffer();
 #endif
+
+	//---------------- v15: internet hardening — appended, impl at the file tail ----------------
+	/* Join authentication (challenge/response, see NetworkPackets.h v15),
+	   packet role gating, per-guest payload validation before apply/relay,
+	   strikes + kick, reliable-packet rate limit, max_players at CONNECT,
+	   guest id reuse, discovery reflector limits. README "Security". */
+public:
+	/** The password a GUEST sends when joining (cfg join_password=, or the
+	    join screen). Sanitised: printable ASCII, kNetPasswordMaxChars max.
+	    Takes effect on the next JoinGame. */
+	void SetJoinPassword(const hpl::tString &asPassword);
+	const hpl::tString &GetJoinPassword() const { return msJoinPassword; }
+	/** The password a HOST demands (cfg server_password=). Empty = open
+	    server. Takes effect for peers connecting after the call. */
+	void SetServerPassword(const hpl::tString &asPassword);
+	bool HasServerPassword() const { return !msServerPassword.empty(); }
+	/** Printable ASCII only, kNetPasswordMaxChars max, blanks kept inside. */
+	static hpl::tString SanitizePassword(const hpl::tString &asPassword);
+	/** THE role table: may a packet of this type be accepted from a peer of
+	    that role? abFromHost = the packet was authored by the host (we are a
+	    guest). Unknown types are never allowed. One call per packet, in
+	    Service, before any dispatch or relay. */
+	static bool IsAllowedFrom(uint8_t alType, bool abFromHost);
+	/** Wire strings are untrusted: true when [apStr, apStr+alCap) holds only
+	    printable ASCII up to its first NUL (a full field without NUL counts
+	    as terminated at alCap). abAllowEmpty = "" passes. */
+	static bool NetStringOk(const char *apStr, size_t alCap, bool abAllowEmpty);
+	/** A bare file name for the world/entity loaders: no path separators,
+	    no drive, no "..", printable, non-empty, ending in ".<asExt>"
+	    (case-insensitive). */
+	static bool NetBareFileNameOk(const char *apStr, size_t alCap, const char *asExt);
+private:
+	hpl::tString msServerPassword; /**< host: cfg server_password ("" = open) */
+	hpl::tString msJoinPassword;   /**< guest: cfg join_password / menu */
+	bool mbAuthSent;               /**< guest: answered the host's challenge (this connection) */
+	uint64_t mlGuestViolationsLogged; /**< guest: bit per packet type already logged (log-once) */
+	std::vector<uint8_t> mvFreeGuestIds; /**< host: ids of departed guests, reused first */
+	/** Host: next free wire id (free list first), 0 = none left. */
+	uint8_t AllocGuestId();
+	void FreeGuestId(uint8_t alId);
+#ifdef PENUMBRA_MULTIPLAYER
+	/** Host: a connected peer that passed authentication (has a wire id). */
+	static bool PeerLive(const struct _ENetPeer *apPeer);
+	/** Host: connected peers, all of them or only the accepted ones. */
+	int CountConnectedPeers(bool abAcceptedOnly) const;
+	/** Host: a fresh per-connection nonce (time, address, counter, mixed). */
+	void MakeNonce(const struct _ENetPeer *apPeer, uint8_t aOut[16]);
+	/** Host: the guest's cNetAuth arrived — accept (id, ack, join, census,
+	    beacon, name table) or refuse with kNetDisconnectBadAuth. */
+	void HostAcceptPeer(struct _ENetPeer *apPeer, const cNetAuth &aAuth);
+	/** Guest: the host's challenge arrived — answer it once. */
+	void SendAuthResponse(const cNetChallenge &aChallenge);
+	/** Host: one protocol violation by a peer — logged once per (peer,
+	    type), counted; kNetMaxStrikes -> kNetDisconnectKicked. */
+	void NoteViolation(struct _ENetPeer *apPeer, uint8_t alType, const char *asWhy);
+	/** Both roles: bounds/shape checks common to every event, clamping in
+	    place (impulses, damage). false = drop. abFromHost picks the role
+	    of the AUTHOR. Host-only extras (file searcher, distance to the
+	    guest) live in ValidateGuestPacket. */
+	bool ValidateEventPacket(unsigned char *apData, size_t alLen, bool abFromHost);
+	/** Host: everything a guest-authored packet must satisfy before the host
+	    applies or relays it (clamps in place). false = drop + strike. */
+	bool ValidateGuestPacket(struct _ENetPeer *apPeer, unsigned char *apData, size_t alLen);
+	/** Host: auth timeouts, rate windows, strike decay, dead-slot sweep. */
+	void UpdatePeerGuards(float afTimeStep);
+	/** Host: discovery reflector limiter — may we pong this source now? */
+	bool DiscoveryPongAllowed(uint32_t alAddr);
+	/** Host: forget every per-peer record (HostGame / Disconnect). */
+	void ResetPeerGuards();
+#endif
 };
 //-----------------------------------------------------------------------
 /** Pumps cNetworkManager from the GLOBAL updater state, so hosting and
