@@ -139,7 +139,8 @@ public:
 	uint8_t GetCharacterCount() const;
 	/** v17: the character of any id, ours included: the base name of its
 	    model without ".dae" ("fisherman"), "" while its host-assigned slot
-	    is not known (offline, or before the host's table arrived). */
+	    is not known (offline, or before the host's table arrived). v18: show
+	    it through GetCharacterDisplayName ("The Fisherman"). */
 	hpl::tString GetPlayerCharacterName(uint8_t alId) const;
 
 	/** Join screen UI: why the last join attempt died ("" = no failure).
@@ -661,6 +662,64 @@ private:
 	/** Host: a guest's voice packet — stamp the author, relay to the other
 	    guests, play it here. */
 	void RelayVoice(struct _ENetPeer *apFrom, uint8_t alAuthor, const void *apData, size_t alLen);
+#endif
+
+	//---------------- v18: character picker — appended, impl at the file tail ----------------
+	/* The host is always slot 0 (Philip with the shipped list) and never
+	   picks. A guest keeps a preference (multiplayer.cfg character=, the
+	   Multiplayer / Direct-connect screens' 'Character: < X >' line) and
+	   asks the host for it BY NAME (cNetCharacterRequest) after its name
+	   and on every change while connected; the host moves it if that
+	   character exists there, is not slot 0 and is free, then re-sends the
+	   name table (ghosts are rebuilt everywhere from the new slot). */
+public:
+	/** "phillip" -> "Philip", "fisherman" -> "The Fisherman", "red" ->
+	    "Red", "malik" -> "Malik"; any other base name with its first letter
+	    capitalised; "" stays "". Case-insensitive lookup. */
+	static hpl::tString GetCharacterDisplayName(const hpl::tString &asBase);
+	/** Printable ASCII, no blanks at either end, at most
+	    kNetCharacterNameMaxChars (cfg, menu and wire all go through it). */
+	static hpl::tString SanitizeCharacterName(const hpl::tString &asName);
+	/** Our character list (final order: slot i = entry i). */
+	size_t GetCharacterListSize() const { return mvGhostMeshPaths.size(); }
+	/** Base name of list entry alIdx ("fisherman"), "" when out of range. */
+	hpl::tString GetCharacterBaseName(size_t alIdx) const;
+	/** List index of a base name (ASCII-case-insensitive), -1 = not ours. */
+	int FindCharacterIndex(const hpl::tString &asBase) const;
+	/** multiplayer.cfg character= (sanitised, "" = no preference). */
+	const hpl::tString &GetCharacterPreference() const { return msCharacterPref; }
+	/** Stores the preference, writes character= to multiplayer.cfg (every
+	    other line kept) and, as a connected guest, asks the host at once. */
+	void SetCharacterPreference(const hpl::tString &asBase);
+	/** Somebody other than us holds that character in the current session
+	    (host's table / the name table we got). Always false offline. */
+	bool IsCharacterTakenByOther(const hpl::tString &asBase) const;
+	/** Picker: may we ask for list entry alIdx? Not slot 0 (the host's),
+	    in range, and not taken by somebody else. */
+	bool IsCharacterSelectable(size_t alIdx) const;
+	/** Picker: the next selectable base name after asCurrent (wrapping;
+	    "" or unknown = from the start). Returns asCurrent's own entry when
+	    it is the only selectable one, "" when none is. */
+	hpl::tString GetNextSelectableCharacter(const hpl::tString &asCurrent) const;
+	/** Our own character right now ("" offline / not assigned yet). */
+	hpl::tString GetLocalCharacterName() const;
+private:
+	hpl::tString msCharacterPref; /**< cfg character= ("" = no preference) */
+	/** An existing ghost of alId built with mesh index alOldIdx is deleted
+	    when its slot now points at a different mesh; the next state packet
+	    re-creates it (EnsureGhost). Both roles. */
+	void RebuildGhostIfMeshChanged(uint8_t alId, size_t alOldIdx);
+#ifdef PENUMBRA_MULTIPLAYER
+	/** Guest: msCharacterPref to the host (no-op when empty / not joined). */
+	void SendCharacterRequest();
+	/** Host: a validated cNetCharacterRequest from an accepted peer —
+	    applied now, or held as the peer's pending request while its
+	    cooldown runs (UpdatePeerGuards applies the newest one). */
+	void HostHandleCharacterRequest(struct _ENetPeer *apPeer, uint8_t alAuthor,
+		const void *apData, size_t alLen);
+	/** Host: move alAuthor to asBase's slot. NULL = done (or already
+	    there); otherwise why it was ignored (the caller logs once). */
+	const char *HostApplyCharacterRequest(uint8_t alAuthor, const hpl::tString &asBase);
 #endif
 };
 //-----------------------------------------------------------------------

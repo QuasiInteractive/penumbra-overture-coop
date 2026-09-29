@@ -867,6 +867,118 @@ public:
 	}
 };
 
+//-----------------------------------------------------------------------
+// v18: character picker line (Multiplayer screen, Direct-connect / join
+// status screen, host lobby).
+//-----------------------------------------------------------------------
+
+namespace {
+
+/** The picker line's text. Host: 'You play Philip' (slot 0, locked).
+    Guest / offline: 'Character: < Red >' = the saved preference (else, while
+    connected, what the host gave us; else 'any'), plus why it is not what
+    we play: '(taken)' when somebody else holds it, '(playing X)' while the
+    host has not (or would not) move us, '(host only)' / '(not installed)'
+    for a hand-edited character= the picker never produces. */
+static tString MulCharacterLine(cInit *apInit)
+{
+	cNetworkManager *nm = apInit ? apInit->mpNetworkManager : NULL;
+	if (nm == NULL)
+		return "Character: -";
+	if (nm->IsHosting())
+	{
+		tString sHost = nm->GetLocalCharacterName();
+		if (sHost.empty())
+			sHost = nm->GetCharacterBaseName(0);
+		return "You play " + cNetworkManager::GetCharacterDisplayName(sHost) + " (the host's character)";
+	}
+	if (nm->GetCharacterListSize() == 0)
+		return "Character: (no characters installed)";
+	const bool bConnected = nm->IsClientSynced();
+	const tString sPref = nm->GetCharacterPreference();
+	const tString sActual = bConnected ? nm->GetLocalCharacterName() : tString("");
+	const tString sShown = sPref.empty() ? sActual : sPref;
+	tString sLine = "Character: < " +
+		(sShown.empty() ? tString("any") : cNetworkManager::GetCharacterDisplayName(sShown)) + " >";
+	if (!sPref.empty())
+	{
+		const int lIdx = nm->FindCharacterIndex(sPref);
+		if (lIdx < 0)
+			sLine += " (not installed)";
+		else if (lIdx == 0)
+			sLine += " (host only)";
+		else if (bConnected && nm->IsCharacterTakenByOther(sPref))
+			sLine += " (taken)";
+		else if (bConnected && !sActual.empty() && nm->FindCharacterIndex(sActual) != lIdx)
+			sLine += " (playing " + cNetworkManager::GetCharacterDisplayName(sActual) + ")";
+	}
+	return sLine;
+}
+
+}
+
+/** v18: 'Character: < Red >'. A click picks the next selectable character
+    (never slot 0 = the host's; while connected as a guest never one another
+    player holds; offline every other character), saves character= in
+    multiplayer.cfg and, when connected, asks the host at once — also from
+    the in-game Esc menu, where the host swaps us live. While hosting it
+    only reads 'You play Philip' (no hover, clicks ignored). */
+class cMainMenuWidget_MultiCharacter : public cMainMenuWidget_Button
+{
+public:
+	cMainMenuWidget_MultiCharacter(cInit *apInit, const cVector3f &avPos)
+		: cMainMenuWidget_Button(apInit, avPos, _W("Character: < any >"), eMainMenuState_LastEnum, 18,
+								 eFontAlign_Center)
+	{
+		RefreshLabel();
+	}
+
+	void RefreshLabel()
+	{
+		const tWString wsText = cString::To16Char(MulCharacterLine(mpInit));
+		if (wsText == msText)
+			return;
+		msText = wsText;
+		mRect.w = mpFont->GetLength(mvFontSize, msText.c_str());
+		mRect.x = mvPositon.x - mRect.w / 2;
+	}
+
+	virtual void OnUpdate(float afTimeStep)
+	{
+		cMainMenuWidget_Button::OnUpdate(afTimeStep);
+		RefreshLabel(); /* the name table can change under us at any time */
+	}
+
+	virtual void OnActivate()
+	{
+		cMainMenuWidget_Button::OnActivate();
+		RefreshLabel();
+	}
+
+	virtual void OnMouseOver(bool abOver)
+	{
+		const bool bHost = mpInit->mpNetworkManager && mpInit->mpNetworkManager->IsHosting();
+		cMainMenuWidget_Button::OnMouseOver(abOver && !bHost); /* the host's line is plain text */
+	}
+
+	virtual void OnMouseDown(eMButton aButton)
+	{
+		(void)aButton;
+		cNetworkManager *nm = mpInit->mpNetworkManager;
+		if (nm == NULL || nm->IsHosting())
+			return; /* the host is always slot 0 */
+		tString sFrom = nm->GetCharacterPreference();
+		if (sFrom.empty() && nm->IsClientSynced())
+			sFrom = nm->GetLocalCharacterName(); /* no preference yet: step on from what we play */
+		const tString sNext = nm->GetNextSelectableCharacter(sFrom);
+		if (sNext.empty())
+			return; /* nothing selectable (one character, or every other one taken) */
+		nm->SetCharacterPreference(sNext); /* cfg character= + request when connected */
+		RefreshLabel();
+		mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+	}
+};
+
 #endif /* PENUMBRA_MULTIPLAYER */
 
 //////////////////////////////////////////////////////////////////////////
@@ -3939,7 +4051,8 @@ void cMainMenu::CreateWidgets()
 								 _W("A Quasi Interactive mod  -  quasi-interactive.com"),
 								 13, eFontAlign_Center)));
 
-		/* five buttons + name line + hint + Back must fit above y=600: 38 px pitch */
+		/* five buttons + name line + character line + hint + Back must fit
+		   above y=600: 38 px pitch */
 		vPos.y += 30;
 		AddWidgetToState(eMainMenuState_Multiplayer,
 						 hplNew(cMainMenuWidget_MultiHostStartListen,
@@ -3960,13 +4073,16 @@ void cMainMenu::CreateWidgets()
 		vPos.y += 38;
 		gpMulNameShown = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W(""), 13, eFontAlign_Center));
 		AddWidgetToState(eMainMenuState_Multiplayer, gpMulNameShown); /* text set in Update */
+		vPos.y += 22;
+		/* v18: 'Character: < Red >' (multiplayer.cfg character=) */
+		AddWidgetToState(eMainMenuState_Multiplayer, hplNew(cMainMenuWidget_MultiCharacter,(mpInit, vPos)));
 		vPos.y += 24;
 
 		sprintf(sTempVec, "F11 toggles hosting | F10 joins 127.0.0.1:%s | Port %s", portBuf, portBuf);
 		AddWidgetToState(eMainMenuState_Multiplayer,
 						 hplNew(cMainMenuWidget_Text,
 								(mpInit, vPos, cString::To16Char(sTempVec), 13, eFontAlign_Center)));
-		vPos.y += 40;
+		vPos.y += 36;
 		AddWidgetToState(
 			eMainMenuState_Multiplayer,
 			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, kTranslate("MainMenu", "Back"),
@@ -4027,7 +4143,11 @@ void cMainMenu::CreateWidgets()
 			gpMulHostPublicNote = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W(""), 13, eFontAlign_Center));
 			AddWidgetToState(eMainMenuState_MultiplayerHostLobby, gpMulHostPublicNote);
 		}
-		vPos.y += 36;
+		vPos.y += 26;
+		/* v18: 'You play Philip' — the host is slot 0, no picker */
+		AddWidgetToState(eMainMenuState_MultiplayerHostLobby,
+						 hplNew(cMainMenuWidget_MultiCharacter,(mpInit, vPos)));
+		vPos.y += 30;
 		AddWidgetToState(
 			eMainMenuState_MultiplayerHostLobby,
 			hplNew(cMainMenuWidget_MultiLaunchPlaying,(mpInit, vPos,
@@ -4068,7 +4188,11 @@ void cMainMenu::CreateWidgets()
 		gpMulJoinFoot = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W("(not connected yet)"), 14,
 													  eFontAlign_Center));
 		AddWidgetToState(eMainMenuState_MultiplayerJoin, gpMulJoinFoot);
-		vPos.y += 76;
+		vPos.y += 36;
+		/* v18: pick while waiting for the host to launch (asks at once when
+		   connected, else only saves character= for the next join) */
+		AddWidgetToState(eMainMenuState_MultiplayerJoin, hplNew(cMainMenuWidget_MultiCharacter,(mpInit, vPos)));
+		vPos.y += 40;
 		AddWidgetToState(
 			eMainMenuState_MultiplayerJoin,
 			hplNew(cMainMenuWidget_MultiJoinTry,(mpInit, vPos, _W("Connect"))));

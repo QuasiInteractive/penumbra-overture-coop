@@ -1882,7 +1882,8 @@ void cPlayer::DrawPartyPanel()
 	const cVector2f vFontSize(12,12);
 
 	/* v17: "<name> (<character>)" — the host-assigned character, one of
-	   each per lobby. The bar column moves right of the longest line. */
+	   each per lobby. The bar column moves right of the longest line.
+	   v18: the character's display name ("Deadl (The Fisherman)"). */
 	std::vector<tWString> vTexts;
 	for(size_t i=0; i<vLines.size(); ++i)
 	{
@@ -1890,7 +1891,7 @@ void cPlayer::DrawPartyPanel()
 		const float fHealth = (vLines[i].second < 0) ? 0.0f : ((vLines[i].second > 100) ? 100.0f : vLines[i].second);
 
 		tWString sName = cString::To16Char(pNet->GetPlayerName((uint8_t)lId));
-		const tString sChar = pNet->GetPlayerCharacterName((uint8_t)lId);
+		const tString sChar = cNetworkManager::GetCharacterDisplayName(pNet->GetPlayerCharacterName((uint8_t)lId));
 		if(sChar.empty()==false) sName += _W(" (") + cString::To16Char(sChar) + _W(")");
 		if(lId == 1) sName += _W(" (host)");
 		/* column from the stable part + the longest status suffix, so it

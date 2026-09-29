@@ -32,7 +32,7 @@ writes, entity activation, door locks, item pickups/drops/consumption and
 breakable damage are replicated as reliable events; map changes move the
 whole party). Player state, bodies and enemies stream at **30 Hz**
 (`kNetSendPeriodSeconds`); every wire layout change bumps
-`kNetProtocolVersion` (currently **17**), and the connect handshake refuses
+`kNetProtocolVersion` (currently **18**), and the connect handshake refuses
 mismatched builds (then the v15 password challenge, see **Security**).
 
 Remote players are drawn as **ghosts** (`cGhostPlayer`): each `cNetPlayerState`
@@ -123,7 +123,7 @@ living member has no position yet (between maps) it waits up to 15 s, then
 gives up to the death menu. Offline the code path is the original two
 lines — single-player is unchanged.
 
-## Characters (four-player lobbies, protocol v17)
+## Characters (four-player lobbies, protocol v17; picker v18)
 
 **One of each, never a duplicate.** The host owns a slot table: slot 0 is
 the host itself, every accepted guest (`HostAcceptPeer`) gets the lowest
@@ -131,12 +131,69 @@ free slot, and the slot is freed when the guest goes (`DropRemotePlayer`,
 reached from every disconnect path: leave, timeout, kick, and the guard
 sweep for a peer slot that died without an event; `HostGame`/`Disconnect`
 reset the table). A slot is an index into the character list below. The
-shipped list is ordered `phillip, fisherman, stefan, malik`
+shipped list is ordered `phillip, fisherman, red, malik`
 (`kGhostCharacterOrder` in NetworkManager.cpp; other auto-discovered
-characters follow alphabetically), so the host always plays Phillip, the
-game's main character, and guests get the fisherman, Stefan and Malik in
-join order; a player who leaves frees the character for the next joiner.
-An explicit `ghost_models=` keeps its own order.
+characters follow alphabetically), so the host always plays Philip, the
+game's main character, and a guest without a preference gets The
+Fisherman, Red and Malik in join order; a player who leaves frees the
+character for the next joiner. An explicit `ghost_models=` keeps its own
+order. Since v18 a guest can pick (below).
+
+**Display names (v18).** Players never see file names:
+`cNetworkManager::GetCharacterDisplayName` maps `phillip` -> Philip,
+`fisherman` -> The Fisherman, `red` -> Red, `malik` -> Malik, and any other
+base name to itself with the first letter capitalised (`kCharacterDisplayNames`
+at the tail of NetworkManager.cpp). Used by the party panel
+(`Deadl (The Fisherman)`, `Host (Philip) (host)`), the picker and the feed.
+
+**Picker (v18).** The host is **always slot 0 (Philip), locked**: the host
+lobby (and the Multiplayer screen while hosting) reads `You play Philip
+(the host's character)` instead of a picker. A guest has a preference —
+`character=<file base name>` in `multiplayer.cfg` (empty / absent = no
+preference; printable ASCII, 24 characters max, matched
+case-insensitively) — shown and changed by a `Character: < Red >` line on
+the **Multiplayer** screen and on the **Direct-connect / join status**
+screen (so a guest waiting in the menu for the host to launch can still
+pick). A click steps to the next selectable character, wrapping: never
+entry 0 of the list (the host's), and while connected as a guest never one
+another player holds per the name table; offline every non-host character
+is offered. One selectable character = the click re-sends it; none = the
+click does nothing. The choice is written with `UpdateMultiplayerCfgKey`
+(every other cfg line kept) and, when connected, sent to the host at once.
+The same line in the in-game Esc menu (Multiplayer screen) swaps a
+connected guest live. Suffixes: `(taken)` = the preference is held by
+somebody else (first come, first served); `(playing X)` = the host has not
+moved us (request in flight, or refused, e.g. its list lacks the
+character); `(host only)` / `(not installed)` = a hand-edited `character=`
+naming entry 0 / a character missing here. No preference = `< any >`
+offline, the assigned character when connected.
+
+**Request flow (v18, `cNetCharacterRequest`, type 30, 25 B, reliable ch0,
+guest -> host only).** It carries the character's **file base name**, not
+a slot, so machines whose lists are ordered differently still agree on the
+character. `HostAcceptPeer` still gives a new guest the lowest free slot at
+once (a guest always has a character); the guest sends its request right
+after its name (after `PlayerJoin`) when `character=` is set, and again on
+every pick while connected. The host (`HostHandleCharacterRequest` ->
+`HostApplyCharacterRequest`) matches the name case-insensitively against
+**its** list; if it exists, is not slot 0, is inside the slot range and is
+free (or already the requester's), the requester moves there, its old slot
+is free again, the host rebuilds its own ghost of it, adds `<name> now
+plays Red` to the feed and re-broadcasts the name table — which rebuilds
+the ghost on every guest through `OnPlayerSlotReceived` (and puts the same
+feed line there). Anything else is ignored (hpl.log, once per connection:
+`guest N asked for character 'x' - ignored: taken by another player`) and
+the table stays as it is. Two guests asking for the same character in the
+same frame: packets are handled one at a time, the first wins, the second
+is ignored and its line shows `(taken)`. Per peer at most one request is
+applied per 0.25 s (`kNetCharRequestCooldown`); requests inside the
+cooldown replace the pending one, which `UpdatePeerGuards` applies — the
+last pick wins and a spamming guest cannot flood the table. Validation: a
+request must be exactly 25 bytes with a non-empty printable-ASCII,
+NUL-bounded name (`ValidateEventPacket`), else it is a strike like any
+malformed packet; it is a guest-only type in `IsAllowedFrom`; before the
+guest is accepted it is dropped by the auth gate (`packet before
+authentication`) and a peer without a slot never moves.
 
 **Player cap = number of characters.** The effective cap is
 `min(max_players, character count)` (`GetMaxPlayers()`): CONNECT refuses
@@ -150,7 +207,8 @@ hpl.log at host start: `multiplayer: player cap 4 = min(max_players 4,
 **Wire.** The v13 name table carries it: `cNetPlayerName` grew
 `uint8_t mCharacter` (the slot; 255 = unknown, what a guest sends about
 itself — the host never reads it). The host fills it for every entry (its
-own = 0) and re-broadcasts the table on every join/leave/rename as before;
+own = 0) and re-broadcasts the table on every join/leave/rename as before
+(v18: and on every accepted character request);
 `ValidateEventPacket` accepts `mCharacter < 32` or 255. Guests keep the slot
 per id (theirs included).
 
@@ -162,10 +220,12 @@ different mesh, `OnPlayerSlotReceived` deletes the ghost and the next state
 packet re-creates it through `EnsureGhost` (seq/health/move state live
 outside the ghost; only the interpolation buffer refills, ~33 ms). The
 preview ghost keeps `ghost_preview_model`. `GetPlayerCharacterName(id)`
-("fisherman") is shown in the party panel: `Deadl (fisherman) (host)`.
+("fisherman") is shown in the party panel through its display name:
+`Deadl (The Fisherman)`, the host's line `Host (Philip) (host)`.
 
-**Every machine needs the same character files.** Only the slot travels,
-not the file name. A guest with fewer characters than the host logs
+**Every machine needs the same character files.** Only the slot travels
+in the name table, not the file name (the v18 request is by name, but the
+host answers with slots). A guest with fewer characters than the host logs
 `WARNING host assigned character slot N but we only have M character(s)` and
 falls back to `slot mod M` (that player then looks like somebody else on
 that machine only); a guest with a different set of the same size cannot
@@ -190,11 +250,11 @@ The list itself — `cNetworkManager::ResolveGhostModels` (called from
    `opendir` elsewhere) and sorted by an ASCII-lowercase compare (exact
    bytes break ties; case-only duplicates collapse), so the order does not
    depend on the file system or the C locale, then put in
-   `kGhostCharacterOrder` (phillip, fisherman, stefan, malik; the rest
+   `kGhostCharacterOrder` (phillip, fisherman, red, malik; the rest
    alphabetically after them). A lone `.dae` without clips (a prop) is
    ignored.
 3. **Still empty** (folder missing): `phillip.dae`, `malik.dae` (host =
-   Phillip; a host without its models therefore takes two players).
+   Philip; a host without its models therefore takes two players).
 
 hpl.log: `multiplayer: N character(s) (<source>): a.dae, b.dae, ... — the
 host gives every player a different one`, plus a note when fewer than four
@@ -363,9 +423,11 @@ the one table, consulted in `Service` before any dispatch or relay: the
 host drops `PlayerJoin`, `PlayerLeave`, `VersionAck`, `ObjectState`,
 `BodyCensus`, `BodyGrabDeny`, `EnemyState`, `EnemyEvent`, `PlayerDamage`,
 `WorldSnapshot` and `Challenge` from a guest; a guest drops `BodyGrab*`,
-`BodyPush`, `EnemyDamage`, `MapReady` and `Auth` from the host. Unknown
+`BodyPush`, `EnemyDamage`, `MapReady`, `Auth` and (v18) `CharacterRequest`
+from the host. Unknown
 types (and the reserved `ChatMessage`) are dropped from either side. **Add
-every new packet type to that table** (voice, type 29, included).
+every new packet type to that table** (voice, type 29, and the v18
+character request, type 30, included).
 
 **Validation** (`ValidateEventPacket`, both roles, clamps in place so the
 host relays the sanitised bytes; `ValidateGuestPacket` adds the host-only
@@ -380,7 +442,10 @@ be finite; positions within 20 km; drop impulse <= 15, throw <= 30, push
 `ScriptEvent.mOp` must be a known op; grab mass multiplier 0.1..20; a
 guest's grab target / push point must lie within 50 m of its last
 validated `PlayerState` position (a guest that never sent a state can not
-touch anything). A short packet of a known type is malformed. The host's
+touch anything). v18: a `CharacterRequest` must be exactly 25 bytes with a
+non-empty printable name (NUL-bounded; the host then only acts for an
+accepted peer that holds a slot, see 'Characters'). A short packet of a
+known type is malformed. The host's
 own outgoing traffic is never validated, but guests apply the same shape
 checks to what the host sends (a hostile host cannot make a guest load
 `..\x.dae`).
@@ -482,11 +547,11 @@ handshake), `cNetVoice` = 5 bytes, constants `kNetVoice*` in
 | Location | What |
 |----------|------|
 | `../Init.cpp` / `Init.h` | Owns `mpNetworkManager`; `Startup()` after input exists; `Update()` each frame; config port load/save. |
-| `../Player.cpp` / `Player.h` | `DrawPartyHud()` — world-anchored party health bars in `OnDraw`; `DrawPartyPanel()` — top-left names/health panel + event feed (v13), `(talking)` / `[MIC]` voice indicators (v16), `(<character>)` after each name (v17). |
+| `../Player.cpp` / `Player.h` | `DrawPartyHud()` — world-anchored party health bars in `OnDraw`; `DrawPartyPanel()` — top-left names/health panel + event feed (v13), `(talking)` / `[MIC]` voice indicators (v16), `(<character>)` after each name (v17; v18: display name, `Deadl (The Fisherman)`). |
 | `../PlayerHelper.cpp` / `.h` | `cPlayerDeath` co-op respawn branch (`CoopRespawnApplies`, `UpdateCoopRespawn`). |
 | `../Inventory.cpp` / `.h` | `DrawParty()` — inventory party health list. |
 | `../GameEnemy.cpp`, `../TriggerHandler.cpp` | Host senses read `GetGhostHealth` (focus health, sight candidates, ghost footsteps). |
-| `../MainMenu.cpp` / `MainMenu.h` | Multiplayer menu states, host/join UI, IP typing widget (`#ifdef PENUMBRA_MULTIPLAYER`); v13 username screen (`eMainMenuState_MultiplayerName`, the typing widget's name mode, "Change name"). |
+| `../MainMenu.cpp` / `MainMenu.h` | Multiplayer menu states, host/join UI, IP typing widget (`#ifdef PENUMBRA_MULTIPLAYER`); v13 username screen (`eMainMenuState_MultiplayerName`, the typing widget's name mode, "Change name"); v18 character picker (`cMainMenuWidget_MultiCharacter` on the Multiplayer, Direct-connect and host lobby screens). |
 | `../GameScripts.cpp` / `.h` | Script hooks (`NetOnScriptEvent`), `NetApplyScriptEvent`, `gbNetScriptApplying` / `gbNetScriptPlayerContext` + `cNetScriptPlayerScope` (v14). |
 | `../GameEntity.cpp`, `../Player.cpp`, `../Inventory.cpp`, `../GameMessageHandler.cpp`, `../NumericalPanel.cpp`, `../GameLamp.cpp` | `cNetScriptPlayerScope` around the player-driven `RunScriptCommand` sites (v14 Add*Var authority). |
 | `../GameSwingDoor.h`, `../GameLamp.h`, `../Inventory.h`, `../MapHandler.h` | `IsLocked()`, `IsLit()`/`GetLitChangeCallback()`, `friend class cNetworkManager` (party items, local timers) for the world snapshot. |
@@ -502,7 +567,7 @@ handshake), `cNetVoice` = 5 bytes, constants `kNetVoice*` in
 - **F9** — LAN/Hamachi discovery scan (~1.5s window; results logged, feed the server browser).
 - **V** (hold) — push-to-talk voice chat (v16); heard from your character's head, fading with distance.
 - **Menu** — Multiplayer → Host / Server browser (Internet · LAN) / Direct connect / Change name (asks for a username the first time).
-- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=` (enforced at CONNECT since v15; v17: capped at the number of characters), `server_password=` / `join_password=` (v15, see Security), `ghost_models=a.dae,b.dae` (optional: without it the characters in `multiplayer/models` are auto-discovered, see 'Characters'), `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `voice_enabled=1`, `voice_volume=1.0`, `voice_open_mic=0` (v16), `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`, `master_server=HOST:PORT`, `public=0|1` (internet browser, see 'Public servers'). See `multiplayer.cfg.example`.
+- **`multiplayer.cfg`** — `player_name=` (v13, written by the menu), `character=` (v18, the guest's preferred character by file base name, written by the menu's picker), `host=1`, `join=HOST:PORT`, `port=`, `server_name=` (empty = `<player_name>'s game`), `max_players=` (enforced at CONNECT since v15; v17: capped at the number of characters), `server_password=` / `join_password=` (v15, see Security), `ghost_models=a.dae,b.dae` (optional: without it the characters in `multiplayer/models` are auto-discovered, see 'Characters'), `ghost_body_y=` / `ghost_body_ys=` (offsets from the feet, default 0), `coop_respawn=1`, `voice_enabled=1`, `voice_volume=1.0`, `voice_open_mic=0` (v16), `ghost_interp_ms=100`, `ghost_turn_rate=720`, `ghost_gait_walk|run|crouch_walk|walk_back|strafe_walk|strafe_run=` (m/s), `ghost_anim_trace=0|1`, `ghost_preview=0|1`, `ghost_preview_model=0`, `master_server=HOST:PORT`, `public=0|1` (internet browser, see 'Public servers'). See `multiplayer.cfg.example`.
 
 ### Ghost preview (offline animation check)
 

@@ -7,17 +7,18 @@
 # multiplayer/models/. By DEFAULT (no ghost_models= line) every
 # <name>.dae there whose <name> has no '_' and that has at least one
 # <name>_<clip>.dae clip next to it (malik.dae + malik_idle.dae, ...) is a
-# character. v17: the list is ordered phillip, fisherman, stefan, malik, then
+# character. v17: the list is ordered phillip, fisherman, red, malik, then
 # any other character alphabetically, and the HOST gives every player a
-# different one (host = 1st = always Phillip, each guest the lowest free one
-# — fisherman, Stefan, Malik in join order — freed when it leaves): one of
+# different one (host = 1st = always Philip, each guest the lowest free one
+# — The Fisherman, Red, Malik in join order, unless it picked one with
+# character= below — freed when it leaves): one of
 # each, never a duplicate, so the lobby holds at most as many players as
 # there are characters (see max_players). Adding one = drop
 # <name>.dae + <name>_*.dae (+ <name>.mat/.tga, <name>_clips.json) into the
 # folder on EVERY machine: only the slot number travels, so all machines
 # need the same files (a guest with fewer characters than the host logs a
 # WARNING and shows that player as another character). hpl.log lists them:
-#   multiplayer: 4 character(s) (auto-discovered in multiplayer/models): phillip.dae, fisherman.dae, stefan.dae, malik.dae
+#   multiplayer: 4 character(s) (auto-discovered in multiplayer/models): phillip.dae, fisherman.dae, red.dae, malik.dae
 #
 # v11: the wire carries the sender's FEET height and the shipped meshes have
 # their origin at the feet, so no grounding offset is needed any more.
@@ -36,6 +37,20 @@ host=0
 #                 every other line of this file is kept). Friends without a
 #                 name show as "Player <id>".
 player_name=
+# ---- Character (v18) ---------------------------------------------------------
+# character=    — the character you want to play as a GUEST, by file base
+#                 name (the .dae in multiplayer/models without ".dae"):
+#                 fisherman, red, malik, ... (shown as The Fisherman, Red,
+#                 Malik; phillip = Philip is always the HOST and cannot be
+#                 picked). Empty (or out) = no preference: the host gives you
+#                 the lowest free one. The Multiplayer and Direct-connect
+#                 screens have a 'Character: < Red >' line that cycles through
+#                 the free ones and writes this key (every other line of this
+#                 file is kept); in a session the host moves you at once
+#                 (also from the in-game Esc menu). First come, first served:
+#                 a character somebody else plays shows "(taken)" and you
+#                 keep your current one. The host ignores the key.
+character=
 # server_name=  — shown in the LAN server browser (spaces OK, 31 chars max).
 #                 Empty / not set = "<player_name>'s game" ("Penumbra Server"
 #                 when there is no player_name either).

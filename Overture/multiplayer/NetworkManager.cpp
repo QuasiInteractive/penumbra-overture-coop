@@ -567,11 +567,21 @@ struct cNetworkManager::Impl
 		uint64_t mlLoggedTypes; /* log-once mask, bit = packet type */
 		bool mbHavePos;         /* newest validated PlayerState position */
 		hpl::cVector3f mvLastPos;
+		/* v18 character requests: at most one applied per
+		   kNetCharRequestCooldown; a request inside the cooldown replaces
+		   the pending one (UpdatePeerGuards applies the newest), so a
+		   click-happy (or hostile) guest cannot make the host re-send the
+		   name table hundreds of times a second, and the LAST pick wins. */
+		float mfCharCooldown;
+		bool mbCharPending;
+		hpl::tString msCharPending;
+		bool mbCharRefusedLogged; /* "request ignored" is logged once per connection */
 
 		cPeerGuard()
 			: mbAuthed(false), mbRefused(false), mfAge(0), mlStrikes(0), mfStrikeDecay(0),
 			  mfRateWindow(0), mlReliableInWindow(0), mbRateStruck(false), mlLoggedTypes(0),
-			  mbHavePos(false), mvLastPos(0, 0, 0)
+			  mbHavePos(false), mvLastPos(0, 0, 0),
+			  mfCharCooldown(0), mbCharPending(false), msCharPending(), mbCharRefusedLogged(false)
 		{
 			memset(mNonce, 0, sizeof(mNonce));
 		}
@@ -1116,6 +1126,8 @@ void cNetworkManager::RegisterInputActions()
    Without ghost_models/ghost_model every multiplayer/models/<name>.dae with no
    '_' in <name> and at least one <name>_<clip>.dae sibling is a character,
    sorted case-insensitively (ResolveGhostModels, run from Startup).
+   v18: character=red (file base name, spaces kept, "" = no preference) is
+   the guest's wanted character, asked for after the join (README 'Characters').
 */
 void cNetworkManager::TryLoadMultiplayerCfg()
 {
@@ -1139,7 +1151,8 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 		const bool bPlayerName = bHaveKey && strcmp(rawKey, "player_name") == 0; /* v13 */
 		const bool bServerPw = bHaveKey && strcmp(rawKey, "server_password") == 0; /* v15 */
 		const bool bJoinPw = bHaveKey && strcmp(rawKey, "join_password") == 0;     /* v15 */
-		if (bServerName || bPlayerName || bServerPw || bJoinPw)
+		const bool bCharacter = bHaveKey && strcmp(rawKey, "character") == 0;      /* v18 */
+		if (bServerName || bPlayerName || bServerPw || bJoinPw || bCharacter)
 		{
 			char *eq = strchr(buf, '=');
 			size_t ln = 0;
@@ -1160,6 +1173,8 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 				SetServerPassword(hpl::tString(nm, ln)); /* v15: "" = open server */
 			else if (bJoinPw)
 				SetJoinPassword(hpl::tString(nm, ln));   /* v15: sent on JoinGame */
+			else if (bCharacter)
+				msCharacterPref = SanitizeCharacterName(hpl::tString(nm, ln)); /* v18: "" = no preference */
 			else
 			{
 				if (ln > 31)
@@ -1293,11 +1308,13 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 }
 
 /* Character order for auto-discovered lists. Slot 0 is the HOST, and the
-   host always plays Phillip, the game's main character; guests then get the
+   host always plays Philip (file phillip.dae), the game's main character; guests then get the
    next free character in this order as they join. Characters not listed here
    follow alphabetically; names missing from the folder are skipped. An
-   explicit ghost_models= in multiplayer.cfg keeps its own order instead. */
-static const char *const kGhostCharacterOrder[] = { "phillip", "fisherman", "stefan", "malik" };
+   explicit ghost_models= in multiplayer.cfg keeps its own order instead.
+   v18: guests may pick another free character (character= / the menu's
+   'Character' line); the display names live in GetCharacterDisplayName. */
+static const char *const kGhostCharacterOrder[] = { "phillip", "fisherman", "red", "malik" };
 
 static void OrderGhostCharacters(std::vector<tString> &avPaths)
 {
@@ -1381,7 +1398,7 @@ void cNetworkManager::ResolveGhostModels()
 	{
 		/* Nothing found either (folder missing / not installed): the shipped
 		   pair, as before — a missing mesh leaves the marker light only. */
-		mvGhostMeshPaths.push_back("phillip.dae"); /* v17: host = Phillip (kGhostCharacterOrder) */
+		mvGhostMeshPaths.push_back("phillip.dae"); /* v17: host = Philip (kGhostCharacterOrder) */
 		mvGhostMeshPaths.push_back("malik.dae");
 		szSource = "built-in default";
 	}
@@ -1801,6 +1818,7 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		Log(" multiplayer: local PlayerID=%u\n", (unsigned)mlLocalPlayerId);
 		mfSinceJoinSeconds = 0; /* v13: the table that follows is the existing party */
 		SendLocalName();        /* v13: we know our id now — tell the host who we are */
+		SendCharacterRequest(); /* v18: ...and whom we want to play (no-op without character=) */
 		return;
 	}
 
@@ -2406,6 +2424,12 @@ void cNetworkManager::Service(int timeoutMs)
 					const cNetPlayerName *pn = (const cNetPlayerName *)pk->data;
 					OnPlayerNameReceived(author, pn->msName, sizeof(pn->msName));
 					SendNameTable(NULL);
+				}
+				else if (author >= 2 && lFirst == eNetPacketType_CharacterRequest)
+				{
+					/* v18: guest-only type (IsAllowedFrom), validated above;
+					   the peer id is the requester, never a packet byte */
+					HostHandleCharacterRequest(ev.peer, author, pk->data, (size_t)pk->dataLength);
 				}
 				else if (author >= 2 && lFirst == eNetPacketType_MapReady)
 				{
@@ -5499,16 +5523,7 @@ hpl::tString cNetworkManager::GetPlayerCharacterName(uint8_t alId) const
 	std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.find(alId);
 	if (it == m_mapPlayerSlots.end() || mvGhostMeshPaths.empty())
 		return "";
-	const hpl::tString &sPath = mvGhostMeshPaths[it->second % mvGhostMeshPaths.size()];
-	size_t lStart = 0;
-	for (size_t i = 0; i < sPath.size(); ++i)
-		if (sPath[i] == '/' || sPath[i] == '\\')
-			lStart = i + 1;
-	hpl::tString sName = sPath.substr(lStart);
-	const size_t lDot = sName.rfind('.');
-	if (lDot != hpl::tString::npos && lDot > 0)
-		sName = sName.substr(0, lDot); /* "fisherman.dae" -> "fisherman" */
-	return sName;
+	return GetCharacterBaseName(it->second % mvGhostMeshPaths.size());
 }
 
 uint8_t cNetworkManager::AllocCharacterSlot() const
@@ -5541,11 +5556,18 @@ void cNetworkManager::OnPlayerSlotReceived(uint8_t alId, uint8_t alSlot)
 	}
 	else
 	{
-		const bool bChanged = (it == m_mapPlayerSlots.end() || it->second != alSlot);
+		const bool bHadSlot = (it != m_mapPlayerSlots.end());
+		const bool bChanged = (!bHadSlot || it->second != alSlot);
 		m_mapPlayerSlots[alId] = alSlot;
 		if (bChanged)
 			Log(" multiplayer: player %u is character slot %u (%s)\n",
 				(unsigned)alId, (unsigned)alSlot, GetPlayerCharacterName(alId).c_str());
+		/* v18: a live swap (the host moved somebody after a character
+		   request) is a feed line; the first slot we learn is not */
+		if (bHadSlot && bChanged && lCount > 0 &&
+			(alId == mlLocalPlayerId || m_setJoinAnnounced.find(alId) != m_setJoinAnnounced.end()))
+			AddPartyEvent(GetPlayerName(alId) + " now plays " +
+				GetCharacterDisplayName(GetPlayerCharacterName(alId)));
 		if (lCount > 0 && alSlot >= lCount && (mlSlotWarned & (1u << alSlot)) == 0)
 		{
 			/* the host has more characters than we do: the lists differ,
@@ -5557,18 +5579,28 @@ void cNetworkManager::OnPlayerSlotReceived(uint8_t alId, uint8_t alSlot)
 		}
 	}
 
+	RebuildGhostIfMeshChanged(alId, lOldIdx);
+}
+
+void cNetworkManager::RebuildGhostIfMeshChanged(uint8_t alId, size_t alOldIdx)
+{
 	/* A ghost built from the (id-1) guess (or an older slot) with the wrong
 	   mesh: delete it here — Service runs after Update's world check, so it
 	   lives in the current world and a plain hplDelete is the right
 	   teardown (as in DropRemotePlayer). The next state packet re-creates
 	   it through EnsureGhost with the slot's mesh; seq/health/move state
-	   live outside the ghost, the interpolation buffer refills. */
-	if (lCount == 0 || (lOldIdx % lCount) == (GhostMeshIndexFor(alId) % lCount))
+	   live outside the ghost, the interpolation buffer refills. v18: also
+	   the host's own ghost of a guest it just moved. */
+	const size_t lCount = mvGhostMeshPaths.size();
+	if (alId == 0 || alId == mlLocalPlayerId || alId == kPreviewGhostId)
+		return; /* never a ghost of ourselves; the preview keeps its model */
+	if (lCount == 0 || (alOldIdx % lCount) == (GhostMeshIndexFor(alId) % lCount))
 		return;
 	tGhostMap::iterator gi = m_mapGhosts.find(alId);
 	if (gi == m_mapGhosts.end())
 		return;
-	hplDelete(gi->second);
+	if (gi->second)
+		hplDelete(gi->second);
 	m_mapGhosts.erase(gi);
 	Log(" multiplayer: ghost %u rebuilt as %s (host-assigned character)\n",
 		(unsigned)alId, GetPlayerCharacterName(alId).c_str());
@@ -5719,6 +5751,7 @@ bool cNetworkManager::IsAllowedFrom(uint8_t alType, bool abFromHost)
 	case eNetPacketType_EnemyDamage:
 	case eNetPacketType_MapReady:
 	case eNetPacketType_Auth:
+	case eNetPacketType_CharacterRequest: /* v18 */
 		return !abFromHost;
 	/* ChatMessage (4, reserved), discovery 5/6 (never over ENet), unknown */
 	default:
@@ -5813,6 +5846,7 @@ const float kNetMaxThrowImpulse = 30.0f; /* GrabEnd throw (BodySync clamps again
 const float kNetMaxPushImpulse = 50.0f;  /* one tick of move/push force */
 const float kNetMaxDamage = 200.0f;      /* enemy / entity / player damage per hit */
 const float kNetStrikeDecaySeconds = 5.0f;
+const float kNetCharRequestCooldown = 0.25f; /* v18: one applied character request per peer per this */
 
 static bool NetFinite(float afX)
 {
@@ -6253,6 +6287,15 @@ bool cNetworkManager::ValidateEventPacket(unsigned char *apData, size_t alLen, b
 		}
 		return at == alLen;
 	}
+	case eNetPacketType_CharacterRequest:
+	{
+		/* v18: exact size, a non-empty printable-ASCII name up to its first
+		   NUL (a full 24-char field needs none); anything else = strike */
+		if (alLen != sizeof(cNetCharacterRequest))
+			return false;
+		const cNetCharacterRequest *cr = (const cNetCharacterRequest *)apData;
+		return NetStringOk(cr->msCharacter, sizeof(cr->msCharacter), false);
+	}
 	case eNetPacketType_MapReady:
 		return alLen >= sizeof(cNetMapReady);
 	case eNetPacketType_Auth:
@@ -6405,6 +6448,30 @@ void cNetworkManager::UpdatePeerGuards(float afTimeStep)
 				guard.mfStrikeDecay = 0;
 				--guard.mlStrikes; /* a flaky-but-honest client never accumulates */
 			}
+		}
+		if (guard.mfCharCooldown > 0)
+		{
+			guard.mfCharCooldown -= afTimeStep;
+			if (guard.mfCharCooldown < 0)
+				guard.mfCharCooldown = 0;
+		}
+		if (guard.mbCharPending && guard.mfCharCooldown <= 0)
+		{
+			/* v18: the newest request that arrived inside the cooldown */
+			guard.mbCharPending = false;
+			const uint8_t lAuthor = PeerGetId(pPeer);
+			if (guard.mbAuthed && !guard.mbRefused && lAuthor >= 2)
+			{
+				const char *szWhy = HostApplyCharacterRequest(lAuthor, guard.msCharPending);
+				if (szWhy && !guard.mbCharRefusedLogged)
+				{
+					guard.mbCharRefusedLogged = true;
+					Log(" multiplayer: guest %u asked for character '%s' - ignored: %s (logged once)\n",
+						(unsigned)lAuthor, guard.msCharPending.c_str(), szWhy);
+				}
+				guard.mfCharCooldown = kNetCharRequestCooldown;
+			}
+			guard.msCharPending = "";
 		}
 		++it;
 	}
@@ -6576,6 +6643,256 @@ void cNetworkManager::UpdateVoice(float afTimeStep)
 	}
 	if (n > 0)
 		mpVoice->ClearOutgoing();
+}
+
+#endif /* PENUMBRA_MULTIPLAYER */
+
+//======================================================================
+// v18: character picker — APPENDED (see the NetworkManager.h tail).
+// Shared part first (both builds: display names, the list helpers, the
+// preference); the request itself (send / host apply) needs ENet and lives
+// under PENUMBRA_MULTIPLAYER. README.md "Characters".
+//======================================================================
+
+namespace
+{
+/** ASCII lower-case copy: character names match case-insensitively (the
+    discovery sort already collapses case-only duplicates). */
+hpl::tString CharNameLowerAscii(const hpl::tString &asName)
+{
+	hpl::tString s = asName;
+	for (size_t i = 0; i < s.size(); ++i)
+		if (s[i] >= 'A' && s[i] <= 'Z')
+			s[i] = (char)(s[i] - 'A' + 'a');
+	return s;
+}
+
+/** File base name -> the name players read. Anything not listed shows its
+    base name with the first letter capitalised. */
+struct cCharacterDisplayName
+{
+	const char *mpBase;    /**< lower case */
+	const char *mpDisplay;
+};
+const cCharacterDisplayName kCharacterDisplayNames[] = {
+	{ "phillip", "Philip" },
+	{ "fisherman", "The Fisherman" },
+	{ "red", "Red" },
+	{ "malik", "Malik" },
+};
+} // namespace
+
+hpl::tString cNetworkManager::GetCharacterDisplayName(const hpl::tString &asBase)
+{
+	if (asBase.empty())
+		return "";
+	const hpl::tString sLower = CharNameLowerAscii(asBase);
+	for (size_t i = 0; i < sizeof(kCharacterDisplayNames) / sizeof(kCharacterDisplayNames[0]); ++i)
+		if (sLower == kCharacterDisplayNames[i].mpBase)
+			return kCharacterDisplayNames[i].mpDisplay;
+	hpl::tString sOut = asBase;
+	if (sOut[0] >= 'a' && sOut[0] <= 'z')
+		sOut[0] = (char)(sOut[0] - 'a' + 'A');
+	return sOut;
+}
+
+hpl::tString cNetworkManager::SanitizeCharacterName(const hpl::tString &asName)
+{
+	hpl::tString sOut;
+	for (size_t i = 0; i < asName.size(); ++i)
+	{
+		const unsigned char c = (unsigned char)asName[i];
+		if (c < 32 || c > 126)
+			continue; /* control chars, DEL, non-ASCII */
+		if (c == ' ' && sOut.empty())
+			continue; /* leading blanks */
+		if (sOut.size() >= kNetCharacterNameMaxChars)
+			break;
+		sOut += (char)c;
+	}
+	while (!sOut.empty() && sOut[sOut.size() - 1] == ' ')
+		sOut.erase(sOut.size() - 1);
+	return sOut;
+}
+
+hpl::tString cNetworkManager::GetCharacterBaseName(size_t alIdx) const
+{
+	if (alIdx >= mvGhostMeshPaths.size())
+		return "";
+	const hpl::tString &sPath = mvGhostMeshPaths[alIdx];
+	size_t lStart = 0;
+	for (size_t i = 0; i < sPath.size(); ++i)
+		if (sPath[i] == '/' || sPath[i] == '\\')
+			lStart = i + 1;
+	hpl::tString sName = sPath.substr(lStart);
+	const size_t lDot = sName.rfind('.');
+	if (lDot != hpl::tString::npos && lDot > 0)
+		sName = sName.substr(0, lDot); /* "fisherman.dae" -> "fisherman" */
+	return sName;
+}
+
+int cNetworkManager::FindCharacterIndex(const hpl::tString &asBase) const
+{
+	if (asBase.empty())
+		return -1;
+	const hpl::tString sWant = CharNameLowerAscii(asBase);
+	for (size_t i = 0; i < mvGhostMeshPaths.size(); ++i)
+		if (CharNameLowerAscii(GetCharacterBaseName(i)) == sWant)
+			return (int)i;
+	return -1;
+}
+
+void cNetworkManager::SetCharacterPreference(const hpl::tString &asBase)
+{
+	const hpl::tString sNew = SanitizeCharacterName(asBase);
+	if (sNew != msCharacterPref)
+	{
+		msCharacterPref = sNew;
+		UpdateMultiplayerCfgKey("character", msCharacterPref); /* every other line kept */
+	}
+#ifdef PENUMBRA_MULTIPLAYER
+	SendCharacterRequest(); /* connected guest only; the host picks nothing */
+#endif
+}
+
+bool cNetworkManager::IsCharacterTakenByOther(const hpl::tString &asBase) const
+{
+	if (asBase.empty() || mvGhostMeshPaths.empty())
+		return false;
+	if (!mbHosting && !(mbClientConnected && mbHadJoinPacket))
+		return false; /* offline: nobody holds anything */
+	const hpl::tString sWant = CharNameLowerAscii(asBase);
+	const size_t lCount = mvGhostMeshPaths.size();
+	for (std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.begin();
+		it != m_mapPlayerSlots.end(); ++it)
+	{
+		if (it->first == mlLocalPlayerId || it->first == 0)
+			continue;
+		if (CharNameLowerAscii(GetCharacterBaseName(it->second % lCount)) == sWant)
+			return true;
+	}
+	return false;
+}
+
+bool cNetworkManager::IsCharacterSelectable(size_t alIdx) const
+{
+	if (alIdx == 0 || alIdx >= mvGhostMeshPaths.size() || alIdx >= kNetMaxCharacterSlots)
+		return false; /* slot 0 is the host's; beyond the slot range never exists */
+	return !IsCharacterTakenByOther(GetCharacterBaseName(alIdx));
+}
+
+hpl::tString cNetworkManager::GetNextSelectableCharacter(const hpl::tString &asCurrent) const
+{
+	const size_t n = mvGhostMeshPaths.size();
+	if (n == 0)
+		return "";
+	const int lCur = FindCharacterIndex(asCurrent);
+	/* unknown / empty: start "before" entry 0 so the first step lands on 0 */
+	const size_t lStart = lCur >= 0 ? (size_t)lCur : n - 1;
+	for (size_t lStep = 1; lStep <= n; ++lStep)
+	{
+		const size_t i = (lStart + lStep) % n;
+		if (IsCharacterSelectable(i))
+			return GetCharacterBaseName(i); /* lStep == n: the current one, the only choice */
+	}
+	return "";
+}
+
+hpl::tString cNetworkManager::GetLocalCharacterName() const
+{
+	if (mlLocalPlayerId == 0)
+		return "";
+	return GetPlayerCharacterName(mlLocalPlayerId);
+}
+
+#ifdef PENUMBRA_MULTIPLAYER
+
+void cNetworkManager::SendCharacterRequest()
+{
+	if (mbHosting || !mbClientConnected || !mbHadJoinPacket || msCharacterPref.empty())
+		return; /* the host is slot 0; a guest asks only once it has an id */
+	cNetCharacterRequest pkt;
+	memset(&pkt, 0, sizeof(pkt)); /* NUL padding; a 24-char name has none */
+	pkt.mType = eNetPacketType_CharacterRequest;
+	const size_t n = msCharacterPref.size() < sizeof(pkt.msCharacter) ?
+		msCharacterPref.size() : sizeof(pkt.msCharacter);
+	if (n > 0)
+		memcpy(pkt.msCharacter, msCharacterPref.data(), n);
+	SendReliableEvent(&pkt, sizeof(pkt));
+	Log(" multiplayer: asked the host for character '%s'\n", msCharacterPref.c_str());
+}
+
+void cNetworkManager::HostHandleCharacterRequest(ENetPeer *apPeer, uint8_t alAuthor,
+	const void *apData, size_t alLen)
+{
+	if (!mbHosting || !mpImpl || !apPeer || !apData || alAuthor < 2 ||
+		alLen < sizeof(cNetCharacterRequest))
+		return;
+	std::map<const ENetPeer *, Impl::cPeerGuard>::iterator gi = mpImpl->m_mapGuards.find(apPeer);
+	if (gi == mpImpl->m_mapGuards.end())
+		return;
+	Impl::cPeerGuard &guard = gi->second;
+	if (!guard.mbAuthed || guard.mbRefused)
+		return; /* not an accepted peer: never moves anybody */
+	cNetCharacterRequest req;
+	memcpy(&req, apData, sizeof(req));
+	size_t n = 0; /* bounded: the field need not be NUL-terminated */
+	while (n < sizeof(req.msCharacter) && req.msCharacter[n] != '\0')
+		++n;
+	const hpl::tString sName = SanitizeCharacterName(hpl::tString(req.msCharacter, n));
+	if (sName.empty())
+		return;
+	if (guard.mfCharCooldown > 0)
+	{
+		guard.mbCharPending = true; /* newest wins; UpdatePeerGuards applies it */
+		guard.msCharPending = sName;
+		return;
+	}
+	guard.mbCharPending = false;
+	guard.msCharPending = "";
+	const char *szWhy = HostApplyCharacterRequest(alAuthor, sName);
+	if (szWhy && !guard.mbCharRefusedLogged)
+	{
+		guard.mbCharRefusedLogged = true;
+		Log(" multiplayer: guest %u asked for character '%s' - ignored: %s (logged once)\n",
+			(unsigned)alAuthor, sName.c_str(), szWhy);
+	}
+	guard.mfCharCooldown = kNetCharRequestCooldown;
+}
+
+const char *cNetworkManager::HostApplyCharacterRequest(uint8_t alAuthor, const hpl::tString &asBase)
+{
+	if (!mbHosting)
+		return "not hosting";
+	std::map<uint8_t, uint8_t>::iterator mine = m_mapPlayerSlots.find(alAuthor);
+	if (alAuthor < 2 || alAuthor == mlLocalPlayerId || mine == m_mapPlayerSlots.end())
+		return "not an accepted player";
+	const int lIdx = FindCharacterIndex(asBase);
+	if (lIdx < 0)
+		return "the host has no such character";
+	if (lIdx == 0)
+		return "slot 0 is the host's character";
+	if (lIdx >= (int)GetCharacterCount())
+		return "beyond the character slot range";
+	const uint8_t lSlot = (uint8_t)lIdx;
+	if (mine->second == lSlot)
+		return NULL; /* already that character: nothing to re-send */
+	for (std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.begin();
+		it != m_mapPlayerSlots.end(); ++it)
+		if (it->first != alAuthor && it->second == lSlot)
+			return "taken by another player"; /* first come, first served */
+
+	const size_t lOldIdx = GhostMeshIndexFor(alAuthor);
+	const uint8_t lOldSlot = mine->second;
+	mine->second = lSlot; /* the old slot is free again: nobody else holds it */
+	Log(" multiplayer: guest %u moved from character slot %u to %u (%s) on request\n",
+		(unsigned)alAuthor, (unsigned)lOldSlot, (unsigned)lSlot, GetPlayerCharacterName(alAuthor).c_str());
+	RebuildGhostIfMeshChanged(alAuthor, lOldIdx); /* our own ghost of it */
+	if (m_setJoinAnnounced.find(alAuthor) != m_setJoinAnnounced.end())
+		AddPartyEvent(GetPlayerName(alAuthor) + " now plays " +
+			GetCharacterDisplayName(GetPlayerCharacterName(alAuthor)));
+	SendNameTable(NULL); /* every guest: OnPlayerSlotReceived rebuilds its ghost */
+	return NULL;
 }
 
 #endif /* PENUMBRA_MULTIPLAYER */

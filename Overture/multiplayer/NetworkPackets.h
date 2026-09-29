@@ -65,8 +65,17 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
         host's slot for that player (slot 0 = the host, each accepted guest
         the lowest free one, freed on leave), i.e. an index into the
         character list, so every player in a lobby is a DIFFERENT character.
-        The effective player cap is min(max_players, character count). */
-static const uint16_t kNetProtocolVersion = 17;
+        The effective player cap is min(max_players, character count).
+    v18: character picker — reliable cNetCharacterRequest (type 30), guest
+        -> host: "I want to play <file base name>" (by NAME, so machines
+        whose lists are ordered differently still agree). Sent right after
+        the guest's name (after PlayerJoin) when multiplayer.cfg has a
+        character= preference, and whenever the player picks another one
+        while connected. The host moves the requester to that slot if the
+        character exists in ITS list, is not slot 0 (the host's) and is
+        free, then re-broadcasts the name table; otherwise the request is
+        ignored and the table stays as it is. */
+static const uint16_t kNetProtocolVersion = 18;
 
 
 /** v13: cNetPlayerName::msName capacity. A name is at most this many
@@ -81,6 +90,10 @@ static const uint8_t kNetCharacterUnknown = 255;
 /** v17: character slots are < this (ValidateEventPacket). The effective cap
     min(max_players <= 31, character count) keeps real slots well below. */
 static const uint8_t kNetMaxCharacterSlots = 32;
+/** v18: cNetCharacterRequest::msCharacter capacity — a character's file
+    base name ("fisherman"), printable ASCII, NUL-padded, not necessarily
+    NUL-terminated (a 24-char name fills the field). */
+static const size_t kNetCharacterNameMaxChars = 24;
 
 /** Snapshot send period, every sender (cNetworkManager::kSendPeriodSeconds
     is this value). The receiver uses cNetPlayerState::mSeq * this period as
@@ -186,6 +199,12 @@ enum eNetPacketType : uint8_t
 	                                    1..kNetVoiceMaxFramesPerPacket Opus
 	                                    frames. A lost packet is concealed by
 	                                    the decoder (PLC), never resent. */
+	eNetPacketType_CharacterRequest = 30, /* v18, reliable ch0, guest -> host
+	                                         only: the character the guest
+	                                         wants (cNetCharacterRequest, by
+	                                         file base name). The host answers
+	                                         with the name table (moved) or
+	                                         not at all (refused). */
 };
 
 /** v16 voice: fixed codec parameters — both ends must agree, so they are
@@ -350,6 +369,16 @@ struct cNetPlayerName
 	uint8_t mPlayerID;
 	char msName[kNetPlayerNameMaxChars];
 	uint8_t mCharacter; /**< v17: slot, < kNetMaxCharacterSlots or kNetCharacterUnknown */
+};
+
+/** v18: guest -> host, "move me to this character". msCharacter is the
+    file base name without ".dae" as the guest's list spells it
+    ("fisherman"); the host matches it ASCII-case-insensitively against ITS
+    list. Printable ASCII, non-empty, NUL-padded (ValidateEventPacket). */
+struct cNetCharacterRequest
+{
+	uint8_t mType; /**< eNetPacketType_CharacterRequest */
+	char msCharacter[kNetCharacterNameMaxChars];
 };
 
 /** v16 voice packet header. Payload layout after the header, mFrames
@@ -756,6 +785,7 @@ static inline void NetAuthDigest(const char *apPassword, size_t alPasswordLen,
 static_assert(sizeof(cNetPlayerJoin) == 2, "");
 static_assert(sizeof(cNetPlayerLeave) == 2, "");
 static_assert(sizeof(cNetPlayerName) == 27, ""); /* v13; v17: +mCharacter */
+static_assert(sizeof(cNetCharacterRequest) == 25, ""); /* v18 */
 static_assert(sizeof(cNetVoice) == 5, "");       /* v16 */
 static_assert(sizeof(cNetPlayerState) == 30, ""); /* v7: +mSeq; v11: +vel/flags; v12: +mHealth */
 static_assert(sizeof(cNetDiscoveryPing) == 7, "");
