@@ -84,8 +84,11 @@ bool cNetworkManager::BuildLocalSnapshot(cNetPlayerState *apOut) const
 	   (cPlayerHeadMove) and the ghost mesh origin is at its feet. */
 	apOut->mfPosY = pBody ? pBody->GetFeetPosition().y : p.y;
 	apOut->mfPosZ = p.z;
-	apOut->mfPitch = cam->GetPitch();
-	apOut->mfYaw = cam->GetYaw();
+	/* The camera yaw is never wrapped by the engine (yaw limits are off), so
+	   after enough turns in one direction it exceeds any sane bound; wrap
+	   both angles to [-pi, pi) on the wire. */
+	apOut->mfPitch = cMath::Wrap(cam->GetPitch(), -kPif, kPif);
+	apOut->mfYaw = cMath::Wrap(cam->GetYaw(), -kPif, kPif);
 	cPlayerFlashLight *fl = mpInit->mpPlayer->GetFlashLight();
 	apOut->mbFlashlightOn = (uint8_t)(fl && fl->IsActive() && !fl->IsDisabled());
 	/* Engine -> wire stance mapping, explicit per state so an engine enum
@@ -305,6 +308,7 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mfInternetTimeLeft(0)
 	  , msInternetFailReason("")
 	  , mfMasterRegisterAccum(0)
+	  , mfMasterResolveAge(0)
 	  , mbMasterRegistered(false)
 	  , mpBodySync(new cBodySync())
 	  , mbCoopRespawn(true) /* v12: multiplayer.cfg coop_respawn */
@@ -522,6 +526,7 @@ struct cNetworkManager::Impl
 	bool mbMasterResolved;
 	hpl::tString msMasterResolvedFor; /* the host:port mMasterAddr stands for */
 	bool mbMasterWarned;              /* log the "cannot resolve" line once */
+	double mfMasterResolveFailedAt;   /* wall seconds of the last failed lookup, 0 = none */
 
 	/* Rung 3, guest side: pending forwarded intent, flushed at the send tick.
 	   Begin/End go out immediately (reliable); these are the streams. */
@@ -586,6 +591,7 @@ struct cNetworkManager::Impl
 		  , mbBrowseHoldsNetRef(false)
 		  , mbMasterResolved(false)
 		  , msMasterResolvedFor("")
+		  , mfMasterResolveFailedAt(0.0)
 		  , mbMasterWarned(false)
 		  , mlHeldHash(0)
 		  , mvGrabTarget(0, 0, 0)
@@ -896,6 +902,7 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mfInternetTimeLeft(0)
 	  , msInternetFailReason("")
 	  , mfMasterRegisterAccum(0)
+	  , mfMasterResolveAge(0)
 	  , mbMasterRegistered(false)
 	  , mpBodySync(new cBodySync())
 	  , mbCoopRespawn(true) /* v12: multiplayer.cfg coop_respawn */
@@ -3094,6 +3101,15 @@ void cNetworkManager::Update(float afTimeStep)
 		if (mfMasterRegisterAccum >= kNetMasterRegisterSeconds)
 		{
 			mfMasterRegisterAccum = 0;
+			/* re-resolve now and then (dynamic-DNS masters); this is once per
+			   20 s beacon at most, never per frame, and a failed lookup is
+			   remembered for a minute inside ResolveMasterAddress */
+			mfMasterResolveAge += kNetMasterRegisterSeconds;
+			if (mfMasterResolveAge >= 600.0f || !mpImpl->mbMasterResolved)
+			{
+				mfMasterResolveAge = 0;
+				ResolveMasterAddress();
+			}
 			SendMasterRegister();
 		}
 	}
@@ -3500,6 +3516,12 @@ bool cNetworkManager::ResolveMasterAddress()
 		mpImpl->msMasterResolvedFor = "";
 		return false;
 	}
+	/* a lookup that just failed is not retried for a minute (HostGame /
+	   Refresh clicks would otherwise block on DNS every time) */
+	if (mpImpl->mfMasterResolveFailedAt > 0.0 &&
+		(double)GetApplicationTime() / 1000.0 - mpImpl->mfMasterResolveFailedAt < 60.0 &&
+		mpImpl->msMasterResolvedFor == sMaster)
+		return false;
 	if (mpImpl->mbMasterResolved && mpImpl->msMasterResolvedFor == sMaster)
 		return true;
 
@@ -3531,6 +3553,9 @@ bool cNetworkManager::ResolveMasterAddress()
 	memset(&ea, 0, sizeof(ea));
 	if (enet_address_set_host(&ea, hbuf) != 0 || ea.host == 0)
 	{
+		mpImpl->mfMasterResolveFailedAt = (double)GetApplicationTime() / 1000.0;
+		mpImpl->msMasterResolvedFor = sMaster;
+		mpImpl->mbMasterResolved = false;
 		if (!mpImpl->mbMasterWarned)
 		{
 			mpImpl->mbMasterWarned = true;
@@ -3546,6 +3571,7 @@ bool cNetworkManager::ResolveMasterAddress()
 	mpImpl->mMasterAddr.sin_port = htons(port);
 	mpImpl->mbMasterResolved = true;
 	mpImpl->mbMasterWarned = false;
+	mpImpl->mfMasterResolveFailedAt = 0.0;
 
 	char where[64];
 	FormatAddrPort(mpImpl->mMasterAddr, port, where, sizeof(where));
@@ -3569,7 +3595,7 @@ void cNetworkManager::SendMasterRegister()
 	reg.mlMagic = kNetMasterMagic;
 	reg.mlMasterVer = kNetMasterProtocolVersion;
 	reg.mlGamePort = mlListenPort;
-	reg.mlPlayerCount = (uint8_t)(m_mapGhosts.size() + 1); /* guests + me */
+	reg.mlPlayerCount = (uint8_t)(CountConnectedPeers(true) + 1); /* accepted guests + me */
 	reg.mlMaxPlayers = mlMaxPlayers;
 	reg.mFlags = HasServerPassword() ? kNetMasterFlag_Password : 0; /* v15 auth: the real setting */
 	reg.mlProtocolVer = kNetProtocolVersion;
@@ -3877,7 +3903,7 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 			pong.mlProtocolMagic = kNetProtocolMagic;
 			pong.mlProtocolVer = kNetProtocolVersion;
 			pong.mlGamePort = mlListenPort;
-			pong.mlPlayerCount = (uint8_t)(m_mapGhosts.size() + 1); /* guests + me */
+			pong.mlPlayerCount = (uint8_t)(CountConnectedPeers(true) + 1); /* accepted guests + me */
 			pong.mlMaxPlayers = mlMaxPlayers;
 			{
 				/* v13: no server_name -> "<player_name>'s game" (or the old default) */
@@ -5409,7 +5435,11 @@ void cNetworkManager::HostAcceptPeer(ENetPeer *apPeer, const cNetAuth &aAuth)
 	uint8_t aExpect[16];
 	NetAuthDigest(msServerPassword.c_str(), msServerPassword.size(), guard.mNonce,
 		kNetProtocolVersion, aExpect);
-	if (aAuth.mlVersion != kNetProtocolVersion || memcmp(aExpect, aAuth.mDigest, sizeof(aExpect)) != 0)
+	/* An open server (no password) accepts any digest: a guest with a stale
+	   join_password must not be locked out of servers that never asked. */
+	const bool bDigestOk = msServerPassword.empty() ||
+		memcmp(aExpect, aAuth.mDigest, sizeof(aExpect)) == 0;
+	if (aAuth.mlVersion != kNetProtocolVersion || !bDigestOk)
 	{
 		guard.mbRefused = true;
 		Log(" multiplayer: REFUSED peer %s - bad auth (version %u, %s)\n", sWho,
@@ -5523,9 +5553,21 @@ bool cNetworkManager::ValidateEventPacket(unsigned char *apData, size_t alLen, b
 			return false;
 		cNetPlayerState st;
 		memcpy(&st, apData, sizeof(st));
-		return NetFiniteBounded(st.mfPosX, kNetMaxCoord) && NetFiniteBounded(st.mfPosY, kNetMaxCoord) &&
-			NetFiniteBounded(st.mfPosZ, kNetMaxCoord) && NetFiniteBounded(st.mfPitch, kNetMaxAngle) &&
-			NetFiniteBounded(st.mfYaw, kNetMaxAngle); /* velocities are int8, health is clamped on apply */
+		if (!NetFiniteBounded(st.mfPosX, kNetMaxCoord) || !NetFiniteBounded(st.mfPosY, kNetMaxCoord) ||
+			!NetFiniteBounded(st.mfPosZ, kNetMaxCoord))
+			return false;
+		if (!NetFiniteBounded(st.mfPitch, kNetMaxAngle) || !NetFiniteBounded(st.mfYaw, kNetMaxAngle))
+		{
+			/* an unwrapped angle from an older build is not an attack: wrap it
+			   in place (NaN/inf still fail NetFiniteBounded's finite part) */
+			if (st.mfPitch != st.mfPitch || st.mfYaw != st.mfYaw ||
+				fabsf(st.mfPitch) > 1e9f || fabsf(st.mfYaw) > 1e9f)
+				return false;
+			st.mfPitch = cMath::Wrap(st.mfPitch, -kPif, kPif);
+			st.mfYaw = cMath::Wrap(st.mfYaw, -kPif, kPif);
+			memcpy(apData, &st, sizeof(st));
+		}
+		return true; /* velocities are int8, health is clamped on apply */
 	}
 	case eNetPacketType_MapChange:
 	{
@@ -5981,6 +6023,9 @@ void cNetworkManager::UpdateVoice(float afTimeStep)
 	hpl::cInput *inp = (mpInit && mpInit->mpGame) ? mpInit->mpGame->GetInput() : NULL;
 	if (inp)
 		bTalk = inp->IsTriggerd("VoiceTalk");
+	/* never transmit while a menu is up (typing a 'v' in a text field) */
+	if (mpInit && mpInit->mpMainMenu && mpInit->mpMainMenu->IsActive())
+		bTalk = false;
 
 	mpVoice->Update(afTimeStep, bTalk);
 

@@ -310,7 +310,8 @@ private:
 	bool mbInternetActive;
 	float mfInternetTimeLeft;
 	hpl::tString msInternetFailReason;
-	float mfMasterRegisterAccum;     /**< host: seconds since the last Register */
+	float mfMasterRegisterAccum;
+	float mfMasterResolveAge;       /**< host: seconds since the master was last resolved */     /**< host: seconds since the last Register */
 	bool mbMasterRegistered;         /**< host: at least one Register went out
 	    this session -> send an Unregister on stop */
 

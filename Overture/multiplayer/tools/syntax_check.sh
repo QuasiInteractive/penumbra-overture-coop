@@ -39,7 +39,7 @@
 # MSVC-only behaviour and link errors are not detected. Stub functions are
 # mostly declared variadic (ret f(...)) so any argument list parses.
 #
-# Coverage (as of writing, g++ 13 and clang++ both): all 8 DEFAULT_FILES pass;
+# Coverage (as of writing, g++ 13 and clang++ both): all 10 DEFAULT_FILES pass;
 # 58/59 Overture/*.cpp pass (MainMenu.cpp needs OALWrapper/OAL_Init.h, not
 # stubbed); 207/231 HPL1Engine/sources/**/*.cpp pass, including
 # scene/MeshEntity.cpp and impl/MeshLoaderCollada.cpp. Engine files that do

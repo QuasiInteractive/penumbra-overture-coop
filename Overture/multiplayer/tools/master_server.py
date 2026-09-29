@@ -93,6 +93,8 @@ LIST = struct.Struct("<BIHH")
 ENTRIES_HDR = struct.Struct("<BIHB")
 ENTRY = struct.Struct("<4sHBBBHH32s32s")
 
+MAX_PER_IP = 8                   # distinct game ports one source ip may list
+MAX_TABLE = 1000                 # total entries; new registrations refused when full
 MAX_ENTRIES_PER_DATAGRAM = 10   # 8 + 10*77 = 778 bytes, well under any MTU
 NAME_LEN = 32
 
@@ -176,6 +178,7 @@ class Master:
         self.expiry = float(expiry)
         self.max_entries = int(max_entries)
         self.limiter = RateLimiter(rate)
+        self.reg_limiter = RateLimiter(1.0)   # new registrations per second per ip
         self.servers = {}       # (ip, port) -> Server
         self.stats = {"register": 0, "unregister": 0, "list": 0,
                       "malformed": 0, "ratelimited": 0}
@@ -202,6 +205,15 @@ class Master:
             sv = self.servers.get(key)
             fresh = sv is None
             if fresh:
+                # abuse limits: a new entry costs a token (1/s per source ip),
+                # at most MAX_PER_IP entries per ip, MAX_TABLE overall
+                if not self.reg_limiter.allow(ip, now):
+                    self.stats["ratelimited"] += 1
+                    return
+                if sum(1 for k in self.servers if k[0] == ip) >= MAX_PER_IP:
+                    return self.malformed(addr, "too many servers from this ip")
+                if len(self.servers) >= MAX_TABLE:
+                    return self.malformed(addr, "table full")
                 sv = self.servers[key] = Server(ip, gport)
             sv.players, sv.max_players = players, maxp
             sv.flags, sv.protocol = flags, proto
@@ -269,6 +281,7 @@ class Master:
             log.info("EXPIRED  %s:%d '%s' (last beacon %.0fs ago, %d listed)",
                      sv.ip, sv.port, sv.name, now - sv.last_seen, len(self.servers))
         self.limiter.prune(now)
+        self.reg_limiter.prune(now)
 
     def run(self):
         last_expire = last_stats = time.monotonic()
