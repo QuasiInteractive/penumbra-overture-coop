@@ -93,15 +93,15 @@ static cMainMenuWidget_MultiIpLine *gpMulTypedName = NULL;
 static cMainMenuWidget_Text *gpMulNameFoot = NULL;
 static cMainMenuWidget_Text *gpMulNameShown = NULL;
 /* Server browser screen: Internet tab = master server list, LAN tab = the
-   broadcast scan. Rows are fixed slots refreshed from the network manager's
-   result vectors every frame (cheap: string compares). */
+   broadcast scan. Rows are fixed slots showing one page of the network
+   manager's result vector, re-synced every frame (cheap: string copies);
+   the status line / selection / page live further down (browser section). */
 static const int kMulBrowserRows = 8;
 static std::vector<cMainMenuWidget_MultiServerRow *> gvMulRows;
-static cMainMenuWidget_Text *gpMulBrowserFoot = NULL;
 static bool gMulBrowserInternet = true;
-/* Password prompt: the [pw] row that was clicked, joined once typed. */
+/* Password prompt: the locked row that was chosen, joined once typed (its
+   name / address are drawn by the prompt's panel). */
 static cMainMenuWidget_MultiIpLine *gpMulTypedPw = NULL;
-static cMainMenuWidget_Text *gpMulPwTitle = NULL;
 static cDiscoveredServer gMulPendingServer;
 /* Host lobby: 'Public (list on master)' toggle + the port-forward note. */
 static cMainMenuWidget_MultiPublicToggle *gpMulPublicToggle = NULL;
@@ -147,6 +147,137 @@ static int KeypadDigit(eKey mk)
 
 } 
 
+//-----------------------------------------------------------------------
+// Drawing kit for the multiplayer screens (server browser, password
+// prompt, character picker). Only primitives the menu already uses:
+// solid quads = effect_white.jpg through the diffalpha2d material tinted
+// with a colour (what cMainMenuWidget_List draws its back and selection
+// with), text = font_menu_small.fnt through iFontData::Draw. Everything is
+// drawn in the 800x600 menu space; z: panel 28-32, boxes/rows 33-36,
+// text 40 (the widgets' own z), mouse 100.
+//-----------------------------------------------------------------------
+
+namespace {
+
+/** One shared white quad, created on first use, released by ~cMainMenu. */
+static cGfxObject *gpMulWhiteGfx = NULL;
+static cGraphicsDrawer *gpMulWhiteDrawer = NULL;
+
+static void MulFillRect(cGraphicsDrawer *apDrawer, float afX, float afY, float afW, float afH,
+						float afZ, const cColor &aCol)
+{
+	if (apDrawer == NULL || afW <= 0 || afH <= 0)
+		return;
+	if (gpMulWhiteGfx == NULL)
+	{
+		gpMulWhiteGfx = apDrawer->CreateGfxObject("effect_white.jpg", "diffalpha2d");
+		gpMulWhiteDrawer = apDrawer;
+	}
+	if (gpMulWhiteGfx == NULL)
+		return;
+	apDrawer->DrawGfxObject(gpMulWhiteGfx, cVector3f(afX, afY, afZ), cVector2f(afW, afH), aCol);
+}
+
+/** 1-px (afT) outline just inside the rectangle. */
+static void MulFrameRect(cGraphicsDrawer *apDrawer, float afX, float afY, float afW, float afH,
+						 float afZ, const cColor &aCol, float afT = 1.0f)
+{
+	MulFillRect(apDrawer, afX, afY, afW, afT, afZ, aCol);
+	MulFillRect(apDrawer, afX, afY + afH - afT, afW, afT, afZ, aCol);
+	MulFillRect(apDrawer, afX, afY + afT, afT, afH - 2 * afT, afZ, aCol);
+	MulFillRect(apDrawer, afX + afW - afT, afY + afT, afT, afH - 2 * afT, afZ, aCol);
+}
+
+/** A 12x12 padlock (shackle + body + keyhole) with its top-left at x,y. */
+static void MulDrawLock(cGraphicsDrawer *apDrawer, float afX, float afY, float afZ, const cColor &aCol)
+{
+	MulFillRect(apDrawer, afX + 2.5f, afY, 7.0f, 1.5f, afZ, aCol);         /* shackle top */
+	MulFillRect(apDrawer, afX + 2.5f, afY, 1.5f, 5.5f, afZ, aCol);         /* shackle left */
+	MulFillRect(apDrawer, afX + 8.0f, afY, 1.5f, 5.5f, afZ, aCol);         /* shackle right */
+	MulFillRect(apDrawer, afX, afY + 5.0f, 12.0f, 7.0f, afZ, aCol);        /* body */
+	MulFillRect(apDrawer, afX + 5.25f, afY + 7.0f, 1.5f, 3.0f, afZ + 0.5f, /* keyhole */
+				cColor(0.05f, 0.05f, 0.08f, 1.0f));
+}
+
+static void MulReleaseGfx()
+{
+	if (gpMulWhiteGfx && gpMulWhiteDrawer)
+		gpMulWhiteDrawer->DestroyGfxObject(gpMulWhiteGfx);
+	gpMulWhiteGfx = NULL;
+	gpMulWhiteDrawer = NULL;
+}
+
+/** Text is ALWAYS drawn through "%ls": server names, maps and player names
+    come off the network and a '%' in one must not reach the formatter. */
+static void MulText(iFontData *apFont, float afX, float afY, float afZ, float afSize,
+					const cColor &aCol, eFontAlign aAlign, const tWString &asText)
+{
+	if (apFont == NULL || asText.empty())
+		return;
+	apFont->Draw(cVector3f(afX, afY, afZ), cVector2f(afSize, afSize), aCol, aAlign, _W("%ls"),
+				 asText.c_str());
+}
+
+static float MulTextWidth(iFontData *apFont, float afSize, const tWString &asText)
+{
+	if (apFont == NULL || asText.empty())
+		return 0;
+	return apFont->GetLength(cVector2f(afSize, afSize), asText.c_str());
+}
+
+/** asText, cut with "..." so it is at most afMaxW wide. */
+static tWString MulFitText(iFontData *apFont, float afSize, const tWString &asText, float afMaxW)
+{
+	if (afMaxW <= 0 || MulTextWidth(apFont, afSize, asText) <= afMaxW)
+		return asText;
+	const tWString kDots = _W("...");
+	tWString sCut = asText;
+	while (!sCut.empty())
+	{
+		sCut.erase(sCut.size() - 1);
+		while (!sCut.empty() && sCut[sCut.size() - 1] == L' ')
+			sCut.erase(sCut.size() - 1);
+		const tWString sTry = sCut + kDots;
+		if (MulTextWidth(apFont, afSize, sTry) <= afMaxW)
+			return sTry;
+	}
+	return kDots;
+}
+
+static bool MulMouseIn(cInit *apInit, const cRect2f &aRect)
+{
+	if (apInit == NULL || apInit->mpMainMenu == NULL || aRect.w <= 0 || aRect.h <= 0)
+		return false;
+	return cMath::PointBoxCollision(apInit->mpMainMenu->GetMousePos(), aRect);
+}
+
+static iFontData *MulMenuFont(cInit *apInit)
+{
+	return apInit->mpGame->GetResources()->GetFontManager()->CreateFontData("font_menu_small.fnt", 30);
+}
+
+static void MulClickSound(cInit *apInit)
+{
+	apInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+}
+
+/* Palette: the menu's own blues (cMainMenuWidget_Button's glow 0.1/0.32/1.0,
+   cMainMenuWidget_List's back 0.05/0.05/0.1 and selection 0/0/0.73). */
+static cColor MulColPanel() { return cColor(0.02f, 0.025f, 0.05f, 0.86f); }
+static cColor MulColTitleBar() { return cColor(0.05f, 0.09f, 0.22f, 0.92f); }
+static cColor MulColBorder() { return cColor(0.28f, 0.34f, 0.52f, 0.9f); }
+static cColor MulColAccent() { return cColor(0.25f, 0.5f, 1.0f, 0.95f); }
+static cColor MulColBox() { return cColor(0.07f, 0.08f, 0.13f, 0.88f); }
+static cColor MulColBoxHover() { return cColor(0.11f, 0.17f, 0.38f, 0.92f); }
+static cColor MulColSelected() { return cColor(0.0f, 0.08f, 0.6f, 0.85f); }
+static cColor MulColText() { return cColor(0.78f, 1.0f); }
+static cColor MulColTextBright() { return cColor(1.0f, 1.0f); }
+static cColor MulColTextDim() { return cColor(0.45f, 1.0f); }
+static cColor MulColWarn() { return cColor(0.95f, 0.5f, 0.4f, 1.0f); }
+static cColor MulColGold() { return cColor(0.9f, 0.78f, 0.42f, 1.0f); }
+
+} // namespace
+
 /** ASCII typing line. Address mode (default): IPv4/host:port characters,
     220 max. Name mode (v13, abNameMode): any printable ASCII incl. spaces,
     kNetPlayerNameMaxChars max, re-seeded from the current player name on
@@ -181,6 +312,10 @@ public:
 	    address characters) and the field draws asterisks. */
 	void SetPasswordMode(bool abX) { mbPasswordMode = abX; }
 
+	/** Draw as a boxed input field afWidth wide (no [ ] brackets); the
+	    whole box is the click target. 0 = the classic '[ text_ ]' line. */
+	void SetFieldBox(float afWidth) { mfBoxW = afWidth; UpdateHitBox(); }
+
 	/** v13: Enter was pressed while focused since the last call (one-shot). */
 	bool TakeEnter()
 	{
@@ -211,8 +346,14 @@ private:
 	bool mbNameMode;     /**< v13: username instead of an address */
 	bool mbEnterPressed; /**< v13: see TakeEnter */
 	bool mbPasswordMode; /**< server-browser password prompt: any printable ASCII, drawn as asterisks */
+	float mfBoxW;        /**< SetFieldBox width, 0 = bracket line */
 
 	void FlushToWide();
+	/** The shown text ('[ ' ... ' ]' or the boxed text, no cursor). */
+	tWString ShownText(bool abBrackets) const;
+	/** Hit box = what is drawn (centred text grows both ways; the plain
+	    Text::UpdateSize only widened it to the right). */
+	void UpdateHitBox();
 
 	size_t MaxLen() const { return mbNameMode ? kNetPlayerNameMaxChars : 220; }
 
@@ -321,7 +462,7 @@ cMainMenuWidget_MultiIpLine::cMainMenuWidget_MultiIpLine(cInit *apInit, const cV
 														 cVector2f avFontSize, eFontAlign aAlignment,
 														 bool abNameMode)
 	: cMainMenuWidget_Text(apInit, avPos, _W(""), avFontSize, aAlignment), mbTypingFocus(false), mbSelectAll(false)
-	, mbNameMode(abNameMode), mbEnterPressed(false), mbPasswordMode(false)
+	, mbNameMode(abNameMode), mbEnterPressed(false), mbPasswordMode(false), mfBoxW(0)
 {
 	msAscii = asciiSeed;
 	FlushToWide();
@@ -337,6 +478,42 @@ void cMainMenuWidget_MultiIpLine::FlushToWide()
 	else
 		msText = cString::To16Char(msAscii);
 	UpdateSize();
+	UpdateHitBox();
+}
+
+tWString cMainMenuWidget_MultiIpLine::ShownText(bool abBrackets) const
+{
+	tWString sShow = abBrackets ? _W("[ ") : _W("");
+	if (msAscii.empty())
+		sShow += mbNameMode ? _W("type your name here") :
+				 mbPasswordMode ? _W("type password") : _W("type address here");
+	else if (mbPasswordMode)
+		sShow += tWString(msAscii.size(), L'*');
+	else
+		sShow += cString::To16Char(msAscii);
+	if (abBrackets)
+		sShow += _W(" ]");
+	return sShow;
+}
+
+void cMainMenuWidget_MultiIpLine::UpdateHitBox()
+{
+	if (mfBoxW > 0)
+	{
+		mRect.w = mfBoxW;
+		mRect.h = mvFontSize.y + 12;
+		mRect.y = mvPositon.y - 5;
+	}
+	else
+	{
+		mRect.w = mpFont->GetLength(mvFontSize, ShownText(true).c_str()) + mvFontSize.x; /* + cursor */
+	}
+	if (mAlignment == eFontAlign_Center)
+		mRect.x = mvPositon.x - mRect.w / 2;
+	else if (mAlignment == eFontAlign_Right)
+		mRect.x = mvPositon.x - mRect.w;
+	else
+		mRect.x = mvPositon.x;
 }
 
 void cMainMenuWidget_MultiIpLine::OnDraw()
@@ -345,6 +522,27 @@ void cMainMenuWidget_MultiIpLine::OnDraw()
 	   while it has typing focus (it grabs focus when the screen opens). */
 	static int sBlink = 0;
 	++sBlink;
+	const bool bCursor = mbTypingFocus && ((sBlink / 25) % 2) == 0;
+
+	if (mfBoxW > 0)
+	{
+		/* boxed field (password prompt): dark box, frame lit while typing,
+		   dim placeholder, text clipped from the left so the end shows */
+		const float fBoxH = mvFontSize.y + 12;
+		const float fX = mRect.x, fY = mvPositon.y - 5;
+		MulFillRect(mpDrawer, fX, fY, mfBoxW, fBoxH, 33, cColor(0.01f, 0.01f, 0.03f, 0.9f));
+		MulFrameRect(mpDrawer, fX, fY, mfBoxW, fBoxH, 34,
+						mbTypingFocus ? cColor(0.25f, 0.5f, 1.0f, 0.95f) : cColor(0.3f, 0.34f, 0.5f, 0.8f));
+		tWString sShow = ShownText(false);
+		const float fMaxW = mfBoxW - 16 - mvFontSize.x;
+		while (!msAscii.empty() && sShow.size() > 1 && mpFont->GetLength(mvFontSize, sShow.c_str()) > fMaxW)
+			sShow.erase(0, 1);
+		if (bCursor)
+			sShow += _W("_");
+		const cColor col = msAscii.empty() ? cColor(0.45f, 1.0f) : cColor(1.0f, 1.0f);
+		mpFont->Draw(mvPositon, mvFontSize, col, mAlignment, _W("%ls"), sShow.c_str());
+		return;
+	}
 
 	tWString sShow = _W("[ ");
 	if (msAscii.empty())
@@ -354,7 +552,7 @@ void cMainMenuWidget_MultiIpLine::OnDraw()
 		sShow += tWString(msAscii.size(), L'*');
 	else
 		sShow += cString::To16Char(msAscii);
-	if (mbTypingFocus && ((sBlink / 25) % 2) == 0)
+	if (bCursor)
 		sShow += _W("_");
 	sShow += _W(" ]");
 
@@ -598,17 +796,47 @@ void cMainMenuWidget_MultiLaunchPlaying::OnMouseDown(eMButton aButton)
 	(void)aButton;
 }
 
+
 //-----------------------------------------------------------------------
 // Server browser (Internet = master server list, LAN = broadcast scan),
 // password prompt, host lobby 'Public' toggle.
+//
+// Browser layout (800x600 menu space), one panel at x 16..576, y 186..590:
+//   title bar      y 186..212   "Server browser" + "Playing as: <name>"
+//   tabs           y 220..244   [Internet] [LAN] ............ [Refresh]
+//   column header  y 250..270   lock | Name | Map | Players | Seen
+//   8 rows         y 272..448   22 px, striped; hover / selected fill
+//   status + pager y 454..474   "3 servers found ..."   [<] 1/2 [>]
+//   divider        y 479
+//   character      y 486..535   Character: [<] The Fisherman [>] + chips
+//   divider        y 541
+//   buttons        y 548..574   [Join] [Direct connect] ........ [Back]
 //-----------------------------------------------------------------------
 
 namespace {
 
-/* A click on a row that cannot be joined explains itself on the foot line
-   for a few seconds; the status text takes over again afterwards. */
+static const float kMulBrPanelX = 16, kMulBrPanelY = 186, kMulBrPanelW = 560, kMulBrPanelH = 404;
+static const float kMulBrListX = 24, kMulBrListW = 532;   /* rows: x 24..556 */
+static const float kMulBrHeaderY = 250, kMulBrHeaderH = 20;
+static const float kMulBrRowsY = 272, kMulBrRowH = 22;
+static const float kMulBrStatusY = 454;
+/* column anchors (text x; Players/Seen are centred) */
+static const float kMulColLockX = 30, kMulColNameX = 50, kMulColNameW = 200;
+static const float kMulColMapX = 262, kMulColMapW = 146;
+static const float kMulColPlayersX = 446, kMulColSeenX = 516;
+
+/* A click on a row that cannot be joined explains itself on the status
+   line for a few seconds; the live status takes over again afterwards. */
 static tString gMulBrowserNotice;
 static float gMulBrowserNoticeLeft = 0;
+/* selection = the server's address (survives refreshes and paging) */
+static tString gMulBrowserSelAddr;
+static int gMulBrowserFirst = 0;        /* first list index shown (page start) */
+static float gMulBrowserClock = 0;      /* browser-screen time, for the double click */
+static float gMulBrowserLastClick = -10;
+/* status line, rebuilt every frame by cMainMenu::Update */
+static tWString gMulBrowserStatus;
+static int gMulBrowserStatusKind = 0;   /* 0 info, 1 busy, 2 error, 3 notice */
 
 static void MulBrowserNotice(const tString &asText)
 {
@@ -625,6 +853,26 @@ static void MulRefreshBrowser(cInit *apInit)
 		apInit->mpNetworkManager->RefreshInternetServers();
 	else
 		apInit->mpNetworkManager->StartDiscovery();
+}
+
+static const std::vector<cDiscoveredServer> *MulBrowserList(cInit *apInit)
+{
+	if (!apInit || !apInit->mpNetworkManager)
+		return NULL;
+	return gMulBrowserInternet ? &apInit->mpNetworkManager->GetInternetServers()
+							   : &apInit->mpNetworkManager->GetDiscoveredServers();
+}
+
+/** Index of the selected server in the current tab's list, -1 = none. */
+static int MulBrowserSelectedIndex(cInit *apInit)
+{
+	const std::vector<cDiscoveredServer> *pList = MulBrowserList(apInit);
+	if (pList == NULL || gMulBrowserSelAddr.empty())
+		return -1;
+	for (size_t i = 0; i < pList->size(); ++i)
+		if ((*pList)[i].msAddress == gMulBrowserSelAddr)
+			return (int)i;
+	return -1;
 }
 
 /** Join a browser row through the SAME path as the direct-connect screen,
@@ -650,57 +898,302 @@ static void MulJoinServer(cInit *apInit, const cDiscoveredServer &aServer,
 		gpMulJoinFoot->UpdateSize();
 	}
 	apInit->mpMainMenu->SetState(eMainMenuState_MultiplayerJoin);
-	apInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+	MulClickSound(apInit);
+}
+
+/** Double click / Join button / Enter on a row: other version = explain;
+    password = the prompt; otherwise join now. */
+static void MulActivateServer(cInit *apInit, const cDiscoveredServer &aServer)
+{
+	if (!apInit || !apInit->mpNetworkManager || !apInit->mpMainMenu)
+		return;
+	if (!aServer.mbVersionMatch)
+	{
+		MulBrowserNotice("That server runs another version of the mod - both machines need the same zip.");
+		return;
+	}
+	if (aServer.mbPassword)
+	{
+		gMulPendingServer = aServer;
+		if (gpMulTypedPw)
+			gpMulTypedPw->SetAscii("");
+		apInit->mpMainMenu->SetState(eMainMenuState_MultiplayerPassword);
+		MulClickSound(apInit);
+		return;
+	}
+	MulJoinServer(apInit, aServer, false, "");
+}
+
+/** Keeps the page start on a page boundary inside the list. */
+static void MulClampBrowserPage(size_t alCount)
+{
+	if (gMulBrowserFirst < 0 || alCount == 0)
+		gMulBrowserFirst = 0;
+	else if ((size_t)gMulBrowserFirst >= alCount)
+		gMulBrowserFirst = (int)(((alCount - 1) / kMulBrowserRows) * kMulBrowserRows);
+	gMulBrowserFirst -= gMulBrowserFirst % kMulBrowserRows;
+}
+
+/** "12s" / "4m" / "2h" — how long ago the master last heard the host. */
+static tWString MulAgeText(uint16_t alSeconds)
+{
+	if (alSeconds < 60)
+		return cString::To16Char(cString::ToString((int)alSeconds) + "s");
+	if (alSeconds < 3600)
+		return cString::To16Char(cString::ToString((int)(alSeconds / 60)) + "m");
+	return cString::To16Char(cString::ToString((int)(alSeconds / 3600)) + "h");
 }
 
 }
 
-/** 'Internet' / 'LAN' tab: selects the list and refreshes it. */
-class cMainMenuWidget_MultiBrowserTab : public cMainMenuWidget_Button
+//-----------------------------------------------------------------------
+
+/** Decoration only: a dark translucent panel with a title bar, drop shadow
+    and a thin frame (its hit box is off-screen, it never takes a click).
+    abPlayingAs adds "Playing as: <name>" on the right of the title bar;
+    abPendingServer adds the password prompt's server name + address. */
+class cMainMenuWidget_MultiPanel : public cMainMenuWidget
 {
 public:
-	cMainMenuWidget_MultiBrowserTab(cInit *apInit, const cVector3f &avPos, const tWString &lbl,
-									bool abInternet)
-		: cMainMenuWidget_Button(apInit, avPos, lbl, eMainMenuState_LastEnum, 20, eFontAlign_Center)
-		, mbInternet(abInternet)
+	cMainMenuWidget_MultiPanel(cInit *apInit, const cRect2f &aBox, const tWString &asTitle,
+							   bool abPlayingAs = false, bool abPendingServer = false)
+		: cMainMenuWidget(apInit, cVector3f(aBox.x, aBox.y, 40), cVector2f(0, 0))
+		, mBox(aBox), msTitle(asTitle), mbPlayingAs(abPlayingAs), mbPendingServer(abPendingServer)
 	{
+		mpFont = MulMenuFont(apInit);
+		mRect = cRect2f(-1000, -1000, 0, 0);
+	}
+
+	void OnDraw()
+	{
+		const float x = mBox.x, y = mBox.y, w = mBox.w, h = mBox.h;
+		MulFillRect(mpDrawer, x + 5, y + 5, w, h, 28, cColor(0, 0, 0, 0.45f)); /* shadow */
+		MulFillRect(mpDrawer, x, y, w, h, 30, MulColPanel());
+		MulFillRect(mpDrawer, x, y, w, 26, 31, MulColTitleBar());
+		MulFillRect(mpDrawer, x, y + 26, w, 1, 32, MulColAccent());
+		MulFrameRect(mpDrawer, x, y, w, h, 32, MulColBorder());
+		MulText(mpFont, x + 12, y + 4, 40, 19, MulColTextBright(), eFontAlign_Left, msTitle);
+
+		if (mbPlayingAs && mpInit->mpNetworkManager)
+		{
+			const tString sName = mpInit->mpNetworkManager->GetLocalPlayerName();
+			const tWString wsName = sName.empty() ? tWString(_W("(no name)")) : cString::To16Char(sName);
+			const tWString wsLine = MulFitText(mpFont, 13, _W("Playing as: ") + wsName, w * 0.45f);
+			MulText(mpFont, x + w - 12, y + 7, 40, 13, MulColText(), eFontAlign_Right, wsLine);
+		}
+
+		if (mbPendingServer)
+		{
+			const cDiscoveredServer &sv = gMulPendingServer;
+			const tWString wsName = cString::To16Char(sv.msName.empty() ? tString("(unnamed)") : sv.msName);
+			MulText(mpFont, x + w / 2, y + 38, 40, 18, MulColTextBright(), eFontAlign_Center,
+					MulFitText(mpFont, 18, wsName, w - 40));
+			tString sSub = sv.msAddress;
+			if (!sv.msMap.empty())
+				sSub += "   -   " + sv.msMap;
+			if (sv.mlMaxPlayers > 0)
+				sSub += "   -   " + cString::ToString((int)sv.mlPlayerCount) + "/" +
+						cString::ToString((int)sv.mlMaxPlayers) + " players";
+			MulText(mpFont, x + w / 2, y + 62, 40, 13, MulColTextDim(), eFontAlign_Center,
+					MulFitText(mpFont, 13, cString::To16Char(sSub), w - 40));
+		}
+	}
+
+private:
+	iFontData *mpFont;
+	cRect2f mBox;
+	tWString msTitle;
+	bool mbPlayingAs;
+	bool mbPendingServer;
+};
+
+//-----------------------------------------------------------------------
+
+/** A boxed button: dark fill + frame, brighter fill on hover (fading like
+    the menu's text buttons), accent fill when IsSelected() (tabs), greyed
+    and inert when !IsEnabled(), not drawn at all when !IsVisible(). The
+    hit box is the whole box. With aNextState != LastEnum a click goes to
+    that state like cMainMenuWidget_Button; subclasses override OnPress. */
+class cMainMenuWidget_MultiBoxButton : public cMainMenuWidget_Button
+{
+public:
+	cMainMenuWidget_MultiBoxButton(cInit *apInit, const cRect2f &aBox, const tWString &asText,
+								   eMainMenuState aNextState = eMainMenuState_LastEnum,
+								   float afFontSize = 17)
+		: cMainMenuWidget_Button(apInit, cVector3f(aBox.x + aBox.w / 2, aBox.y + (aBox.h - afFontSize) / 2, 40),
+								 asText, aNextState, afFontSize, eFontAlign_Center)
+		, mBox(aBox)
+	{
+		mRect = aBox;
+	}
+
+	virtual bool IsEnabled() { return true; }
+	virtual bool IsSelected() { return false; }
+	virtual bool IsVisible() { return true; }
+
+	virtual void OnPress()
+	{
+		if (mNextState != eMainMenuState_LastEnum)
+			cMainMenuWidget_Button::OnMouseDown(eMButton_Left); /* SetState + click */
 	}
 
 	virtual void OnMouseDown(eMButton aButton)
 	{
 		(void)aButton;
-		gMulBrowserInternet = mbInternet;
-		gMulBrowserNoticeLeft = 0;
-		MulRefreshBrowser(mpInit);
-		mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+		if (!IsVisible() || !IsEnabled())
+			return;
+		OnPress();
+	}
+
+	virtual void OnMouseOver(bool abOver)
+	{
+		cMainMenuWidget_Button::OnMouseOver(abOver && IsVisible() && IsEnabled());
 	}
 
 	virtual void OnDraw()
 	{
-		cMainMenuWidget_Button::OnDraw();
-		if (gMulBrowserInternet == mbInternet) /* the selected tab reads bright */
-			mpFont->Draw(mvPositon, mvFontSize, cColor(1.0f, 1), mAlignment, msText.c_str());
+		if (!IsVisible())
+			return;
+		const bool bEnabled = IsEnabled();
+		const bool bSel = IsSelected();
+		const float x = mBox.x, y = mBox.y, w = mBox.w, h = mBox.h;
+		const float fA = bEnabled ? mfAlpha : 0.0f;
+
+		cColor colFill = bSel ? cColor(0.08f, 0.2f, 0.52f, 0.92f) : MulColBox();
+		if (!bEnabled)
+			colFill = cColor(0.05f, 0.05f, 0.07f, 0.6f);
+		MulFillRect(mpDrawer, x, y, w, h, 33, colFill);
+		if (fA > 0)
+		{
+			const cColor colHover = MulColBoxHover();
+			MulFillRect(mpDrawer, x, y, w, h, 33.5f,
+						cColor(colHover.r, colHover.g, colHover.b, colHover.a * fA * 0.8f));
+		}
+		const cColor colFrame = bSel ? MulColAccent() :
+			(bEnabled ? cColor(0.3f + 0.25f * fA, 0.35f + 0.25f * fA, 0.5f + 0.4f * fA, 0.75f + 0.25f * fA)
+					  : cColor(0.2f, 0.2f, 0.25f, 0.5f));
+		MulFrameRect(mpDrawer, x, y, w, h, 34, colFrame);
+		if (bSel)
+			MulFillRect(mpDrawer, x, y, w, 2, 34.5f, MulColAccent()); /* tab accent on top */
+
+		const cColor colText = !bEnabled ? cColor(0.35f, 1.0f) :
+			(bSel ? MulColTextBright() : cColor(0.7f + 0.3f * fA, 1.0f));
+		if (fA > 0)
+			MulText(mpFont, mvPositon.x + 1, mvPositon.y + 1, 39, mvFontSize.y,
+					cColor(0.1f, 0.32f, 1.0f, fA * 0.8f), eFontAlign_Center, msText);
+		MulText(mpFont, mvPositon.x, mvPositon.y, 40, mvFontSize.y, colText, eFontAlign_Center, msText);
+	}
+
+protected:
+	cRect2f mBox;
+};
+
+//-----------------------------------------------------------------------
+
+/** 'Internet' / 'LAN' tab: selects the list and refreshes it. */
+class cMainMenuWidget_MultiBrowserTab : public cMainMenuWidget_MultiBoxButton
+{
+public:
+	cMainMenuWidget_MultiBrowserTab(cInit *apInit, const cRect2f &aBox, const tWString &lbl,
+									bool abInternet)
+		: cMainMenuWidget_MultiBoxButton(apInit, aBox, lbl)
+		, mbInternet(abInternet)
+	{
+	}
+
+	virtual bool IsSelected() { return gMulBrowserInternet == mbInternet; }
+
+	virtual void OnPress()
+	{
+		if (gMulBrowserInternet != mbInternet)
+		{
+			gMulBrowserSelAddr = "";
+			gMulBrowserFirst = 0;
+		}
+		gMulBrowserInternet = mbInternet;
+		gMulBrowserNoticeLeft = 0;
+		MulRefreshBrowser(mpInit);
+		MulClickSound(mpInit);
 	}
 
 private:
 	bool mbInternet;
 };
 
-class cMainMenuWidget_MultiBrowserRefresh : public cMainMenuWidget_Button
+class cMainMenuWidget_MultiBrowserRefresh : public cMainMenuWidget_MultiBoxButton
 {
 public:
-	cMainMenuWidget_MultiBrowserRefresh(cInit *apInit, const cVector3f &avPos, const tWString &lbl)
-		: cMainMenuWidget_Button(apInit, avPos, lbl, eMainMenuState_LastEnum, 20, eFontAlign_Center)
+	cMainMenuWidget_MultiBrowserRefresh(cInit *apInit, const cRect2f &aBox, const tWString &lbl)
+		: cMainMenuWidget_MultiBoxButton(apInit, aBox, lbl)
 	{
 	}
 
-	virtual void OnMouseDown(eMButton aButton)
+	virtual void OnPress()
 	{
-		(void)aButton;
 		gMulBrowserNoticeLeft = 0;
 		MulRefreshBrowser(mpInit);
-		mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+		MulClickSound(mpInit);
 	}
+};
+
+/** 'Join': the selected row (disabled while nothing is selected). */
+class cMainMenuWidget_MultiBrowserJoin : public cMainMenuWidget_MultiBoxButton
+{
+public:
+	cMainMenuWidget_MultiBrowserJoin(cInit *apInit, const cRect2f &aBox, const tWString &lbl)
+		: cMainMenuWidget_MultiBoxButton(apInit, aBox, lbl)
+	{
+	}
+
+	virtual bool IsEnabled() { return MulBrowserSelectedIndex(mpInit) >= 0; }
+
+	virtual void OnPress()
+	{
+		const int lSel = MulBrowserSelectedIndex(mpInit);
+		const std::vector<cDiscoveredServer> *pList = MulBrowserList(mpInit);
+		if (lSel >= 0 && pList)
+			MulActivateServer(mpInit, (*pList)[(size_t)lSel]);
+	}
+};
+
+/** Pager arrows under the list; only there when the list has more rows
+    than fit. */
+class cMainMenuWidget_MultiBrowserPage : public cMainMenuWidget_MultiBoxButton
+{
+public:
+	cMainMenuWidget_MultiBrowserPage(cInit *apInit, const cRect2f &aBox, int alDir)
+		: cMainMenuWidget_MultiBoxButton(apInit, aBox, alDir < 0 ? _W("<") : _W(">"),
+										 eMainMenuState_LastEnum, 15)
+		, mlDir(alDir)
+	{
+	}
+
+	virtual bool IsVisible()
+	{
+		const std::vector<cDiscoveredServer> *pList = MulBrowserList(mpInit);
+		return pList && (int)pList->size() > kMulBrowserRows;
+	}
+
+	virtual bool IsEnabled()
+	{
+		const std::vector<cDiscoveredServer> *pList = MulBrowserList(mpInit);
+		if (pList == NULL)
+			return false;
+		if (mlDir < 0)
+			return gMulBrowserFirst > 0;
+		return gMulBrowserFirst + kMulBrowserRows < (int)pList->size();
+	}
+
+	virtual void OnPress()
+	{
+		gMulBrowserFirst += mlDir * kMulBrowserRows;
+		const std::vector<cDiscoveredServer> *pList = MulBrowserList(mpInit);
+		MulClampBrowserPage(pList ? pList->size() : 0);
+		MulClickSound(mpInit);
+	}
+
+private:
+	int mlDir;
 };
 
 /** Multiplayer menu -> browser, refreshing on the way so it is never blank. */
@@ -715,119 +1208,245 @@ public:
 	virtual void OnMouseDown(eMButton aButton)
 	{
 		cMainMenuWidget_MainButton::OnMouseDown(aButton);
+		gMulBrowserNoticeLeft = 0;
 		MulRefreshBrowser(mpInit);
 	}
 };
 
-/** One list slot: "name | map | players/max | [pw] | age". Empty slots draw
-    nothing and ignore clicks; version-mismatched servers draw greyed. */
-class cMainMenuWidget_MultiServerRow : public cMainMenuWidget_Button
+//-----------------------------------------------------------------------
+
+/** The list frame (decoration, no clicks): column header strip, the list
+    background, a scroll thumb on the right when there is more than one
+    page, the centred 'Searching...' / 'No servers' message on an empty
+    list, and the status line + 'n/m' page label under it. */
+class cMainMenuWidget_MultiBrowserTable : public cMainMenuWidget
 {
 public:
-	cMainMenuWidget_MultiServerRow(cInit *apInit, const cVector3f &avPos, int alIndex, float afWidth)
-		: cMainMenuWidget_Button(apInit, avPos, _W(""), eMainMenuState_LastEnum, 13, eFontAlign_Left)
-		, mlIndex(alIndex)
+	cMainMenuWidget_MultiBrowserTable(cInit *apInit)
+		: cMainMenuWidget(apInit, cVector3f(kMulBrListX, kMulBrHeaderY, 40), cVector2f(0, 0))
+		, mfTime(0)
+	{
+		mpFont = MulMenuFont(apInit);
+		mRect = cRect2f(-1000, -1000, 0, 0);
+	}
+
+	void OnUpdate(float afTimeStep) { mfTime += afTimeStep; }
+
+	void OnDraw()
+	{
+		const std::vector<cDiscoveredServer> *pList = MulBrowserList(mpInit);
+		const size_t lCount = pList ? pList->size() : 0;
+		const float fRowsH = kMulBrRowH * kMulBrowserRows;
+
+		/* header strip + labels */
+		MulFillRect(mpDrawer, kMulBrListX, kMulBrHeaderY, kMulBrListW, kMulBrHeaderH, 33,
+					cColor(0.09f, 0.11f, 0.2f, 0.95f));
+		MulFillRect(mpDrawer, kMulBrListX, kMulBrHeaderY + kMulBrHeaderH - 1, kMulBrListW, 1, 34,
+					MulColBorder());
+		const float fHy = kMulBrHeaderY + 3;
+		const cColor colHead(0.66f, 0.74f, 0.95f, 1.0f);
+		MulDrawLock(mpDrawer, kMulColLockX - 1, kMulBrHeaderY + 4, 35, cColor(0.5f, 0.56f, 0.75f, 0.9f));
+		MulText(mpFont, kMulColNameX, fHy, 40, 13, colHead, eFontAlign_Left, _W("Name"));
+		MulText(mpFont, kMulColMapX, fHy, 40, 13, colHead, eFontAlign_Left, _W("Map"));
+		MulText(mpFont, kMulColPlayersX, fHy, 40, 13, colHead, eFontAlign_Center, _W("Players"));
+		MulText(mpFont, kMulColSeenX, fHy, 40, 13, colHead, eFontAlign_Center,
+				gMulBrowserInternet ? _W("Seen") : _W("Where"));
+
+		/* list background + frame */
+		MulFillRect(mpDrawer, kMulBrListX, kMulBrRowsY, kMulBrListW, fRowsH, 31,
+					cColor(0.01f, 0.01f, 0.03f, 0.55f));
+		MulFrameRect(mpDrawer, kMulBrListX - 1, kMulBrHeaderY - 1, kMulBrListW + 2,
+					 kMulBrRowsY + fRowsH - kMulBrHeaderY + 2, 34, cColor(0.2f, 0.24f, 0.38f, 0.8f));
+
+		/* scroll indicator: track + thumb, only with more than one page */
+		if ((int)lCount > kMulBrowserRows)
+		{
+			const float fTrackX = kMulBrListX + kMulBrListW + 5;
+			MulFillRect(mpDrawer, fTrackX, kMulBrRowsY, 5, fRowsH, 33, cColor(0.1f, 0.12f, 0.2f, 0.9f));
+			const float fThumbH = fRowsH * (float)kMulBrowserRows / (float)lCount;
+			const float fThumbY = kMulBrRowsY + fRowsH * (float)gMulBrowserFirst / (float)lCount;
+			MulFillRect(mpDrawer, fTrackX, fThumbY, 5, fThumbH, 34, MulColAccent());
+		}
+
+		/* empty list: say why in the middle of it */
+		if (lCount == 0 && mpInit->mpNetworkManager)
+		{
+			cNetworkManager *nm = mpInit->mpNetworkManager;
+			const bool bBusy = gMulBrowserInternet ? nm->IsInternetRefreshActive() : nm->IsDiscoveryActive();
+			const float fMidY = kMulBrRowsY + fRowsH / 2 - 16;
+			const float fMidX = kMulBrListX + kMulBrListW / 2;
+			if (bBusy)
+			{
+				tWString sDots = _W("Searching");
+				const int lDots = ((int)(mfTime * 3.0f)) % 4;
+				for (int d = 0; d < lDots; ++d)
+					sDots += _W(".");
+				MulText(mpFont, fMidX, fMidY + 6, 40, 18, MulColText(), eFontAlign_Center, sDots);
+			}
+			else
+			{
+				MulText(mpFont, fMidX, fMidY, 40, 18, MulColText(), eFontAlign_Center, _W("No servers found"));
+				MulText(mpFont, fMidX, fMidY + 24, 40, 13, MulColTextDim(), eFontAlign_Center,
+						gMulBrowserInternet ? _W("Try the LAN tab, Refresh, or Direct connect.")
+											: _W("Try the Internet tab, Refresh, or Direct connect."));
+			}
+		}
+
+		/* dividers: above the character picker and above the buttons */
+		MulFillRect(mpDrawer, kMulBrListX, 479, kMulBrListW, 1, 32, cColor(0.2f, 0.24f, 0.38f, 0.7f));
+		MulFillRect(mpDrawer, kMulBrListX, 541, kMulBrListW, 1, 32, cColor(0.2f, 0.24f, 0.38f, 0.7f));
+
+		/* status line (left) + page label (between the pager arrows) */
+		const bool bPaged = (int)lCount > kMulBrowserRows;
+		cColor colStatus = MulColText();
+		if (gMulBrowserStatusKind == 1)
+			colStatus = cColor(0.75f, 0.82f, 1.0f, 0.65f + 0.35f * (float)fabs(sin(mfTime * 3.0f)));
+		else if (gMulBrowserStatusKind == 2 || gMulBrowserStatusKind == 3)
+			colStatus = MulColWarn();
+		MulText(mpFont, kMulBrListX + 2, kMulBrStatusY + 3, 40, 13, colStatus, eFontAlign_Left,
+				MulFitText(mpFont, 13, gMulBrowserStatus, bPaged ? 420.0f : kMulBrListW - 4));
+		if (bPaged)
+		{
+			const int lPages = (int)((lCount + kMulBrowserRows - 1) / kMulBrowserRows);
+			const int lPage = gMulBrowserFirst / kMulBrowserRows + 1;
+			MulText(mpFont, 519, kMulBrStatusY + 3, 40, 13, MulColText(), eFontAlign_Center,
+					cString::To16Char(cString::ToString(lPage) + "/" + cString::ToString(lPages)));
+		}
+	}
+
+private:
+	iFontData *mpFont;
+	float mfTime;
+};
+
+//-----------------------------------------------------------------------
+
+/** One list slot (index gMulBrowserFirst + slot of the current tab's
+    list): lock | name | map | players/max | seen. Click selects, a second
+    click on the selected row within 0.45 s (or the engine's double click,
+    or Join / Enter) joins. Other-version servers draw grey and explain
+    themselves instead of joining. Every slot draws its stripe, so the
+    table keeps its shape while the list is short. */
+class cMainMenuWidget_MultiServerRow : public cMainMenuWidget
+{
+public:
+	cMainMenuWidget_MultiServerRow(cInit *apInit, const cRect2f &aRect, int alSlot)
+		: cMainMenuWidget(apInit, cVector3f(aRect.x, aRect.y, 40), cVector2f(0, 0))
+		, mlSlot(alSlot)
 		, mbHasServer(false)
 		, mServer()
 	{
-		/* Fixed-width hit box: the whole line is clickable, text length aside. */
-		mRect.x = avPos.x;
-		mRect.w = afWidth;
-		mRect.h = mvFontSize.y + 5;
+		mpFont = MulMenuFont(apInit);
+		mRect = aRect;
+		mbOver = false;
 	}
 
-	/** Mirror slot mlIndex of the list the current tab shows. */
+	/** Mirror slot mlSlot of the current page of the list. */
 	void SyncFromList(const std::vector<cDiscoveredServer> &avList)
 	{
-		const bool bHas = mlIndex >= 0 && (size_t)mlIndex < avList.size();
-		if (!bHas)
-		{
-			if (mbHasServer)
-			{
-				mbHasServer = false;
-				msText = _W("");
-			}
-			return;
-		}
-		const cDiscoveredServer &sv = avList[(size_t)mlIndex];
-		tString s = sv.msName.empty() ? tString("(unnamed)") : sv.msName;
-		s += "  |  ";
-		s += sv.msMap.empty() ? tString("-") : sv.msMap;
-		s += "  |  " + cString::ToString((int)sv.mlPlayerCount) + "/" +
-			 cString::ToString((int)sv.mlMaxPlayers);
-		if (sv.mbPassword)
-			s += "  |  [pw]";
-		s += "  |  ";
-		s += sv.mbInternet ? (cString::ToString((int)sv.mlAgeSeconds) + "s ago") : tString("LAN");
-		if (!sv.mbVersionMatch)
-			s += "  |  other version";
-		const tWString ws = cString::To16Char(s);
-		if (!mbHasServer || ws != msText || mServer.msAddress != sv.msAddress)
-		{
-			mbHasServer = true;
-			mServer = sv;
-			msText = ws;
-		}
+		const int lIdx = gMulBrowserFirst + mlSlot;
+		mbHasServer = lIdx >= 0 && (size_t)lIdx < avList.size();
+		if (mbHasServer)
+			mServer = avList[(size_t)lIdx];
 	}
+
+	virtual void OnMouseOver(bool abOver) { mbOver = abOver; }
 
 	virtual void OnMouseDown(eMButton aButton)
 	{
 		(void)aButton;
 		if (!mbHasServer || !mpInit->mpNetworkManager || !mpInit->mpMainMenu)
 			return;
-		if (!mServer.mbVersionMatch)
+		const bool bSame = gMulBrowserSelAddr == mServer.msAddress;
+		if (bSame && gMulBrowserClock - gMulBrowserLastClick < 0.45f)
 		{
-			MulBrowserNotice("That server runs another version of the mod - both machines need the same zip.");
+			gMulBrowserLastClick = -10;
+			MulActivateServer(mpInit, mServer);
 			return;
 		}
-		if (mServer.mbPassword)
+		gMulBrowserSelAddr = mServer.msAddress;
+		gMulBrowserLastClick = gMulBrowserClock;
+		gMulBrowserNoticeLeft = 0;
+		MulClickSound(mpInit);
+	}
+
+	virtual void OnDoubleClick(eMButton aButton)
+	{
+		(void)aButton;
+		if (mbHasServer && gMulBrowserSelAddr == mServer.msAddress)
 		{
-			gMulPendingServer = mServer;
-			if (gpMulPwTitle)
-			{
-				gpMulPwTitle->msText = cString::To16Char(
-					"Password for '" + mServer.msName + "'  (" + mServer.msAddress + ")");
-				gpMulPwTitle->UpdateSize();
-			}
-			if (gpMulTypedPw)
-				gpMulTypedPw->SetAscii("");
-			mpInit->mpMainMenu->SetState(eMainMenuState_MultiplayerPassword);
-			mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
-			return;
+			gMulBrowserLastClick = -10;
+			MulActivateServer(mpInit, mServer);
 		}
-		MulJoinServer(mpInit, mServer, false, "");
 	}
 
 	virtual void OnDraw()
 	{
+		const float x = mRect.x, y = mRect.y, w = mRect.w, h = mRect.h;
+		if (mlSlot % 2 == 1)
+			MulFillRect(mpDrawer, x, y, w, h, 32, cColor(0.6f, 0.7f, 1.0f, 0.05f));
 		if (!mbHasServer)
 			return;
-		if (!mServer.mbVersionMatch)
+
+		const bool bSel = gMulBrowserSelAddr == mServer.msAddress;
+		const bool bMatch = mServer.mbVersionMatch;
+		if (bSel)
 		{
-			mpFont->Draw(mvPositon, mvFontSize, cColor(0.4f, 1), mAlignment, msText.c_str());
-			return;
+			MulFillRect(mpDrawer, x, y, w, h, 33, MulColSelected());
+			MulFillRect(mpDrawer, x, y, 3, h, 34, MulColAccent());
 		}
-		cMainMenuWidget_Button::OnDraw();
+		else if (mbOver)
+		{
+			MulFillRect(mpDrawer, x, y, w, h, 33, cColor(0.12f, 0.18f, 0.42f, 0.55f));
+		}
+
+		const cColor colBase = !bMatch ? cColor(0.4f, 1.0f) :
+			(bSel ? MulColTextBright() : (mbOver ? cColor(0.92f, 1.0f) : cColor(0.74f, 1.0f)));
+		const float fTy = y + 4;
+
+		if (mServer.mbPassword)
+			MulDrawLock(mpDrawer, kMulColLockX - 1, y + 5, 35, bMatch ? MulColGold() : cColor(0.45f, 1.0f));
+
+		const tWString wsName = cString::To16Char(mServer.msName.empty() ? tString("(unnamed)") : mServer.msName);
+		MulText(mpFont, kMulColNameX, fTy, 40, 14, colBase, eFontAlign_Left,
+				MulFitText(mpFont, 14, wsName, kMulColNameW));
+
+		if (!bMatch)
+			MulText(mpFont, kMulColMapX, fTy + 1, 40, 13, MulColWarn(), eFontAlign_Left,
+					_W("other mod version"));
+		else
+			MulText(mpFont, kMulColMapX, fTy, 40, 14, colBase, eFontAlign_Left,
+					MulFitText(mpFont, 14, cString::To16Char(mServer.msMap.empty() ? tString("-") : mServer.msMap),
+							   kMulColMapW));
+
+		const bool bFull = mServer.mlMaxPlayers > 0 && mServer.mlPlayerCount >= mServer.mlMaxPlayers;
+		const tWString wsPlayers = cString::To16Char(cString::ToString((int)mServer.mlPlayerCount) + "/" +
+													 cString::ToString((int)mServer.mlMaxPlayers));
+		MulText(mpFont, kMulColPlayersX, fTy, 40, 14, (bFull && bMatch) ? MulColWarn() : colBase,
+				eFontAlign_Center, wsPlayers);
+
+		MulText(mpFont, kMulColSeenX, fTy + 1, 40, 13, bSel ? colBase : MulColTextDim(), eFontAlign_Center,
+				mServer.mbInternet ? MulAgeText(mServer.mlAgeSeconds) : tWString(_W("LAN")));
 	}
 
 private:
-	int mlIndex;
+	iFontData *mpFont;
+	int mlSlot;
 	bool mbHasServer;
 	cDiscoveredServer mServer;
 };
 
 /** Password screen 'Join': stores the typed password, joins the pending row. */
-class cMainMenuWidget_MultiPwJoin : public cMainMenuWidget_Button
+class cMainMenuWidget_MultiPwJoin : public cMainMenuWidget_MultiBoxButton
 {
 public:
-	cMainMenuWidget_MultiPwJoin(cInit *apInit, const cVector3f &avPos, const tWString &lbl)
-		: cMainMenuWidget_Button(apInit, avPos, lbl, eMainMenuState_LastEnum, 24, eFontAlign_Center)
+	cMainMenuWidget_MultiPwJoin(cInit *apInit, const cRect2f &aBox, const tWString &lbl)
+		: cMainMenuWidget_MultiBoxButton(apInit, aBox, lbl)
 	{
 	}
 
-	virtual void OnMouseDown(eMButton aButton)
+	virtual void OnPress()
 	{
-		(void)aButton;
 		if (!gpMulTypedPw)
 			return;
 		MulJoinServer(mpInit, gMulPendingServer, true, gpMulTypedPw->GetAscii());
@@ -868,114 +1487,377 @@ public:
 };
 
 //-----------------------------------------------------------------------
-// v18: character picker line (Multiplayer screen, Direct-connect / join
-// status screen, host lobby).
+// v18: character picker (Multiplayer screen, Direct-connect / join status
+// screen, server browser, host lobby).
 //-----------------------------------------------------------------------
 
 namespace {
 
-/** The picker line's text. Host: 'You play Philip' (slot 0, locked).
-    Guest / offline: 'Character: < Red >' = the saved preference (else, while
-    connected, what the host gave us; else 'any'), plus why it is not what
-    we play: '(taken)' when somebody else holds it, '(playing X)' while the
-    host has not (or would not) move us, '(host only)' / '(not installed)'
-    for a hand-edited character= the picker never produces. */
-static tString MulCharacterLine(cInit *apInit)
+/** Philip is the host's character (cNetworkManager::IsCharacterSelectable
+    rule since v19: by NAME, so a list without him has no host-only entry).
+    Only used to LABEL a chip '(host)'; what may be picked is always
+    IsCharacterSelectable's answer. */
+static bool MulIsHostCharacter(const tString &asBase)
 {
-	cNetworkManager *nm = apInit ? apInit->mpNetworkManager : NULL;
-	if (nm == NULL)
-		return "Character: -";
-	if (nm->IsHosting())
+	tString s = asBase;
+	for (size_t i = 0; i < s.size(); ++i)
+		s[i] = (char)std::tolower((unsigned char)s[i]);
+	return s == "phillip";
+}
+
+/** The host's own character: what it plays, else Philip, else entry 0. */
+static tString MulHostCharacterName(cNetworkManager *nm)
+{
+	tString sHost = nm->GetLocalCharacterName();
+	if (!sHost.empty())
+		return sHost;
+	for (size_t i = 0; i < nm->GetCharacterListSize(); ++i)
+		if (MulIsHostCharacter(nm->GetCharacterBaseName(i)))
+			return nm->GetCharacterBaseName(i);
+	return nm->GetCharacterBaseName(0);
+}
+
+/** The next (alDir=+1) / previous (-1) selectable character after
+    asFrom, wrapping; "" or unknown asFrom starts at the list's edge. Its
+    own entry when it is the only selectable one, "" when none is. */
+static tString MulStepCharacter(cNetworkManager *nm, const tString &asFrom, int alDir)
+{
+	const int n = (int)nm->GetCharacterListSize();
+	if (n <= 0)
+		return "";
+	const int lCur = nm->FindCharacterIndex(asFrom);
+	const int lStart = lCur >= 0 ? lCur : (alDir > 0 ? n - 1 : 0);
+	for (int s = 1; s <= n; ++s)
 	{
-		tString sHost = nm->GetLocalCharacterName();
-		if (sHost.empty())
-			sHost = nm->GetCharacterBaseName(0);
-		return "You play " + cNetworkManager::GetCharacterDisplayName(sHost) + " (the host's character)";
+		const int i = ((lStart + alDir * s) % n + n) % n;
+		if (nm->IsCharacterSelectable((size_t)i))
+			return nm->GetCharacterBaseName((size_t)i);
 	}
-	if (nm->GetCharacterListSize() == 0)
-		return "Character: (no characters installed)";
-	const bool bConnected = nm->IsClientSynced();
-	const tString sPref = nm->GetCharacterPreference();
-	const tString sActual = bConnected ? nm->GetLocalCharacterName() : tString("");
-	const tString sShown = sPref.empty() ? sActual : sPref;
-	tString sLine = "Character: < " +
-		(sShown.empty() ? tString("any") : cNetworkManager::GetCharacterDisplayName(sShown)) + " >";
-	if (!sPref.empty())
-	{
-		const int lIdx = nm->FindCharacterIndex(sPref);
-		if (lIdx < 0)
-			sLine += " (not installed)";
-		else if (lIdx == 0)
-			sLine += " (host only)";
-		else if (bConnected && nm->IsCharacterTakenByOther(sPref))
-			sLine += " (taken)";
-		else if (bConnected && !sActual.empty() && nm->FindCharacterIndex(sActual) != lIdx)
-			sLine += " (playing " + cNetworkManager::GetCharacterDisplayName(sActual) + ")";
-	}
-	return sLine;
+	return "";
 }
 
 }
 
-/** v18: 'Character: < Red >'. A click picks the next selectable character
-    (never slot 0 = the host's; while connected as a guest never one another
-    player holds; offline every other character), saves character= in
-    multiplayer.cfg and, when connected, asks the host at once — also from
-    the in-game Esc menu, where the host swaps us live. While hosting it
-    only reads 'You play Philip' (no hover, clicks ignored). */
-class cMainMenuWidget_MultiCharacter : public cMainMenuWidget_Button
+/** v18: 'Character:  [<]  Red  [>]'. The arrows step to the previous /
+    next selectable character (wrapping; never the host's Philip; while
+    connected as a guest never one another player holds; offline every
+    other character), a click on the name steps forward, and with chips on
+    a row of every character is drawn under it ('Philip (host)', 'Red
+    (taken)', the current one lit) - a click on a free one picks it. Every
+    pick saves character= in multiplayer.cfg (SetCharacterPreference) and,
+    when connected, asks the host at once - also from the in-game Esc
+    menu, where the host swaps us live. While hosting it only reads 'You
+    play Philip' (no hit box). */
+class cMainMenuWidget_MultiCharacter : public cMainMenuWidget
 {
 public:
-	cMainMenuWidget_MultiCharacter(cInit *apInit, const cVector3f &avPos)
-		: cMainMenuWidget_Button(apInit, avPos, _W("Character: < any >"), eMainMenuState_LastEnum, 18,
-								 eFontAlign_Center)
+	cMainMenuWidget_MultiCharacter(cInit *apInit, const cVector3f &avPos, bool abChips = false,
+								   float afMaxWidth = 520)
+		: cMainMenuWidget(apInit, avPos, cVector2f(0, 0))
+		, mbChips(abChips), mfMaxWidth(afMaxWidth), mbHostLine(false), mbPicker(false)
 	{
-		RefreshLabel();
-	}
-
-	void RefreshLabel()
-	{
-		const tWString wsText = cString::To16Char(MulCharacterLine(mpInit));
-		if (wsText == msText)
-			return;
-		msText = wsText;
-		mRect.w = mpFont->GetLength(mvFontSize, msText.c_str());
-		mRect.x = mvPositon.x - mRect.w / 2;
+		mpFont = MulMenuFont(apInit);
+		mbOver = false;
+		Layout();
 	}
 
 	virtual void OnUpdate(float afTimeStep)
 	{
-		cMainMenuWidget_Button::OnUpdate(afTimeStep);
-		RefreshLabel(); /* the name table can change under us at any time */
+		(void)afTimeStep;
+		Layout(); /* the name table can change under us at any time */
 	}
 
-	virtual void OnActivate()
-	{
-		cMainMenuWidget_Button::OnActivate();
-		RefreshLabel();
-	}
+	virtual void OnActivate() { Layout(); }
 
-	virtual void OnMouseOver(bool abOver)
-	{
-		const bool bHost = mpInit->mpNetworkManager && mpInit->mpNetworkManager->IsHosting();
-		cMainMenuWidget_Button::OnMouseOver(abOver && !bHost); /* the host's line is plain text */
-	}
+	virtual void OnMouseOver(bool abOver) { mbOver = abOver; }
 
 	virtual void OnMouseDown(eMButton aButton)
 	{
 		(void)aButton;
 		cNetworkManager *nm = mpInit->mpNetworkManager;
-		if (nm == NULL || nm->IsHosting())
-			return; /* the host is always slot 0 */
+		if (nm == NULL || nm->IsHosting() || !mbPicker)
+			return; /* the host is always Philip */
+		Layout();
+		tString sPick;
+		if (MulMouseIn(mpInit, mLeftBox))
+			sPick = MulStepCharacter(nm, CurrentFrom(nm), -1);
+		else if (MulMouseIn(mpInit, mRightBox) || MulMouseIn(mpInit, mNameBox))
+			sPick = MulStepCharacter(nm, CurrentFrom(nm), +1);
+		else
+		{
+			for (size_t c = 0; c < mvChips.size(); ++c)
+				if (mvChips[c].mbSelectable && MulMouseIn(mpInit, mvChips[c].mBox))
+					sPick = mvChips[c].msBase;
+		}
+		if (sPick.empty())
+			return; /* nothing selectable (one character, or every other one taken) */
+		nm->SetCharacterPreference(sPick); /* cfg character= + request when connected */
+		Layout();
+		MulClickSound(mpInit);
+	}
+
+	virtual void OnDraw()
+	{
+		const float y = mvPositon.y;
+		if (!mbPicker)
+		{
+			/* host line / no characters: plain centred text */
+			MulText(mpFont, mvPositon.x, y + 2, 40, 18, mbHostLine ? MulColText() : MulColTextDim(),
+					eFontAlign_Center, msLine);
+		}
+		else
+		{
+			MulText(mpFont, mfLabelX, y + 2, 40, 18, MulColText(), eFontAlign_Left, _W("Character:"));
+			DrawArrow(mLeftBox, _W("<"));
+			DrawArrow(mRightBox, _W(">"));
+			const bool bNameHover = mbCanStep && MulMouseIn(mpInit, mNameBox);
+			MulFillRect(mpDrawer, mNameBox.x, mNameBox.y, mNameBox.w, mNameBox.h, 33,
+						bNameHover ? cColor(0.06f, 0.09f, 0.2f, 0.85f) : cColor(0.03f, 0.04f, 0.08f, 0.78f));
+			MulFrameRect(mpDrawer, mNameBox.x, mNameBox.y, mNameBox.w, mNameBox.h, 34,
+						 cColor(0.25f, 0.3f, 0.46f, 0.8f));
+			MulText(mpFont, mNameBox.x + mNameBox.w / 2, y + 2, 40, 18,
+					mbShownBad ? MulColWarn() : MulColTextBright(), eFontAlign_Center, msShown);
+			if (!msStatus.empty())
+				MulText(mpFont, mfStatusX, y + 5, 40, 13, mbShownBad ? MulColWarn() : MulColTextDim(),
+						eFontAlign_Left, msStatus);
+		}
+
+		for (size_t c = 0; c < mvChips.size(); ++c)
+		{
+			const cChip &chip = mvChips[c];
+			const cRect2f &b = chip.mBox;
+			const bool bHover = chip.mbSelectable && MulMouseIn(mpInit, b);
+			cColor colText = MulColText();
+			if (chip.mbCurrent)
+			{
+				MulFillRect(mpDrawer, b.x, b.y, b.w, b.h, 33, cColor(0.08f, 0.2f, 0.52f, 0.92f));
+				MulFrameRect(mpDrawer, b.x, b.y, b.w, b.h, 34, MulColAccent());
+				colText = MulColTextBright();
+			}
+			else if (chip.mbSelectable)
+			{
+				MulFillRect(mpDrawer, b.x, b.y, b.w, b.h, 33, bHover ? MulColBoxHover() : MulColBox());
+				MulFrameRect(mpDrawer, b.x, b.y, b.w, b.h, 34,
+							 bHover ? cColor(0.55f, 0.65f, 1.0f, 1.0f) : cColor(0.3f, 0.35f, 0.5f, 0.75f));
+				colText = bHover ? MulColTextBright() : MulColText();
+			}
+			else
+			{
+				MulFrameRect(mpDrawer, b.x, b.y, b.w, b.h, 34, cColor(0.2f, 0.2f, 0.26f, 0.55f));
+				colText = chip.mbHost ? MulColGold() : cColor(0.4f, 1.0f);
+			}
+			MulText(mpFont, b.x + b.w / 2, b.y + 3, 40, 13, colText, eFontAlign_Center, chip.msText);
+		}
+	}
+
+private:
+	struct cChip
+	{
+		tString msBase;
+		tWString msText;
+		cRect2f mBox;
+		bool mbSelectable;
+		bool mbCurrent;
+		bool mbHost;
+	};
+
+	iFontData *mpFont;
+	bool mbChips;
+	float mfMaxWidth;
+	bool mbHostLine;   /* hosting: 'You play Philip' */
+	bool mbPicker;     /* guest / offline with characters: the arrows line */
+	bool mbCanStep;    /* some other character is selectable */
+	bool mbShownBad;   /* shown pick is not what we get (taken / host only / missing) */
+	tWString msLine;   /* !mbPicker text */
+	tWString msShown;  /* the name in the field */
+	tWString msStatus; /* '(taken)' etc. right of the arrows */
+	float mfLabelX;
+	float mfStatusX;
+	cRect2f mLeftBox, mNameBox, mRightBox;
+	std::vector<cChip> mvChips;
+
+	/** What the arrows step from: the preference, else (connected) what
+	    the host gave us. */
+	tString CurrentFrom(cNetworkManager *nm)
+	{
 		tString sFrom = nm->GetCharacterPreference();
 		if (sFrom.empty() && nm->IsClientSynced())
-			sFrom = nm->GetLocalCharacterName(); /* no preference yet: step on from what we play */
-		const tString sNext = nm->GetNextSelectableCharacter(sFrom);
-		if (sNext.empty())
-			return; /* nothing selectable (one character, or every other one taken) */
-		nm->SetCharacterPreference(sNext); /* cfg character= + request when connected */
-		RefreshLabel();
-		mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click", false, 1);
+			sFrom = nm->GetLocalCharacterName();
+		return sFrom;
+	}
+
+	void DrawArrow(const cRect2f &b, const wchar_t *asText)
+	{
+		const bool bHover = mbCanStep && MulMouseIn(mpInit, b);
+		MulFillRect(mpDrawer, b.x, b.y, b.w, b.h, 33,
+					!mbCanStep ? cColor(0.05f, 0.05f, 0.07f, 0.6f) : (bHover ? MulColBoxHover() : MulColBox()));
+		MulFrameRect(mpDrawer, b.x, b.y, b.w, b.h, 34,
+					 !mbCanStep ? cColor(0.2f, 0.2f, 0.25f, 0.5f) :
+					 (bHover ? cColor(0.55f, 0.65f, 1.0f, 1.0f) : cColor(0.3f, 0.35f, 0.5f, 0.8f)));
+		MulText(mpFont, b.x + b.w / 2, b.y + 2, 40, 17,
+				!mbCanStep ? cColor(0.35f, 1.0f) : (bHover ? MulColTextBright() : MulColText()),
+				eFontAlign_Center, asText);
+	}
+
+	/** Rebuilds texts, boxes and chips from the network manager (cheap:
+	    a handful of GetLength calls) and sets the hit box around them. */
+	void Layout()
+	{
+		cNetworkManager *nm = mpInit->mpNetworkManager;
+		const float cx = mvPositon.x, y = mvPositon.y;
+		const float kSize = 18, kArrowW = 24, kBoxH = 24, kGap = 8;
+		mvChips.clear();
+		mbHostLine = false;
+		mbPicker = false;
+		mbCanStep = false;
+		mbShownBad = false;
+		msStatus = _W("");
+		float fLeft = cx, fRight = cx;
+
+		if (nm == NULL || nm->GetCharacterListSize() == 0)
+		{
+			msLine = nm == NULL ? tWString(_W("Character: -")) : tWString(_W("Character: (no characters installed)"));
+			const float w = MulTextWidth(mpFont, kSize, msLine);
+			fLeft = cx - w / 2;
+			fRight = cx + w / 2;
+		}
+		else if (nm->IsHosting())
+		{
+			mbHostLine = true;
+			msLine = cString::To16Char("You play " +
+				cNetworkManager::GetCharacterDisplayName(MulHostCharacterName(nm)) + " (the host's character)");
+			const float w = MulTextWidth(mpFont, kSize, msLine);
+			fLeft = cx - w / 2;
+			fRight = cx + w / 2;
+		}
+		else
+		{
+			mbPicker = true;
+			const bool bConnected = nm->IsClientSynced();
+			const tString sPref = nm->GetCharacterPreference();
+			const tString sActual = bConnected ? nm->GetLocalCharacterName() : tString("");
+			const tString sShown = sPref.empty() ? sActual : sPref;
+			msShown = cString::To16Char(sShown.empty() ? tString("Any") :
+				cNetworkManager::GetCharacterDisplayName(sShown));
+			tString sStatus;
+			if (!sPref.empty())
+			{
+				const int lIdx = nm->FindCharacterIndex(sPref);
+				if (lIdx < 0)
+					sStatus = "(not installed)";
+				else if (MulIsHostCharacter(sPref))
+					sStatus = "(host only)";
+				else if (bConnected && nm->IsCharacterTakenByOther(sPref))
+					sStatus = "(taken)";
+				else if (bConnected && !sActual.empty() && nm->FindCharacterIndex(sActual) != lIdx)
+					sStatus = "(playing " + cNetworkManager::GetCharacterDisplayName(sActual) + ")";
+				mbShownBad = !sStatus.empty();
+			}
+			else if (!bConnected)
+				sStatus = "(the host picks)";
+			msStatus = cString::To16Char(sStatus);
+
+			/* a step goes somewhere new, or fixes a pick we cannot have */
+			const tString sNext = MulStepCharacter(nm, CurrentFrom(nm), +1);
+			mbCanStep = !sNext.empty() &&
+				(nm->FindCharacterIndex(sNext) != nm->FindCharacterIndex(CurrentFrom(nm)) || mbShownBad ||
+				 sPref.empty());
+
+			/* the name field fits the longest name, so the arrows stay put */
+			float fNameW = MulTextWidth(mpFont, kSize, msShown);
+			for (size_t i = 0; i < nm->GetCharacterListSize(); ++i)
+			{
+				const float w = MulTextWidth(mpFont, kSize, cString::To16Char(
+					cNetworkManager::GetCharacterDisplayName(nm->GetCharacterBaseName(i))));
+				if (w > fNameW)
+					fNameW = w;
+			}
+			fNameW += 24;
+			if (fNameW < 120)
+				fNameW = 120;
+			const float fLabelW = MulTextWidth(mpFont, kSize, _W("Character:"));
+			const float fStatusW = msStatus.empty() ? 0 : MulTextWidth(mpFont, 13, msStatus) + kGap;
+			const float fTotal = fLabelW + kGap + kArrowW + 4 + fNameW + 4 + kArrowW + fStatusW;
+			float x = cx - fTotal / 2;
+			fLeft = x;
+			mfLabelX = x;
+			x += fLabelW + kGap;
+			mLeftBox = cRect2f(x, y, kArrowW, kBoxH);
+			x += kArrowW + 4;
+			mNameBox = cRect2f(x, y, fNameW, kBoxH);
+			x += fNameW + 4;
+			mRightBox = cRect2f(x, y, kArrowW, kBoxH);
+			x += kArrowW;
+			mfStatusX = x + kGap;
+			fRight = x + fStatusW;
+		}
+
+		float fBottom = y + kBoxH;
+		if (mbChips && nm != NULL && nm->GetCharacterListSize() > 0)
+		{
+			/* one chip per character, wrapped into centred rows */
+			/* lit chip = what we get: the host's own; a guest's usable
+			   preference, else (connected) what the host gave us - never a
+			   hand-edited host-only / taken pick */
+			int lCurIdx = -1;
+			if (mbHostLine)
+				lCurIdx = nm->FindCharacterIndex(MulHostCharacterName(nm));
+			else if (!nm->GetCharacterPreference().empty() && !mbShownBad)
+				lCurIdx = nm->FindCharacterIndex(nm->GetCharacterPreference());
+			else if (nm->IsClientSynced())
+				lCurIdx = nm->FindCharacterIndex(nm->GetLocalCharacterName());
+			std::vector<cChip> vAll;
+			for (size_t i = 0; i < nm->GetCharacterListSize(); ++i)
+			{
+				cChip chip;
+				chip.msBase = nm->GetCharacterBaseName(i);
+				chip.mbHost = MulIsHostCharacter(chip.msBase);
+				chip.mbCurrent = (int)i == lCurIdx;
+				chip.mbSelectable = !mbHostLine && nm->IsCharacterSelectable(i);
+				tString sText = cNetworkManager::GetCharacterDisplayName(chip.msBase);
+				if (chip.mbHost)
+					sText += mbHostLine ? " (you)" : " (host)";
+				else if (nm->IsCharacterTakenByOther(chip.msBase))
+					sText += " (taken)";
+				chip.msText = cString::To16Char(sText);
+				chip.mBox = cRect2f(0, 0, MulTextWidth(mpFont, 13, chip.msText) + 16, 19);
+				vAll.push_back(chip);
+			}
+			const float kChipGap = 6;
+			float fRowY = y + kBoxH + 6;
+			size_t lRowStart = 0;
+			while (lRowStart < vAll.size())
+			{
+				float fRowW = vAll[lRowStart].mBox.w;
+				size_t lRowEnd = lRowStart + 1;
+				while (lRowEnd < vAll.size() && fRowW + kChipGap + vAll[lRowEnd].mBox.w <= mfMaxWidth)
+				{
+					fRowW += kChipGap + vAll[lRowEnd].mBox.w;
+					++lRowEnd;
+				}
+				float x = cx - fRowW / 2;
+				if (x < fLeft)
+					fLeft = x;
+				if (x + fRowW > fRight)
+					fRight = x + fRowW;
+				for (size_t c = lRowStart; c < lRowEnd; ++c)
+				{
+					vAll[c].mBox.x = x;
+					vAll[c].mBox.y = fRowY;
+					x += vAll[c].mBox.w + kChipGap;
+					mvChips.push_back(vAll[c]);
+				}
+				fRowY += 19 + 4;
+				lRowStart = lRowEnd;
+			}
+			fBottom = fRowY - 4;
+		}
+
+		/* only a guest's picker is clickable; the host's line is plain text */
+		if (mbPicker)
+			mRect = cRect2f(fLeft, y, fRight - fLeft, fBottom - y);
+		else
+			mRect = cRect2f(-1000, -1000, 0, 0);
 	}
 };
 
@@ -3004,6 +3886,9 @@ cMainMenu::cMainMenu(cInit *apInit)  : iUpdateable("MainMenu")
 cMainMenu::~cMainMenu(void)
 {
 	STLDeleteAll(mlstWidgets);
+#ifdef PENUMBRA_MULTIPLAYER
+	MulReleaseGfx(); /* the multiplayer screens' shared white quad */
+#endif
 
     mpDrawer->DestroyGfxObject(mpGfxBlackQuad);
 	mpDrawer->DestroyGfxObject(mpGfxMouse);
@@ -3227,50 +4112,94 @@ void cMainMenu::Update(float afTimeStep)
 			}
 		}
 
-		/* Server browser: mirror the current tab's result list into the row
-		   slots and keep the status line honest. */
+		/* Server browser: keep the page inside the list, mirror it into the
+		   row slots, keyboard (Up/Down select, PgUp/PgDn page, Enter join,
+		   F5 refresh) and the status line under the table. */
 		if (mState == eMainMenuState_MultiplayerBrowser && mpInit->mpNetworkManager != NULL)
 		{
 			cNetworkManager *nm = mpInit->mpNetworkManager;
 			const std::vector<cDiscoveredServer> &vList =
 				gMulBrowserInternet ? nm->GetInternetServers() : nm->GetDiscoveredServers();
+			gMulBrowserClock += afTimeStep;
+
+			{
+				iKeyboard *kb = mpInit->mpGame->GetInput()->GetKeyboard();
+				for (int n = 0; n < 32 && kb->KeyIsPressed(); ++n)
+				{
+					const cKeyPress kp = kb->GetKey();
+					const int lCount = (int)vList.size();
+					int lSel = MulBrowserSelectedIndex(mpInit);
+					if ((kp.mKey == eKey_UP || kp.mKey == eKey_DOWN) && lCount > 0)
+					{
+						if (lSel < 0)
+							lSel = kp.mKey == eKey_DOWN ? gMulBrowserFirst : gMulBrowserFirst + kMulBrowserRows - 1;
+						else
+							lSel += kp.mKey == eKey_DOWN ? 1 : -1;
+						if (lSel < 0)
+							lSel = 0;
+						if (lSel >= lCount)
+							lSel = lCount - 1;
+						gMulBrowserSelAddr = vList[(size_t)lSel].msAddress;
+						gMulBrowserFirst = lSel - lSel % kMulBrowserRows; /* follow it onto its page */
+					}
+					else if (kp.mKey == eKey_PAGEUP || kp.mKey == eKey_PAGEDOWN)
+					{
+						gMulBrowserFirst += kp.mKey == eKey_PAGEDOWN ? kMulBrowserRows : -kMulBrowserRows;
+						if (gMulBrowserFirst < 0)
+							gMulBrowserFirst = 0;
+					}
+					else if ((kp.mKey == eKey_RETURN || kp.mKey == eKey_KP_ENTER) && lSel >= 0)
+					{
+						MulActivateServer(mpInit, vList[(size_t)lSel]);
+						break; /* the screen may have changed */
+					}
+					else if (kp.mKey == eKey_F5)
+					{
+						gMulBrowserNoticeLeft = 0;
+						MulRefreshBrowser(mpInit);
+					}
+				}
+			}
+
+			MulClampBrowserPage(vList.size());
 			for (size_t r = 0; r < gvMulRows.size(); ++r)
 				if (gvMulRows[r])
 					gvMulRows[r]->SyncFromList(vList);
 
-			if (gpMulBrowserFoot)
+			const int lCount = (int)vList.size();
+			tString sStatus;
+			int lKind = 0;
+			if (gMulBrowserNoticeLeft > 0)
 			{
-				tString sFoot;
-				if (gMulBrowserNoticeLeft > 0)
-				{
-					gMulBrowserNoticeLeft -= afTimeStep;
-					sFoot = gMulBrowserNotice;
-				}
-				else if (gMulBrowserInternet)
-				{
-					if (nm->IsInternetRefreshActive())
-						sFoot = "Asking the master server " + nm->GetMasterServer() + " ...";
-					else if (!nm->GetInternetFailReason().empty())
-						sFoot = nm->GetInternetFailReason();
-					else
-						sFoot = cString::ToString((int)vList.size()) + " public server(s) listed by " +
-								nm->GetMasterServer() + " - click one to join.";
-				}
-				else
-				{
-					if (nm->IsDiscoveryActive())
-						sFoot = "Scanning the LAN (and Hamachi/Radmin) ...";
-					else
-						sFoot = cString::ToString((int)vList.size()) +
-								" server(s) found on the LAN - click one to join.";
-				}
-				const tWString wsFoot = cString::To16Char(sFoot);
-				if (gpMulBrowserFoot->msText != wsFoot)
-				{
-					gpMulBrowserFoot->msText = wsFoot;
-					gpMulBrowserFoot->UpdateSize();
-				}
+				gMulBrowserNoticeLeft -= afTimeStep;
+				sStatus = gMulBrowserNotice;
+				lKind = 3;
 			}
+			else if (gMulBrowserInternet && nm->IsInternetRefreshActive())
+			{
+				sStatus = "Searching the internet (master server " + nm->GetMasterServer() + ") ...";
+				lKind = 1;
+			}
+			else if (!gMulBrowserInternet && nm->IsDiscoveryActive())
+			{
+				sStatus = "Searching the LAN (and Hamachi/Radmin) ...";
+				lKind = 1;
+			}
+			else if (gMulBrowserInternet && lCount == 0 && !nm->GetInternetFailReason().empty())
+			{
+				sStatus = nm->GetInternetFailReason();
+				lKind = 2;
+			}
+			else if (lCount == 0)
+				sStatus = gMulBrowserInternet ? "No servers found - try LAN or Direct connect."
+											  : "No servers found on the LAN - try Internet or Direct connect.";
+			else
+				sStatus = cString::ToString(lCount) + (lCount == 1 ? " server found" : " servers found") +
+						  (gMulBrowserInternet ? tString("") : tString(" on the LAN")) +
+						  (MulBrowserSelectedIndex(mpInit) >= 0 ? " - press Join (or double-click / Enter)."
+																: " - click one, then Join (or double-click).");
+			gMulBrowserStatus = cString::To16Char(sStatus);
+			gMulBrowserStatusKind = lKind;
 		}
 
 		/* Host lobby: what the 'Public' toggle means right now. */
@@ -3903,12 +4832,12 @@ void cMainMenu::CreateWidgets()
 	gpMulNameFoot = NULL;
 	gpMulNameShown = NULL;
 	gvMulRows.clear();
-	gpMulBrowserFoot = NULL;
 	gpMulTypedPw = NULL;
-	gpMulPwTitle = NULL;
 	gpMulPublicToggle = NULL;
 	gpMulHostPublicNote = NULL;
 	gMulBrowserNoticeLeft = 0;
+	gMulBrowserFirst = 0;
+	gMulBrowserLastClick = -10;
 #endif
 	STLDeleteAll(mlstWidgets);
 	for(size_t i=0; i< eMainMenuState_LastEnum; ++i) mvState[i].clear();
@@ -4074,8 +5003,8 @@ void cMainMenu::CreateWidgets()
 		gpMulNameShown = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W(""), 13, eFontAlign_Center));
 		AddWidgetToState(eMainMenuState_Multiplayer, gpMulNameShown); /* text set in Update */
 		vPos.y += 22;
-		/* v18: 'Character: < Red >' (multiplayer.cfg character=) */
-		AddWidgetToState(eMainMenuState_Multiplayer, hplNew(cMainMenuWidget_MultiCharacter,(mpInit, vPos)));
+		/* v18: 'Character: [<] Red [>]' (multiplayer.cfg character=) */
+		AddWidgetToState(eMainMenuState_Multiplayer, hplNew(cMainMenuWidget_MultiCharacter,(mpInit, vPos, false)));
 		vPos.y += 24;
 
 		sprintf(sTempVec, "F11 toggles hosting | F10 joins 127.0.0.1:%s | Port %s", portBuf, portBuf);
@@ -4146,7 +5075,7 @@ void cMainMenu::CreateWidgets()
 		vPos.y += 26;
 		/* v18: 'You play Philip' — the host is slot 0, no picker */
 		AddWidgetToState(eMainMenuState_MultiplayerHostLobby,
-						 hplNew(cMainMenuWidget_MultiCharacter,(mpInit, vPos)));
+						 hplNew(cMainMenuWidget_MultiCharacter,(mpInit, vPos, false)));
 		vPos.y += 30;
 		AddWidgetToState(
 			eMainMenuState_MultiplayerHostLobby,
@@ -4180,19 +5109,21 @@ void cMainMenu::CreateWidgets()
 								(mpInit, vPos,
 								 _W("Type the host's IP (their Radmin/Hamachi address works), then press Connect. Add :PORT if not 7777."),
 								 13, eFontAlign_Center)));
-		vPos.y += 76;
+		vPos.y += 52;
 		gpMulTypedIp =
 			hplNew(cMainMenuWidget_MultiIpLine,(mpInit, vPos, lastHost, 20, eFontAlign_Center));
 		AddWidgetToState(eMainMenuState_MultiplayerJoin, gpMulTypedIp);
-		vPos.y += 62;
+		vPos.y += 46;
 		gpMulJoinFoot = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W("(not connected yet)"), 14,
 													  eFontAlign_Center));
 		AddWidgetToState(eMainMenuState_MultiplayerJoin, gpMulJoinFoot);
-		vPos.y += 36;
+		vPos.y += 32;
 		/* v18: pick while waiting for the host to launch (asks at once when
-		   connected, else only saves character= for the next join) */
-		AddWidgetToState(eMainMenuState_MultiplayerJoin, hplNew(cMainMenuWidget_MultiCharacter,(mpInit, vPos)));
-		vPos.y += 40;
+		   connected, else only saves character= for the next join); the
+		   chips under the arrows show every character and which are taken */
+		AddWidgetToState(eMainMenuState_MultiplayerJoin,
+						 hplNew(cMainMenuWidget_MultiCharacter,(mpInit, vPos, true, 420.0f)));
+		vPos.y += 62;
 		AddWidgetToState(
 			eMainMenuState_MultiplayerJoin,
 			hplNew(cMainMenuWidget_MultiJoinTry,(mpInit, vPos, _W("Connect"))));
@@ -4238,77 +5169,77 @@ void cMainMenu::CreateWidgets()
 			eMainMenuState_MultiplayerName,
 			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, kTranslate("MainMenu", "Back"),
 												eMainMenuState_Multiplayer)));
-		// Server browser (Internet / LAN)
-		///////////////////////////////////
-		vPos = vTextStart;
-		AddWidgetToState(eMainMenuState_MultiplayerBrowser,
-						 hplNew(cMainMenuWidget_Text,
-								(mpInit, vPos, _W("Server browser"), 24, eFontAlign_Center)));
-		vPos.y += 40;
-		AddWidgetToState(eMainMenuState_MultiplayerBrowser,
-						 hplNew(cMainMenuWidget_MultiBrowserTab,
-								(mpInit, cVector3f(110, vPos.y, 40), _W("Internet"), true)));
-		AddWidgetToState(eMainMenuState_MultiplayerBrowser,
-						 hplNew(cMainMenuWidget_MultiBrowserTab,
-								(mpInit, cVector3f(225, vPos.y, 40), _W("LAN"), false)));
-		AddWidgetToState(eMainMenuState_MultiplayerBrowser,
-						 hplNew(cMainMenuWidget_MultiBrowserRefresh,
-								(mpInit, cVector3f(340, vPos.y, 40), _W("Refresh"))));
-		vPos.y += 32;
-		AddWidgetToState(eMainMenuState_MultiplayerBrowser,
-						 hplNew(cMainMenuWidget_Text,
-								(mpInit, cVector3f(12, vPos.y, 40),
-								 _W("Name  |  Map  |  Players  |  [pw] = password  |  Age    (click a row to join)"),
-								 13, eFontAlign_Left)));
-		vPos.y += 20;
-		gvMulRows.clear();
-		for (int r = 0; r < kMulBrowserRows; ++r)
-		{
-			cMainMenuWidget_MultiServerRow *pRow =
-				hplNew(cMainMenuWidget_MultiServerRow,(mpInit, cVector3f(12, vPos.y, 40), r, 440.0f));
-			gvMulRows.push_back(pRow);
-			AddWidgetToState(eMainMenuState_MultiplayerBrowser, pRow);
-			vPos.y += 19;
-		}
-		vPos.y += 8;
-		gpMulBrowserFoot = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W(""), 13, eFontAlign_Center));
-		AddWidgetToState(eMainMenuState_MultiplayerBrowser, gpMulBrowserFoot);
-		vPos.y += 30;
-		AddWidgetToState(
-			eMainMenuState_MultiplayerBrowser,
-			hplNew(cMainMenuWidget_Button,(mpInit, vPos, _W("Direct connect (type an address)"),
-										   eMainMenuState_MultiplayerJoin, 20, eFontAlign_Center)));
-		vPos.y += 34;
-		AddWidgetToState(
-			eMainMenuState_MultiplayerBrowser,
-			hplNew(cMainMenuWidget_Button,(mpInit, vPos, kTranslate("MainMenu", "Back"),
-										   eMainMenuState_Multiplayer, 22, eFontAlign_Center)));
 
 		///////////////////////////////////
-		// Password prompt for a [pw] row
+		// Server browser (Internet / LAN) - one panel, see the layout
+		// comment above cMainMenuWidget_MultiPanel.
 		///////////////////////////////////
-		vPos = vTextStart;
-		gpMulPwTitle = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W("Password required"), 22, eFontAlign_Center));
-		AddWidgetToState(eMainMenuState_MultiplayerPassword, gpMulPwTitle);
-		vPos.y += 40;
-		AddWidgetToState(eMainMenuState_MultiplayerPassword,
-						 hplNew(cMainMenuWidget_Text,
-								(mpInit, vPos,
-								 _W("This server is password protected. Type the password the host gave you, then press Join."),
-								 13, eFontAlign_Center)));
-		vPos.y += 50;
-		gpMulTypedPw = hplNew(cMainMenuWidget_MultiIpLine,(mpInit, vPos, tString(""), 20, eFontAlign_Center));
-		gpMulTypedPw->SetPasswordMode(true);
-		gpMulTypedPw->SetAscii("");
-		AddWidgetToState(eMainMenuState_MultiplayerPassword, gpMulTypedPw);
-		vPos.y += 60;
-		AddWidgetToState(eMainMenuState_MultiplayerPassword,
-						 hplNew(cMainMenuWidget_MultiPwJoin,(mpInit, vPos, _W("Join"))));
-		vPos.y += 40;
-		AddWidgetToState(
-			eMainMenuState_MultiplayerPassword,
-			hplNew(cMainMenuWidget_Button,(mpInit, vPos, _W("Cancel"),
-										   eMainMenuState_MultiplayerBrowser, 22, eFontAlign_Center)));
+		{
+			const eMainMenuState st = eMainMenuState_MultiplayerBrowser;
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiPanel,
+				(mpInit, cRect2f(kMulBrPanelX, kMulBrPanelY, kMulBrPanelW, kMulBrPanelH),
+				 _W("Server browser"), true, false)));
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiBrowserTab,
+				(mpInit, cRect2f(kMulBrListX, 220, 110, 24), _W("Internet"), true)));
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiBrowserTab,
+				(mpInit, cRect2f(kMulBrListX + 116, 220, 110, 24), _W("LAN"), false)));
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiBrowserRefresh,
+				(mpInit, cRect2f(kMulBrListX + kMulBrListW - 96, 220, 96, 24), _W("Refresh"))));
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiBrowserTable,(mpInit)));
+			gvMulRows.clear();
+			for (int r = 0; r < kMulBrowserRows; ++r)
+			{
+				cMainMenuWidget_MultiServerRow *pRow = hplNew(cMainMenuWidget_MultiServerRow,
+					(mpInit, cRect2f(kMulBrListX, kMulBrRowsY + r * kMulBrRowH, kMulBrListW, kMulBrRowH), r));
+				gvMulRows.push_back(pRow);
+				AddWidgetToState(st, pRow);
+			}
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiBrowserPage,
+				(mpInit, cRect2f(482, kMulBrStatusY, 22, 20), -1)));
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiBrowserPage,
+				(mpInit, cRect2f(534, kMulBrStatusY, 22, 20), +1)));
+			/* divider, then the guest's character (chips: who is taken) */
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiCharacter,
+				(mpInit, cVector3f(kMulBrPanelX + kMulBrPanelW / 2, 486, 40), true, kMulBrListW)));
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiBrowserJoin,
+				(mpInit, cRect2f(kMulBrListX, 548, 120, 26), _W("Join"))));
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiBoxButton,
+				(mpInit, cRect2f(kMulBrListX + 128, 548, 170, 26), _W("Direct connect"),
+				 eMainMenuState_MultiplayerJoin)));
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiBoxButton,
+				(mpInit, cRect2f(kMulBrListX + kMulBrListW - 96, 548, 96, 26), kTranslate("MainMenu", "Back"),
+				 eMainMenuState_Multiplayer)));
+		}
+
+		///////////////////////////////////
+		// Password prompt for a locked row: panel x 96..496, y 214..450
+		// (title, server name + address/map/players, hint, boxed field,
+		// Enter/Esc hint, Join / Cancel).
+		///////////////////////////////////
+		{
+			const eMainMenuState st = eMainMenuState_MultiplayerPassword;
+			const float fPx = kMulBrPanelX + kMulBrPanelW / 2 - 200, fPy = 214, fPw = 400;
+			const float fCx = fPx + fPw / 2;
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiPanel,
+				(mpInit, cRect2f(fPx, fPy, fPw, 236), _W("Password required"), false, true)));
+			AddWidgetToState(st, hplNew(cMainMenuWidget_Text,
+				(mpInit, cVector3f(fCx, fPy + 90, 40),
+				 _W("The host set a join password. Type the one they gave you."), 13, eFontAlign_Center)));
+			gpMulTypedPw = hplNew(cMainMenuWidget_MultiIpLine,
+				(mpInit, cVector3f(fCx, fPy + 124, 40), tString(""), 20, eFontAlign_Center));
+			gpMulTypedPw->SetPasswordMode(true);
+			gpMulTypedPw->SetAscii("");
+			gpMulTypedPw->SetFieldBox(fPw - 60);
+			AddWidgetToState(st, gpMulTypedPw);
+			AddWidgetToState(st, hplNew(cMainMenuWidget_Text,
+				(mpInit, cVector3f(fCx, fPy + 162, 40),
+				 _W("Enter = join     Esc = back to the list"), 12, eFontAlign_Center)));
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiPwJoin,
+				(mpInit, cRect2f(fCx - 150, fPy + 190, 140, 28), _W("Join"))));
+			AddWidgetToState(st, hplNew(cMainMenuWidget_MultiBoxButton,
+				(mpInit, cRect2f(fCx + 10, fPy + 190, 140, 28), _W("Cancel"),
+				 eMainMenuState_MultiplayerBrowser)));
+		}
 	}
 #endif
 

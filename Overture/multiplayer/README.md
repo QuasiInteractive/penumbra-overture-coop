@@ -157,8 +157,11 @@ preference; printable ASCII, 24 characters max, matched
 case-insensitively) — shown and changed by a `Character: < Red >` line on
 the **Multiplayer** screen and on the **Direct-connect / join status**
 screen (so a guest waiting in the menu for the host to launch can still
-pick). A click steps to the next selectable character, wrapping: never
-entry 0 of the list (the host's), and while connected as a guest never one
+pick) and in the **server browser**. `<` / `>` step to the previous / next
+selectable character, wrapping (clicking the name steps forward); on the
+browser and join screens a row of chips under it (`Philip (host)`,
+`Red (taken)`, free ones clickable) picks directly. Never
+Philip (the host's, by name since v19), and while connected as a guest never one
 another player holds per the name table; offline every non-host character
 is offered. One selectable character = the click re-sends it; none = the
 click does nothing. The choice is written with `UpdateMultiplayerCfgKey`
@@ -646,9 +649,11 @@ stop. The master records the beacon's *source* IP, so the host never needs
 to know its own public address.
 
 **Join** — Multiplayer → Server browser → Internet → Refresh. Rows show
-name, map, players/max, `[pw]` for password servers and how many seconds ago
-the host last beaconed; rows from another mod version are greyed out.
-Clicking a `[pw]` row asks for the password first (that sets the join
+name, map, players/max (red when full), a padlock for password servers and
+how long ago the host last beaconed ("Seen"); rows from another mod version
+are greyed out. A click selects a row; **Join**, Enter or a double-click
+joins it (Up/Down select, PgUp/PgDn page past 8 rows, F5 refreshes).
+Joining a padlocked row asks for the password first (that sets the join
 password for that attempt; `join_password=` in the cfg covers Direct
 connect). **Direct connect** (type `ip:port`) still works exactly as before
 for friends who share an address over chat, Hamachi or Radmin.
