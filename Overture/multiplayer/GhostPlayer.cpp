@@ -408,6 +408,15 @@ cGhostPlayer::cGhostPlayer(cWorld3D *apWorld, uint8_t alPlayerID, const tString 
 	mfLocomotionSpeed = 0.0f;
 	mfLastMoveAngleDeg = 0.0f;
 	mlLastAnimTraceMs = 0;
+	mlWantHeld[0] = mlWantHeld[1] = eNetHeldItem_None;
+	mlShownHeld[0] = mlShownHeld[1] = eNetHeldItem_None;
+	mpHeldProp[0] = mpHeldProp[1] = NULL;
+	mpHeldGlow = NULL;
+	mbHeldBoneWarned = false;
+	mpCollider = NULL;
+	mvColliderLastFeet = cVector3f(0, 0, 0);
+	mbColliderCrouch = false;
+	mfColliderHeight = 1.9f;
 
 	if (!mpWorld)
 		return;
@@ -478,9 +487,16 @@ cGhostPlayer::cGhostPlayer(cWorld3D *apWorld, uint8_t alPlayerID, const tString 
 	mpFlashlight = mpWorld->CreateLightSpot(sFlash, "", true);
 	if (mpFlashlight)
 	{
+		/* The player's own flashlight is defined by this file: projection
+		   image (the round beam) + falloff image. A spot light with NO
+		   projection image is not masked to a cone — it floods its whole
+		   square frustum, which on plank ceilings read as hard "prison
+		   bar" stripes. Load the same definition, then override shadows
+		   (cost) and the near plane (the lens sits in the ghost's hand). */
+		mpFlashlight->LoadXMLProperties("light_player_flashlight_spot.lnt");
 		mpFlashlight->SetDiffuseColor(cColor(0.55f, 0.55f, 0.45f, 1.0f));
 		mpFlashlight->SetFarAttenuation(10.0f);
-		mpFlashlight->SetFOV(cMath::ToRad(65));
+		mpFlashlight->SetFOV(cMath::ToRad(85)); /* the hud flashlight's falloff angle */
 		mpFlashlight->SetAspect(1.0f);
 		mpFlashlight->SetNearClipPlane(0.12f);
 		mpFlashlight->SetCastShadows(false);
@@ -492,6 +508,10 @@ cGhostPlayer::cGhostPlayer(cWorld3D *apWorld, uint8_t alPlayerID, const tString 
 
 cGhostPlayer::~cGhostPlayer()
 {
+	DestroyHeldProps(); /* before the body: it owns the hand bones */
+	if (mpWorld && mpCollider && mpWorld->GetPhysicsWorld())
+		mpWorld->GetPhysicsWorld()->DestroyCharacterBody(mpCollider);
+	mpCollider = NULL;
 	if (mpWorld)
 	{
 		if (mpFlashlight)
@@ -508,9 +528,299 @@ cGhostPlayer::~cGhostPlayer()
 }
 
 //-----------------------------------------------------------------------
+// v21: held items. One row per eNetHeldItem.
+//
+// Grip geometry is measured, not eyeballed (analyze_grip.py over the rest
+// poses and the item DAEs, all Y_UP so engine space == file space):
+//  * every character hand bone (mixamo rig): local +Y runs along the
+//    fingers, +Z is the palm side, the thumb points +X on the RIGHT hand and
+//    -X on the LEFT;
+//  * each item's long axis, which end is the heavy head (hammer head, lens,
+//    bristles), and where along that axis a hand closes (tools near the
+//    handle end, lights and throwables mid-body).
+// The item's long axis is laid across the fist along the thumb line (head
+// on the thumb side), its width axis along the fingers, then tilted by
+// mfTiltDeg from the thumb line toward the fingers (a hanging arm carries a
+// hammer head-down-forward, a broom nearly vertical).
+//-----------------------------------------------------------------------
+
+namespace
+{
+struct cHeldItemDef
+{
+	uint8_t mlId;
+	const char *msHudName;  /* iHudModel::msName ("" = not selectable by name) */
+	int mlHudSlot;          /* 0 left, 1 right, -1 either */
+	const char *msFile;     /* world model */
+	int mlLongAxis;         /* 0 X, 1 Y, 2 Z in item space */
+	float mfHeadSign;       /* +1/-1: which end of the long axis is the head */
+	int mlWidthAxis;        /* laid along the fingers */
+	float mfGripAlong;      /* long-axis coordinate the fist closes on (m) */
+	float mfTiltDeg;        /* thumb line -> fingers */
+};
+
+const cHeldItemDef gvHeldItems[] = {
+	{ eNetHeldItem_Flashlight, "Flashlight",  0, "item_flashlight.dae",   1, -1.0f, 0,  0.030f,  0.0f },
+	{ eNetHeldItem_Glowstick,  "Glowstick",   0, "item_glowstick.dae",    2, +1.0f, 0, -0.010f,  0.0f },
+	{ eNetHeldItem_Flare,      "Flare",       0, "item_flare.dae",        2, +1.0f, 0,  0.000f,  0.0f },
+	{ eNetHeldItem_Hammer,     "Hammer",      1, "item_hammer.dae",       2, +1.0f, 1, -0.120f, 25.0f },
+	{ eNetHeldItem_PickAxe,    "PickAxe",     1, "items_pickaxe.dae",     0, +1.0f, 2, -0.470f, 25.0f },
+	{ eNetHeldItem_Broom,      "BroomWeapon", 1, "modern_mine_broom.dae", 1, -1.0f, 0,  0.550f, 70.0f },
+	{ eNetHeldItem_Dynamite,   "Dynamite",    1, "item_dynamite.dae",     1, +1.0f, 0,  0.020f,  0.0f },
+	{ eNetHeldItem_Meat,       "Meat",        1, "item_meat.dae",         0, +1.0f, 1,  0.000f,  0.0f },
+	{ eNetHeldItem_FlareThrow, "Flare",       1, "items_flare.dae",       1, +1.0f, 0,  0.030f,  0.0f },
+};
+const int kHeldItemDefNum = (int)(sizeof(gvHeldItems) / sizeof(gvHeldItems[0]));
+
+/* flashlight lens: the wide end of item_flashlight.dae's long axis */
+const float kFlashlightLensAlong = -0.150f;
+
+const cHeldItemDef *FindHeldDef(uint8_t alId)
+{
+	for (int i = 0; i < kHeldItemDefNum; ++i)
+		if (gvHeldItems[i].mlId == alId)
+			return &gvHeldItems[i];
+	return NULL;
+}
+
+cVector3f AxisVec(int alAxis)
+{
+	return cVector3f(alAxis == 0 ? 1.0f : 0.0f, alAxis == 1 ? 1.0f : 0.0f, alAxis == 2 ? 1.0f : 0.0f);
+}
+
+/** Item-space -> hand-bone-local transform for one item in one hand. */
+cMatrixf HeldGripMatrix(const cHeldItemDef &aDef, bool abRightHand)
+{
+	const cVector3f vFingers(0.0f, 1.0f, 0.0f);
+	const cVector3f vPalm(0.0f, 0.0f, 1.0f);
+	const cVector3f vThumb(abRightHand ? 1.0f : -1.0f, 0.0f, 0.0f);
+
+	const float fTilt = cMath::ToRad(aDef.mfTiltDeg);
+	const cVector3f vT = vThumb * cosf(fTilt) + vFingers * sinf(fTilt);   /* long axis goes here */
+	const cVector3f vF = vThumb * -sinf(fTilt) + vFingers * cosf(fTilt);  /* width axis goes here */
+
+	const int lL = aDef.mlLongAxis;
+	const int lW = aDef.mlWidthAxis;
+	const int lC = 3 - lL - lW;
+	/* u_L x u_W = eps * u_C; a proper rotation needs R(u_C) = eps * s * (R u_L x R u_W) / s */
+	const float fEps = (((lL + 1) % 3) == lW) ? 1.0f : -1.0f;
+	const float fS = aDef.mfHeadSign;
+
+	cVector3f vCol[3];
+	vCol[lL] = vT * fS;
+	vCol[lW] = vF;
+	vCol[lC] = cMath::Vector3Cross(vT, vF) * (fEps * fS);
+
+	cMatrixf m = cMatrixf::Identity;
+	for (int c = 0; c < 3; ++c)
+	{
+		m.m[0][c] = vCol[c].x;
+		m.m[1][c] = vCol[c].y;
+		m.m[2][c] = vCol[c].z;
+	}
+
+	/* the fist closes a finger-length past the wrist, just off the palm */
+	const cVector3f vGripHand = vFingers * 0.080f + vPalm * 0.030f;
+	const cVector3f vGripItem = AxisVec(lL) * aDef.mfGripAlong;
+	const cVector3f vT0 = vGripHand - cMath::MatrixMul(m, vGripItem);
+	m.SetTranslation(vT0);
+	return m;
+}
+}
+
+uint8_t cGhostPlayer::HeldItemFromHudName(const tString &asHudName, int alSlot)
+{
+	if (asHudName.empty())
+		return eNetHeldItem_None;
+	const tString sLow = cString::ToLowerCase(asHudName);
+	for (int i = 0; i < kHeldItemDefNum; ++i)
+	{
+		const cHeldItemDef &d = gvHeldItems[i];
+		if (d.mlHudSlot >= 0 && d.mlHudSlot != alSlot)
+			continue;
+		if (cString::ToLowerCase(d.msHudName) == sLow)
+			return d.mlId;
+	}
+	return eNetHeldItem_None;
+}
+
+void cGhostPlayer::DestroyHeldProps()
+{
+	if (mpWorld)
+	{
+		for (int h = 0; h < 2; ++h)
+			if (mpHeldProp[h])
+				mpWorld->DestroyMeshEntity(mpHeldProp[h]);
+		if (mpHeldGlow)
+			mpWorld->DestroyLight(mpHeldGlow);
+	}
+	mpHeldProp[0] = mpHeldProp[1] = NULL;
+	mpHeldGlow = NULL;
+	mlShownHeld[0] = mlShownHeld[1] = eNetHeldItem_None;
+}
+
+void cGhostPlayer::UpdateHeldProps()
+{
+	if (mpWorld == NULL || mpBodyEntity == NULL)
+		return;
+
+	for (int h = 0; h < 2; ++h)
+	{
+		const uint8_t lWant = mbLastDead ? (uint8_t)eNetHeldItem_None : mlWantHeld[h];
+		if (lWant == mlShownHeld[h])
+			continue;
+		if (mpHeldProp[h])
+		{
+			mpWorld->DestroyMeshEntity(mpHeldProp[h]);
+			mpHeldProp[h] = NULL;
+		}
+		mlShownHeld[h] = lWant;
+
+		const cHeldItemDef *pDef = FindHeldDef(lWant);
+		if (pDef == NULL)
+			continue;
+
+		const char *sBoneName = (h == 0) ? "mixamorigwLeftHand" : "mixamorigwRightHand";
+		cBoneState *pBone = mpBodyEntity->GetBoneStateFromName(sBoneName);
+		if (pBone == NULL)
+		{
+			if (mbHeldBoneWarned == false)
+			{
+				mbHeldBoneWarned = true;
+				Log(" multiplayer: GhostPlayer id=%u has no '%s' bone - held items are not shown for this character\n",
+					(unsigned)mlPlayerID, sBoneName);
+			}
+			continue;
+		}
+
+		cMeshManager *pMeshManager = mpWorld->GetResources()->GetMeshManager();
+		unsigned long lException = 0;
+		cMesh *pMesh = CreateMeshGuarded(pMeshManager, pDef->msFile, &lException);
+		if (pMesh == NULL)
+		{
+			Log(" multiplayer: GhostPlayer id=%u could not load held item '%s'\n",
+				(unsigned)mlPlayerID, pDef->msFile);
+			continue;
+		}
+		const tString sName = "GhostHeld_" + cString::ToString((int)mlPlayerID) + (h == 0 ? "_L" : "_R");
+		cMeshEntity *pProp = mpWorld->CreateMeshEntity(sName, pMesh);
+		if (pProp == NULL)
+			continue;
+		pProp->SetCastsShadows(false);
+		pBone->AddEntity(pProp);
+		pProp->SetMatrix(HeldGripMatrix(*pDef, h == 1));
+		mpHeldProp[h] = pProp;
+		Log(" multiplayer: GhostPlayer id=%u holds '%s' in the %s hand\n",
+			(unsigned)mlPlayerID, pDef->msHudName, h == 0 ? "left" : "right");
+	}
+
+	/* glow: a lit glowstick or flare in the left hand lights its holder */
+	const uint8_t lLeft = mlShownHeld[0];
+	const bool bGlow = mpHeldProp[0] &&
+		(lLeft == eNetHeldItem_Glowstick || lLeft == eNetHeldItem_Flare);
+	if (bGlow && mpHeldGlow == NULL)
+	{
+		mpHeldGlow = mpWorld->CreateLightPoint("GhostHeldGlow_" + cString::ToString((int)mlPlayerID), true);
+		if (mpHeldGlow)
+			mpHeldGlow->SetCastShadows(false);
+	}
+	if (mpHeldGlow)
+	{
+		mpHeldGlow->SetVisible(bGlow);
+		if (bGlow)
+		{
+			/* colours from the first-person hud models' own lights */
+			if (lLeft == eNetHeldItem_Glowstick)
+			{
+				mpHeldGlow->SetDiffuseColor(cColor(0.53f, 0.83f, 0.73f, 1.0f));
+				mpHeldGlow->SetFarAttenuation(4.0f);
+			}
+			else
+			{
+				mpHeldGlow->SetDiffuseColor(cColor(1.0f, 0.3f, 0.3f, 1.0f));
+				mpHeldGlow->SetFarAttenuation(7.0f);
+			}
+			mpHeldGlow->SetPosition(mpHeldProp[0]->GetWorldMatrix().GetTranslation());
+		}
+	}
+}
+
+//-----------------------------------------------------------------------
+
+void cGhostPlayer::CreateCollider(const cVector3f &avSize, float afCrouchHeight)
+{
+	if (mpWorld == NULL || mpCollider != NULL || mpWorld->GetPhysicsWorld() == NULL)
+		return;
+	iPhysicsWorld *pPhysics = mpWorld->GetPhysicsWorld();
+	mpCollider = pPhysics->CreateCharacterBody("GhostCollider_" + cString::ToString((int)mlPlayerID), avSize);
+	if (mpCollider == NULL)
+		return;
+	mpCollider->AddExtraSize(cVector3f(avSize.x, afCrouchHeight, avSize.z)); /* size 1 = crouch */
+	/* We place it; it must not fall, climb or push by itself. With gravity
+	   off the character update only copies its position to the body. */
+	mpCollider->SetGravityActive(false);
+	mpCollider->SetMaxPushMass(0);
+	mpCollider->SetPushForce(0);
+	mpCollider->SetActive(false); /* until the first state places it */
+	mfColliderHeight = avSize.y;
+}
+
+iPhysicsBody *cGhostPlayer::GetHitBody() const
+{
+	if (mpCollider == NULL || mpCollider->IsActive() == false)
+		return NULL;
+	return mpCollider->GetBody();
+}
+
+void cGhostPlayer::UpdateCollider(bool abCrouch)
+{
+	if (mpCollider == NULL)
+		return;
+	const bool bWant = (mbLastDead == false) && mbRenderValid;
+	if (mpCollider->IsActive() != bWant)
+		mpCollider->SetActive(bWant);
+	if (bWant == false)
+		return;
+	if (abCrouch != mbColliderCrouch)
+	{
+		mpCollider->SetActiveSize(abCrouch ? 1 : 0);
+		mbColliderCrouch = abCrouch;
+	}
+	mpCollider->SetFeetPosition(mvRenderPos);
+
+	/* Wake sleeping objects inside the friend's footprint: a teleported
+	   body resolves overlaps only with AWAKE bodies, so without this a
+	   friend walks straight into a resting crate. On the host that push is
+	   the real one and replicates; on a guest it is only a local preview
+	   the host's stream corrects. */
+	const cVector3f vMoved = mvRenderPos - mvColliderLastFeet;
+	mvColliderLastFeet = mvRenderPos;
+	if (vMoved.x * vMoved.x + vMoved.z * vMoved.z < 0.0001f)
+		return;
+	const float kWakeRadius = 0.9f;
+	cPhysicsBodyIterator it = mpWorld->GetPhysicsWorld()->GetBodyIterator();
+	while (it.HasNext())
+	{
+		iPhysicsBody *pBody = it.Next();
+		if (pBody == NULL || pBody->GetMass() <= 0.0f || pBody->IsCharacter() || pBody->GetEnabled())
+			continue;
+		const cVector3f v = pBody->GetWorldPosition();
+		const float fDx = v.x - mvRenderPos.x, fDz = v.z - mvRenderPos.z;
+		if (fDx * fDx + fDz * fDz > kWakeRadius * kWakeRadius)
+			continue;
+		if (v.y < mvRenderPos.y - 0.3f || v.y > mvRenderPos.y + mfColliderHeight)
+			continue;
+		pBody->SetEnabled(true);
+	}
+}
+
+//-----------------------------------------------------------------------
 
 void cGhostPlayer::OrphanWorld()
 {
+	mpHeldProp[0] = mpHeldProp[1] = NULL; /* the dying world destroys them */
+	mpHeldGlow = NULL;
+	mpCollider = NULL;
 	mpBodyEntity = NULL;
 	mpFlashlight = NULL;
 	mpMarkerLight = NULL;
@@ -712,6 +1022,9 @@ void cGhostPlayer::ApplyState(const cNetPlayerState &aState)
 	/* v12: vitals ride on the newest state (no interpolation) */
 	mlLastHealth = (aState.mHealth > 100) ? (uint8_t)100 : aState.mHealth;
 	mbLastDead = (aState.mFlags & eNetPlayerFlag_Dead) != 0;
+	/* v21: held items ride on the newest state too; unknown ids = empty */
+	mlWantHeld[0] = (aState.mHeldLeft < eNetHeldItem_Count) ? aState.mHeldLeft : (uint8_t)eNetHeldItem_None;
+	mlWantHeld[1] = (aState.mHeldRight < eNetHeldItem_Count) ? aState.mHeldRight : (uint8_t)eNetHeldItem_None;
 
 	cGhostSample s;
 	s.mfTSend = (double)mlSeqUnwrapped * (double)kNetSendPeriodSeconds;
@@ -958,6 +1271,7 @@ void cGhostPlayer::Update(float afTimeStep)
 		const cMatrixf mtx = cMath::MatrixMul(cMath::MatrixTranslate(vBody),
 			cMath::MatrixRotateY(mfRenderYaw + kMeshYawOffset));
 		mpBodyEntity->SetWorldMatrix(mtx);
+		UpdateHeldProps(); /* v21 */
 
 		/* Diagnosis trace (ghost_anim_trace=1): activeAnims=0 is the ONLY
 		   state that renders the skin bind pose — anything else playing
@@ -995,6 +1309,8 @@ void cGhostPlayer::Update(float afTimeStep)
 		}
 	}
 
+	UpdateCollider(bCrouch); /* solid friend */
+
 	const cVector3f vEye = mvRenderPos +
 		cVector3f(0, bCrouch ? mfEyeHeightCrouch : mfEyeHeightStand, 0);
 
@@ -1005,8 +1321,14 @@ void cGhostPlayer::Update(float afTimeStep)
 	{
 		/* roll is not on the wire — ghost aim uses pitch/yaw only */
 		const float roll = 0.0f;
+		/* v21: a held flashlight shines from its lens; the aim stays the
+		   sender's view direction (that is where their real beam points) */
+		cVector3f vBeamFrom = vEye;
+		if (mpHeldProp[0] && mlShownHeld[0] == eNetHeldItem_Flashlight)
+			vBeamFrom = cMath::MatrixMul(mpHeldProp[0]->GetWorldMatrix(),
+				cVector3f(0.0f, kFlashlightLensAlong, 0.0f));
 		cMatrixf mtx = cMath::MatrixMul(
-			cMath::MatrixTranslate(vEye),
+			cMath::MatrixTranslate(vBeamFrom),
 			cMath::MatrixRotate(cVector3f(mfRenderPitch, s.mfYaw, roll), eEulerRotationOrder_XYZ));
 		mpFlashlight->SetMatrix(mtx);
 		mpFlashlight->SetVisible(s.mbFlashlightOn);

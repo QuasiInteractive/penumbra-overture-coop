@@ -17,6 +17,8 @@
  * along with Penumbra Overture.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "Init.h"
+#include "resources/FileSearcher.h"
+#include "TechDemoPaths.h"
 #include "impl/CGProgram.h"
 #include "Player.h"
 #include "ButtonHandler.h"
@@ -186,6 +188,27 @@ bool CheckSupport(cInit *apInit)
 
 tWString gsUserSettingsPath = _W("");
 tWString gsDefaultSettingsPath = _W("config/default_settings.cfg");
+
+/* Tech demo co-op: run the 2006 Penumbra tech demo's levels in this exe.
+   Its folder is searched BEFORE ours (first added wins in cFileSearcher),
+   so its maps, models, sounds and menu art replace Overture's; everything
+   it lacks (hud models, gui, config, the engine core) comes from Overture. */
+bool gbTechDemoMode = false;
+tString gsTechDemoDir = "C:/Program Files (x86)/Penumbra/redist";
+/* multiplayer.cfg techdemo_skip=sounds,music : tech demo folders NOT searched
+   (a debugging aid: fall back to Overture's copies of those) */
+tString gsTechDemoSkip = "";
+/* The co-op install: this exe in the tech demo's own redist/coop folder.
+   Found by where the exe is, no command line needed. Overture's base files
+   (engine core, config, hud models, fonts) come from the Overture install,
+   which becomes the working folder; multiplayer.cfg lives in Documents
+   (Program Files is read-only for the game). */
+bool gbTechDemoCoopFolder = false;
+tString gsTechDemoExeDir = "";
+
+tString gsMultiplayerCfg = "multiplayer.cfg";
+tString gsGhostModelDir = "multiplayer/models";
+
 bool gbUsingUserSettings=false;
 
 //-----------------------------------------------------------------------
@@ -203,6 +226,7 @@ cInit::cInit(void)  : iUpdateable("Init")
 
 	gpInit = this;
 
+	mpGame = NULL; /* hplMain deletes it when Init fails, even before it exists */
 	mpNetworkManager = NULL;
 	mpNetworkUpdater = NULL;
 }
@@ -244,6 +268,23 @@ bool cInit::Init(tString asCommandLine)
 	//iResourceBase::SetLogCreateAndDelete(true);
 	SetWindowCaption("Penumbra Loading...");
 
+	/* -techdemo : the tech demo co-op mode (see gbTechDemoMode) */
+	if (cString::ToLowerCase(asCommandLine).find("-techdemo") != tString::npos)
+		gbTechDemoMode = true;
+	{
+		/* <tech demo>/redist/coop/this.exe : the tech demo co-op install */
+		const std::string sExe = TdExeFolder();
+		const std::string sUp = TdParentFolder(sExe);
+		if (!TdFileExists(sExe + "/config/game.cfg") && !sUp.empty() &&
+			TdFileExists(sUp + "/Penumbra.exe") && TdFileExists(sUp + "/resources.cfg"))
+		{
+			gbTechDemoMode = true;
+			gbTechDemoCoopFolder = true;
+			gsTechDemoDir = sUp;
+			gsTechDemoExeDir = sExe;
+		}
+	}
+
 	// PERSONAL DIR /////////////////////
 	tWString sPersonalDir = GetSystemSpecialPath(eSystemPath_Personal);
 	if(	cString::GetLastCharW(sPersonalDir) != _W("/") && 
@@ -253,7 +294,7 @@ bool cInit::Init(tString asCommandLine)
 	}
 
 	// CREATE NEEDED DIRS /////////////////////
-	gsUserSettingsPath = sPersonalDir + PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME _W("settings.cfg");
+	gsUserSettingsPath = sPersonalDir + tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME + _W("settings.cfg");
 	#ifndef WIN32
 	// For Mac OS X and Linux move the OLD Episode 1 folder to Penumbra/Overture and symlink to the old path
 	if (FolderExists(sPersonalDir + PERSONAL_RELATIVEROOT _W("Penumbra Overture/Episode1"))
@@ -272,7 +313,7 @@ bool cInit::Init(tString asCommandLine)
 
 	tWString vDirs[] = { PERSONAL_RELATIVEPIECES //auto includes ,
 			PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME_PARENT,
-			PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME};
+			tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME};
 	int lDirNum = PERSONAL_RELATIVEPIECES_COUNT + 2;
 
 	//Check if directories exist and if not create
@@ -285,8 +326,47 @@ bool cInit::Init(tString asCommandLine)
 	}
 
 	// LOG FILE SETUP /////////////////////
-	SetLogFile(sPersonalDir+PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME _W("hpl.log"));
-	SetUpdateLogFile(sPersonalDir+PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME _W("hpl_update.log"));
+	SetLogFile(sPersonalDir + tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME + _W("hpl.log"));
+	SetUpdateLogFile(sPersonalDir + tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME + _W("hpl_update.log"));
+
+	// TECH DEMO CO-OP INSTALL /////////////////////
+	if (gbTechDemoCoopFolder)
+	{
+		/* multiplayer.cfg in Documents (first run: the shipped default) */
+		gsMultiplayerCfg = cString::To8Char(sPersonalDir + tWString(PERSONAL_RELATIVEROOT) +
+											 PERSONAL_RELATIVEGAME + _W("multiplayer.cfg"));
+		TdCopyFileIfMissing(gsTechDemoExeDir + "/multiplayer_default.cfg", gsMultiplayerCfg);
+		gsGhostModelDir = gsTechDemoExeDir + "/multiplayer/models";
+
+		/* Overture's base files: overture_path= in multiplayer.cfg, else found */
+		std::string sOverture;
+		FILE *pF = fopen(gsMultiplayerCfg.c_str(), "r");
+		if (pF)
+		{
+			char line[512];
+			while (fgets(line, sizeof(line), pF))
+			{
+				if (strncmp(line, "overture_path=", 14) != 0) continue;
+				sOverture = line + 14;
+				while (!sOverture.empty() && (sOverture[sOverture.size() - 1] == '\n' ||
+					sOverture[sOverture.size() - 1] == '\r' || sOverture[sOverture.size() - 1] == ' '))
+					sOverture.erase(sOverture.size() - 1);
+			}
+			fclose(pF);
+		}
+		if (sOverture.empty())
+			sOverture = TdFindOvertureFolder();
+		if (sOverture.empty() || !TdSetWorkingFolder(sOverture))
+		{
+			msErrorMessage = _W("Penumbra: Tech Demo co-op uses files from Penumbra Overture, ")
+							 _W("and no Overture install was found.\n\nInstall Penumbra Overture, or put its ")
+							 _W("game folder in ") + cString::To16Char(gsMultiplayerCfg) +
+							 _W(" as overture_path=");
+			return false;
+		}
+		Log(" tech demo co-op install: tech demo '%s', Overture base files '%s', settings '%s'\n",
+			gsTechDemoDir.c_str(), sOverture.c_str(), gsMultiplayerCfg.c_str());
+	}
 
 	
 	// MAIN INIT /////////////////////
@@ -341,7 +421,7 @@ bool cInit::Init(tString asCommandLine)
 		   test guest install pins itself windowed here while the main install
 		   runs borderless fullscreen. Keys: force_windowed=1, window_width=,
 		   window_height=. */
-		FILE *pF = fopen("multiplayer.cfg", "r");
+		FILE *pF = fopen(gsMultiplayerCfg.c_str(), "r");
 		if (pF)
 		{
 			char line[256];
@@ -356,6 +436,23 @@ bool cInit::Init(tString asCommandLine)
 					lW = v;
 				else if (sscanf(line, "window_height=%d", &v) == 1)
 					lH = v;
+				else if (strncmp(line, "techdemo_skip=", 14) == 0)
+				{
+					gsTechDemoSkip = cString::ToLowerCase(tString(line + 14));
+					while (!gsTechDemoSkip.empty() && (gsTechDemoSkip[gsTechDemoSkip.size() - 1] == '\n' ||
+						gsTechDemoSkip[gsTechDemoSkip.size() - 1] == '\r'))
+						gsTechDemoSkip.erase(gsTechDemoSkip.size() - 1);
+				}
+				else if (strncmp(line, "techdemo_path=", 14) == 0)
+				{
+					/* where the tech demo is installed (spaces allowed) */
+					tString sPath = line + 14;
+					while (!sPath.empty() && (sPath[sPath.size() - 1] == '\n' ||
+						sPath[sPath.size() - 1] == '\r' || sPath[sPath.size() - 1] == ' '))
+						sPath.erase(sPath.size() - 1);
+					if (!sPath.empty() && !gbTechDemoCoopFolder) /* the co-op install IS inside it */
+						gsTechDemoDir = cString::ReplaceCharTo(sPath, "\\", "/");
+				}
 				else if (sscanf(line, "window_x=%d", &v) == 1)
 					lX = v;
 				else if (sscanf(line, "window_y=%d", &v) == 1)
@@ -424,6 +521,13 @@ bool cInit::Init(tString asCommandLine)
 
 	msStartMap = mpConfig->GetString("Map","File","level00_01_boat_cabin.dae"); 
 	msStartLink = mpConfig->GetString("Map","StartPos","link01");
+	if (gbTechDemoMode)
+	{
+		/* the tech demo's own start (its settings.cfg <Map>): the entrance */
+		msStartMap = "level01_02_entrance.dae";
+		msStartLink = "link01";
+		msGlobalScriptFile = "global_script.hps";
+	}
 
 	mlFSAA = mpConfig->GetInt("Graphics","FSAA",0);
 	mbPostEffects = mpConfig->GetBool("Graphics","PostEffects",true);
@@ -510,10 +614,77 @@ bool cInit::Init(tString asCommandLine)
 	cMath::Randomize();
 
 	// RESOURCE INIT /////////////////////
+	if (gbTechDemoMode)
+	{
+		/* the tech demo's own resources.cfg, made absolute, BEFORE ours:
+		   first added wins. It lists no /core, so the engine shaders stay
+		   ours (its 2006 .cg programs do not match this renderer). */
+		const tString sTdCfg = gsTechDemoDir + "/resources.cfg";
+		TiXmlDocument *pTdDoc = hplNew(TiXmlDocument, (sTdCfg.c_str()));
+		if (pTdDoc->LoadFile() == false || pTdDoc->RootElement() == NULL)
+		{
+			hplDelete(pTdDoc);
+			msErrorMessage = _W("Penumbra tech demo not found at ") + cString::To16Char(gsTechDemoDir) +
+				_W(". Install the tech demo, or put its redist folder in multiplayer.cfg as techdemo_path=");
+			return false;
+		}
+		int lTdDirs = 0;
+		for (TiXmlElement *pDir = pTdDoc->RootElement()->FirstChildElement(); pDir;
+			 pDir = pDir->NextSiblingElement())
+		{
+			tString sPath = cString::ToString(pDir->Attribute("Path"), "");
+			if (sPath.empty())
+				continue;
+			if (sPath[0] == '/' || sPath[0] == '\\')
+				sPath = sPath.substr(1);
+			/* our engine core (the 2006 .cg shaders do not match this
+			   renderer) and our config (Overture's language file is the
+			   base: menus, the font folder; the tech demo's text is laid
+			   over it below) */
+			const tString sLow = cString::ToLowerCase(sPath);
+			if (sLow.find("core") == 0 || sLow == "config")
+				continue;
+			bool bSkip = false;
+			if (!gsTechDemoSkip.empty())
+			{
+				tStringVec vSkip;
+				cString::GetStringVec(gsTechDemoSkip, vSkip, NULL);
+				for (size_t k = 0; k < vSkip.size() && !bSkip; ++k)
+					if (!vSkip[k].empty() && sLow.find(vSkip[k]) == 0)
+						bSkip = true;
+			}
+			if (bSkip)
+			{
+				Log(" tech demo mode: '%s' skipped (techdemo_skip)\n", sPath.c_str());
+				continue;
+			}
+			mpGame->GetResources()->AddResourceDir(gsTechDemoDir + "/" + sPath);
+			++lTdDirs;
+		}
+		hplDelete(pTdDoc);
+		Log(" tech demo mode: %d folder(s) from '%s' searched first\n", lTdDirs, gsTechDemoDir.c_str());
+		mbShowIntro = false; /* Overture's intro story is not the tech demo's */
+		if (getenv("HPL_TRACE_OUTSIDE"))
+			hpl::cFileSearcher::SetTraceOutside(gsTechDemoDir);
+
+		/* the tech demo's own TrueType fonts wherever Overture's are asked for */
+		cFontManager *pFonts = mpGame->GetResources()->GetFontManager();
+		pFonts->SetAlias("font_menu_small.fnt", "font_menu.ttf", 48);
+		pFonts->SetAlias("verdana.fnt", "verdana.ttf", 32);
+		pFonts->SetAlias("cour.fnt", "cour.ttf", 32);
+		pFonts->SetAlias("font_computer.fnt", "cour.ttf", 32);
+	}
 	mpGame->GetResources()->LoadResourceDirsFile("resources.cfg");
 
 	// LANGUAGE ////////////////////////////////
 	mpGame->GetResources()->SetLanguageFile(msLanguageFile);
+	if (gbTechDemoMode)
+	{
+		/* the tech demo's own texts (item names, messages, notes) over ours */
+		const tString sTdLang = gsTechDemoDir + "/config/" + msLanguageFile;
+		if (mpGame->GetResources()->AddLanguageOverlay(sTdLang))
+			Log(" tech demo mode: language overlay '%s'\n", sTdLang.c_str());
+	}
 
 	Log("Initializing " PRODUCT_NAME "\n  Version\t" PRODUCT_VERSION "\n  Date\t" PRODUCT_DATE "\n");
 	//////////////////////////////////////////////7
@@ -726,7 +897,8 @@ bool cInit::Init(tString asCommandLine)
 		gbUsingUserSettings = true;
 	}
 
-	SetWindowCaption("Penumbra");
+	SetWindowCaption(gbTechDemoMode ? "Penumbra: Tech Demo (co-op)" : "Penumbra");
+	TdApplyExeIconToWindows(); /* the exe icon in the title bar and taskbar, not SDL's */
 
 	if (mpNetworkManager)
 		mpNetworkManager->Startup();

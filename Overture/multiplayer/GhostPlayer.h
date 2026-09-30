@@ -6,7 +6,7 @@
 
 #include <map>
 
-namespace hpl { class cMeshEntity; class cAnimationState; }
+namespace hpl { class cMeshEntity; class cAnimationState; class cLight3DPoint; class iCharacterBody; }
 
 //-----------------------------------------------------------------------
 /** Tuning shared by every ghost, read from multiplayer.cfg by cNetworkManager
@@ -112,6 +112,25 @@ public:
 	    already tore the entities down. Call before hplDelete on a world switch. */
 	void OrphanWorld();
 
+	/** v21: first-person hand model name (iHudModel::msName, e.g. "Hammer")
+	    in hand slot 0 (left) or 1 (right) -> eNetHeldItem wire id.
+	    Unknown names -> eNetHeldItem_None. */
+	static uint8_t HeldItemFromHudName(const hpl::tString &asHudName, int alSlot);
+
+	/** Give this player a solid body in OUR physics world: a character body
+	    the size of a real player (game.cfg Player Width/Height, a second size
+	    for crouching) that follows the rendered position. The local player
+	    can no longer walk through a friend, objects bounce off them, and on
+	    the HOST (the authoritative sim) a friend walking into a crate moves
+	    it for everyone. It is a real iCharacterBody, not a bare shape: game
+	    code treats IsCharacter() bodies as characters (dog shoves call
+	    GetCharacterBody(), liquids read its velocity) and skips them in
+	    sight/pick/weapon rays. */
+	void CreateCollider(const hpl::cVector3f &avSize, float afCrouchHeight);
+	/** v22: the collider's physics body while it is solid (alive, placed),
+	    else NULL — what a melee swing can hit. */
+	hpl::iPhysicsBody *GetHitBody() const;
+
 	/** Preview/debug: force a named clip (crossfaded in; one-shots replay
 	    every ~1 s), "" = back to automatic selection. Returns false when the
 	    clip is not loaded on this body (nothing changes). */
@@ -166,6 +185,20 @@ private:
 
 	void AnimLog(const char *asFmt, ...) const;
 
+	/** v21: create/replace/remove the held-item props so they match the
+	    newest state (nothing while dead), and place the glow light of a
+	    held glowstick/flare. Props hang off the hand bones, so they follow
+	    the animation with no per-frame work. */
+	void UpdateHeldProps();
+	/** Destroy both props and the glow light (before the body — the body
+	    owns the bones they hang from). */
+	void DestroyHeldProps();
+
+	/** Per frame: follow the render position, crouch size, off while dead;
+	    wake sleeping objects the friend walks into (a teleported body does
+	    not disturb sleeping bodies by itself). */
+	void UpdateCollider(bool abCrouch);
+
 	hpl::cWorld3D *mpWorld;
 	uint8_t mlPlayerID;
 	float mfBodyYOffsetStand;   /* cfg override offsets from the wire feet */
@@ -177,6 +210,15 @@ private:
 	hpl::cMeshEntity *mpBodyEntity;
 	hpl::cLight3DPoint *mpMarkerLight;
 	hpl::cLight3DSpot *mpFlashlight;
+	uint8_t mlWantHeld[2];              /* v21: newest state's items (0 left, 1 right) */
+	uint8_t mlShownHeld[2];             /* what the props currently show */
+	hpl::cMeshEntity *mpHeldProp[2];    /* world model on the hand bone */
+	hpl::cLight3DPoint *mpHeldGlow;     /* glowstick / flare light */
+	bool mbHeldBoneWarned;              /* rig without mixamo hand bones: logged once */
+	hpl::iCharacterBody *mpCollider;    /* solid body in our physics world */
+	hpl::cVector3f mvColliderLastFeet;
+	bool mbColliderCrouch;
+	float mfColliderHeight;             /* standing height, for the wake-up box */
 
 	/* tuning (copied from cGhostTuning at creation) */
 	float mfInterpDelaySec;

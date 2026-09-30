@@ -19,6 +19,8 @@
 #include "impl/OpenALSoundData.h"
 #include "system/LowLevelSystem.h"
 #include "impl/OpenALSoundChannel.h"
+#include "impl/Mp3Stream.h"
+#include "system/String.h"
 namespace hpl {
 
 	//////////////////////////////////////////////////////////////////////////
@@ -69,10 +71,14 @@ namespace hpl {
 //		if(lCaps & FSOUND_CAPS_HARDWARE)	lFlags |= FSOUND_HW3D;
 		//if(mbStream)						lFlags |= FSOUND_STREAMABLE;
 
+		//MP3 (the 2006 tech demo's music) is always streamed, decoded as it plays
+		const bool bMp3 = cString::ToLowerCase(cString::GetFileExt(asFile)) == "mp3";
+		if(bMp3) mbStream = true;
+
 		if(mbStream)
 		{
 			//mpSoundData
-			mpStream = OAL_Stream_Load ( asFile.c_str() );
+			mpStream = bMp3 ? LoadMp3Stream(asFile) : OAL_Stream_Load ( asFile.c_str() );
 
 
 

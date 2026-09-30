@@ -369,6 +369,36 @@ private:
 
 //-----------------------------------------------------------------------
 
+/** Tech demo: "New Game" starts right away (the tech demo had no
+    difficulty choice; Normal). */
+class cMainMenuWidget_TdNewGame : public cMainMenuWidget_MainButton
+{
+public:
+	cMainMenuWidget_TdNewGame(cInit *apInit, const cVector3f &avPos, const tWString &asText)
+		: cMainMenuWidget_MainButton(apInit, avPos, asText, eMainMenuState_NewGame)
+	{
+	}
+
+	virtual void OnMouseDown(eMButton aButton)
+	{
+		mpInit->mpGame->GetSound()->GetSoundHandler()->PlayGui("gui_menu_click",false,1);
+		mpInit->mpGraphicsHelper->DrawLoadingScreen("");
+		mpInit->mpMainMenu->SetActive(false);
+		mpInit->ResetGame(true);
+		mpInit->mDifficulty = eGameDifficulty_Normal;
+		if(mpInit->mbShowIntro)
+		{
+			mpInit->mpIntroStory->SetActive(true);
+		}
+		else
+		{
+			mpInit->mpGame->GetUpdater()->SetContainer("Default");
+			mpInit->mpGame->GetScene()->SetDrawScene(true);
+			mpInit->mpMapHandler->Load(mpInit->msStartMap, mpInit->msStartLink);
+		}
+	}
+};
+
 /** v13: the Start screen's "Multiplayer" button — asks for a username
     first when multiplayer.cfg has none. */
 class cMainMenuWidget_MultiEnter : public cMainMenuWidget_MainButton
@@ -411,7 +441,8 @@ class cMainMenuWidget_MultiHostStartListen : public cMainMenuWidget_Button
 public:
 	cMainMenuWidget_MultiHostStartListen(cInit *apInit, const cVector3f &avPos,
 										 const tWString &lbl)
-		: cMainMenuWidget_Button(apInit, avPos, lbl, eMainMenuState_MultiplayerHostLobby, 24,
+		: cMainMenuWidget_Button(apInit, avPos, lbl, eMainMenuState_MultiplayerHostLobby,
+								 gbTechDemoMode ? 40 : 24, /* tech demo: same size as its neighbours */
 								 eFontAlign_Center)
 	{
 	}
@@ -1861,6 +1892,214 @@ private:
 	}
 };
 
+/** 'Microphone:  [<]  Realtek Audio  [>]' and a live level bar under it.
+    The arrows step through "System default" + every recording device
+    OpenAL lists (wrapping); a click on the name steps forward. Every pick
+    saves voice_capture_device= in multiplayer.cfg and switches the live
+    microphone (cNetworkManager::SetMicrophone). While the line is on screen
+    the chosen device is opened and metered (no session needed), so a pick
+    can be checked by just talking. A saved device that is gone (unplugged)
+    is shown with "(not found)"; the game then falls back to the default. */
+class cMainMenuWidget_MultiMic : public cMainMenuWidget
+{
+public:
+	cMainMenuWidget_MultiMic(cInit *apInit, const cVector3f &avPos)
+		: cMainMenuWidget(apInit, avPos, cVector2f(0, 0)), mfListAge(999.0f)
+	{
+		mpFont = MulMenuFont(apInit);
+		Layout();
+	}
+
+	virtual void OnUpdate(float afTimeStep)
+	{
+		cNetworkManager *nm = mpInit->mpNetworkManager;
+		if (nm && nm->IsVoiceAvailable())
+			nm->KeepMicTestAlive(); /* meter runs while we are on screen */
+		mfListAge += afTimeStep;
+		if (mfListAge > 2.0f) /* a mic plugged in shows up within 2 s */
+		{
+			mfListAge = 0.0f;
+			RefreshList();
+		}
+		Layout();
+	}
+
+	virtual void OnActivate()
+	{
+		mfListAge = 999.0f;
+		RefreshList();
+		Layout();
+	}
+
+	virtual void OnMouseDown(eMButton aButton)
+	{
+		(void)aButton;
+		cNetworkManager *nm = mpInit->mpNetworkManager;
+		if (nm == NULL || !nm->IsVoiceAvailable())
+			return;
+		int lDir = 0;
+		if (MulMouseIn(mpInit, mLeftBox))
+			lDir = -1;
+		else if (MulMouseIn(mpInit, mRightBox) || MulMouseIn(mpInit, mNameBox))
+			lDir = +1;
+		if (lDir == 0)
+			return;
+		/* entry 0 = system default (""), then the devices */
+		const int lNum = (int)mvDevices.size() + 1;
+		int lCur = CurrentIndex(nm);
+		if (lCur < 0)
+			lCur = 0; /* a vanished device steps from the default */
+		const int lNext = ((lCur + lDir) % lNum + lNum) % lNum;
+		nm->SetMicrophone(lNext == 0 ? tString("") : mvDevices[lNext - 1]);
+		Layout();
+		MulClickSound(mpInit);
+	}
+
+	virtual void OnDraw()
+	{
+		cNetworkManager *nm = mpInit->mpNetworkManager;
+		const float y = mvPositon.y;
+		if (nm == NULL || !nm->IsVoiceAvailable())
+		{
+			MulText(mpFont, mvPositon.x, y + 2, 40, 16, MulColTextDim(), eFontAlign_Center,
+					_W("Microphone: voice chat is off (voice_enabled=0)"));
+			return;
+		}
+		MulText(mpFont, mfLabelX, y + 2, 40, 18, MulColText(), eFontAlign_Left, _W("Microphone:"));
+		DrawArrow(mLeftBox, _W("<"));
+		DrawArrow(mRightBox, _W(">"));
+		const bool bHover = MulMouseIn(mpInit, mNameBox);
+		MulFillRect(mpDrawer, mNameBox.x, mNameBox.y, mNameBox.w, mNameBox.h, 33,
+					bHover ? cColor(0.06f, 0.09f, 0.2f, 0.85f) : cColor(0.03f, 0.04f, 0.08f, 0.78f));
+		MulFrameRect(mpDrawer, mNameBox.x, mNameBox.y, mNameBox.w, mNameBox.h, 34,
+					 cColor(0.25f, 0.3f, 0.46f, 0.8f));
+		MulText(mpFont, mNameBox.x + mNameBox.w / 2, y + 4, 40, 14,
+				mbMissing ? MulColWarn() : MulColTextBright(), eFontAlign_Center, msShown);
+
+		/* level bar: what the chosen microphone hears right now */
+		const float fBarY = y + kBoxH + 6;
+		MulFillRect(mpDrawer, mBar.x, fBarY, mBar.w, kBarH, 33, cColor(0.03f, 0.04f, 0.08f, 0.85f));
+		const int lState = nm->GetMicTestState();
+		const float fLevel = nm->GetMicTestLevel();
+		if (lState == 2 && fLevel > 0.0f)
+		{
+			const cColor col = fLevel > 0.85f ? cColor(0.95f, 0.45f, 0.3f, 0.95f) :
+							   cColor(0.35f, 0.85f, 0.45f, 0.95f);
+			MulFillRect(mpDrawer, mBar.x + 1, fBarY + 1, (mBar.w - 2) * fLevel, kBarH - 2, 34, col);
+		}
+		MulFrameRect(mpDrawer, mBar.x, fBarY, mBar.w, kBarH, 35, cColor(0.25f, 0.3f, 0.46f, 0.8f));
+		const tWString sHint = lState == 1 ? tWString(_W("no microphone found - pick another")) :
+							   lState == 2 ? tWString(_W("speak to test")) : tWString(_W("..."));
+		MulText(mpFont, mBar.x + mBar.w + 10, fBarY - 2, 40, 13,
+				lState == 1 ? MulColWarn() : MulColTextDim(), eFontAlign_Left, sHint);
+	}
+
+private:
+	static const int kBoxH = 24;
+	static const int kBarH = 10;
+
+	iFontData *mpFont;
+	std::vector<tString> mvDevices; /* OpenAL recording devices */
+	float mfListAge;
+	tWString msShown;
+	bool mbMissing;
+	float mfLabelX;
+	cRect2f mLeftBox, mNameBox, mRightBox, mBar;
+
+	void RefreshList()
+	{
+		cNetworkManager *nm = mpInit->mpNetworkManager;
+		if (nm)
+			nm->GetMicrophoneNames(mvDevices);
+	}
+
+	/** 0 = system default, 1.. = mvDevices[i-1], -1 = saved device not present. */
+	int CurrentIndex(cNetworkManager *nm) const
+	{
+		const tString &sCur = nm->GetMicrophone();
+		if (sCur.empty())
+			return 0;
+		for (size_t i = 0; i < mvDevices.size(); ++i)
+			if (mvDevices[i] == sCur)
+				return (int)i + 1;
+		return -1;
+	}
+
+	/** OpenAL Soft prefixes every WASAPI name with "OpenAL Soft on " —
+	    noise in a picker. */
+	static tString ShortName(const tString &asName)
+	{
+		const tString sPrefix = "OpenAL Soft on ";
+		if (asName.compare(0, sPrefix.size(), sPrefix) == 0)
+			return asName.substr(sPrefix.size());
+		return asName;
+	}
+
+	/** Fits asText into afMaxW at afSize, ending in "..." when cut. */
+	tWString Fit(const tString &asText, float afSize, float afMaxW) const
+	{
+		tWString w = cString::To16Char(asText);
+		if (MulTextWidth(mpFont, afSize, w) <= afMaxW)
+			return w;
+		while (w.size() > 1 && MulTextWidth(mpFont, afSize, w + _W("...")) > afMaxW)
+			w.erase(w.size() - 1);
+		return w + _W("...");
+	}
+
+	void DrawArrow(const cRect2f &b, const wchar_t *asText)
+	{
+		const bool bHover = MulMouseIn(mpInit, b);
+		MulFillRect(mpDrawer, b.x, b.y, b.w, b.h, 33, bHover ? MulColBoxHover() : MulColBox());
+		MulFrameRect(mpDrawer, b.x, b.y, b.w, b.h, 34,
+					 bHover ? cColor(0.55f, 0.65f, 1.0f, 1.0f) : cColor(0.3f, 0.35f, 0.5f, 0.8f));
+		MulText(mpFont, b.x + b.w / 2, b.y + 2, 40, 17, bHover ? MulColTextBright() : MulColText(),
+				eFontAlign_Center, asText);
+	}
+
+	void Layout()
+	{
+		cNetworkManager *nm = mpInit->mpNetworkManager;
+		const float cx = mvPositon.x, y = mvPositon.y;
+		const float kSize = 18, kArrowW = 24, kGap = 8, kNameW = 300;
+		mbMissing = false;
+		msShown = _W("");
+		if (nm == NULL || !nm->IsVoiceAvailable())
+		{
+			mRect = cRect2f(-1000, -1000, 0, 0);
+			return;
+		}
+		const int lCur = CurrentIndex(nm);
+		tString sName;
+		if (lCur == 0)
+		{
+			/* show what "default" resolves to once the test opened it */
+			const tString sOpened = nm->GetMicTestDeviceName();
+			sName = sOpened.empty() ? tString("System default") : "System default (" + ShortName(sOpened) + ")";
+		}
+		else if (lCur > 0)
+			sName = ShortName(mvDevices[lCur - 1]);
+		else
+		{
+			sName = ShortName(nm->GetMicrophone()) + " (not found)";
+			mbMissing = true;
+		}
+		msShown = Fit(sName, 14, kNameW - 12);
+
+		const float fLabelW = MulTextWidth(mpFont, kSize, _W("Microphone:"));
+		const float fTotal = fLabelW + kGap + kArrowW + 4 + kNameW + 4 + kArrowW;
+		float x = cx - fTotal / 2;
+		mfLabelX = x;
+		x += fLabelW + kGap;
+		mLeftBox = cRect2f(x, y, kArrowW, kBoxH);
+		x += kArrowW + 4;
+		mNameBox = cRect2f(x, y, kNameW, kBoxH);
+		mBar = cRect2f(x, y + kBoxH + 6, kNameW, kBarH);
+		x += kNameW + 4;
+		mRightBox = cRect2f(x, y, kArrowW, kBoxH);
+		mRect = cRect2f(mfLabelX, y, fTotal, kBoxH);
+	}
+};
+
 #endif /* PENUMBRA_MULTIPLAYER */
 
 //////////////////////////////////////////////////////////////////////////
@@ -1901,10 +2140,21 @@ cMainMenuWidget_MainButton::cMainMenuWidget_MainButton(cInit *apInit, const cVec
 											  const tWString& asText, eMainMenuState aNextState)
 											: cMainMenuWidget(apInit,avPos,cVector2f(1,1))
 {
-	mpFont = mpInit->mpGame->GetResources()->GetFontManager()->CreateFontData("font_menu_small.fnt",30);
+	mpFont = NULL;
+	mvFontSize = 35;
+	if (gbTechDemoMode)
+	{
+		/* the tech demo's own start-screen look: its grey TrueType menu font */
+		mpFont = mpInit->mpGame->GetResources()->GetFontManager()->CreateFontData("font_menu.ttf",48);
+		mvFontSize = 40;
+	}
+	if (mpFont == NULL)
+	{
+		mpFont = mpInit->mpGame->GetResources()->GetFontManager()->CreateFontData("font_menu_small.fnt",30);
+		mvFontSize = 35;
+	}
 
 	msText = asText;
-	mvFontSize = 35;
 	mbOver = false;
 
 	mfOverTimer = 0;
@@ -1964,7 +2214,8 @@ void cMainMenuWidget_MainButton::OnMouseDown(eMButton aButton)
 
 void cMainMenuWidget_MainButton::OnDraw()
 {
-	mpFont->Draw(mvPositon,mvFontSize,cColor(0.62f + mfAlpha*0.3f,1),eFontAlign_Center,msText.c_str());
+	const float fBase = gbTechDemoMode ? 0.72f : 0.62f;
+	mpFont->Draw(mvPositon,mvFontSize,cColor(fBase + mfAlpha*0.25f,1),eFontAlign_Center,msText.c_str());
 
 	float fAdd = sin(mfOverTimer) * 16.0f;
 
@@ -3935,9 +4186,18 @@ void cMainMenu::Reset()
 void cMainMenu::OnPostSceneDraw()
 {
 	mpInit->mpGraphicsHelper->ClearScreen(cColor(0,0));
-	
-	mpInit->mpGraphicsHelper->DrawTexture(mpLogo,0,cVector3f(800,180,30),cColor(1,1));
-	mpInit->mpGraphicsHelper->DrawTexture(mpBackground,cVector3f(0,180,0),cVector3f(800,420,0),cColor(1,1));
+
+	if (gbTechDemoMode)
+	{
+		/* tech demo: black screen, its PENUMBRA logo (menu_background.jpg,
+		   1024x256) across the top, the buttons centred below */
+		if(mpLogo) mpInit->mpGraphicsHelper->DrawTexture(mpLogo,cVector3f(0,20,0),cVector3f(800,200,30),cColor(1,1));
+	}
+	else
+	{
+		mpInit->mpGraphicsHelper->DrawTexture(mpLogo,0,cVector3f(800,180,30),cColor(1,1));
+		mpInit->mpGraphicsHelper->DrawTexture(mpBackground,cVector3f(0,180,0),cVector3f(800,420,0),cColor(1,1));
+	}
 
 	////////////////////////////////
 	// Fade in
@@ -3993,6 +4253,8 @@ static void DrawParticle(cGraphicsDrawer *apDrawer, cMainMenuParticle *apParticl
 
 void cMainMenu::DrawBackground()
 {
+	if(gbTechDemoMode) return; /* the tech demo menu has no rain or snow */
+
 	if(mbGameActive)
 	{
 		for(size_t i=0; i < mvSnowFlakes.size(); ++i) DrawParticle(mpDrawer,&mvSnowFlakes[i]);
@@ -4558,13 +4820,14 @@ void cMainMenu::SetActive(bool abX)
 		}
 		else
 		{
-			mpInit->mpGame->GetSound()->GetMusicHandler()->Play("music_theme.ogg",1,5.0f,false);
+			mpInit->mpGame->GetSound()->GetMusicHandler()->Play(gbTechDemoMode ? "music_theme.mp3" : "music_theme.ogg",1,5.0f,false);
 			
-			if(pSoundHandler->IsPlaying("gui_rain1")==false)
+			/* Overture's rain ambience; the tech demo menu is just its theme */
+			if(!gbTechDemoMode && pSoundHandler->IsPlaying("gui_rain1")==false)
 				pSoundHandler->PlayGui("gui_rain1",true,1);
-			
+
 			mbGameActive = false;
-			mbFadeIn = true;
+			mbFadeIn = !gbTechDemoMode; /* the tech demo menu is simply there */
 		}
 		
 		bool bFirstStart = mpInit->mpConfig->GetBool("Game","FirstStart",true);
@@ -4585,8 +4848,10 @@ void cMainMenu::SetActive(bool abX)
 
 		mpCurrentActionText = NULL;
 
-		mpLogo = mpInit->mpGame->GetResources()->GetTextureManager()->Create2D("menu_logo.jpg",false);
-		
+		/* the tech demo keeps its logo in menu_background.jpg */
+		mpLogo = mpInit->mpGame->GetResources()->GetTextureManager()->Create2D(
+			gbTechDemoMode ? "menu_background.jpg" : "menu_logo.jpg",false);
+
 		if(mbGameActive)
 			mpBackground = mpInit->mpGame->GetResources()->GetTextureManager()->Create2D("menu_background_ingame.jpg",false);
 		else
@@ -4819,6 +5084,7 @@ void cMainMenu::CreateWidgets()
 
 
 	cVector3f vTextStart(220, 230, 40);
+	if (gbTechDemoMode) vTextStart.x = 400; /* tech demo: every page centred under its full-width logo */
 
 
 	///////////////////////////////
@@ -4888,6 +5154,8 @@ void cMainMenu::CreateWidgets()
 	//Start menu:
 	//////////////////////////////
 	vPos = vTextStart;//cVector3f(400, 260, 40);
+	if (gbTechDemoMode)
+		vPos = cVector3f(400, 262, 40); /* tech demo: centred under the logo */
 
 	if(mpInit->mpMapHandler->GetCurrentMapName() != "")
 	{
@@ -4906,10 +5174,16 @@ void cMainMenu::CreateWidgets()
 		}
 	}
 
-	AddWidgetToState(eMainMenuState_Start,hplNew( cMainMenuWidget_MainButton,(mpInit,vPos,kTranslate("MainMenu","New Game"),eMainMenuState_NewGame)) ); 
+	if (gbTechDemoMode)
+		AddWidgetToState(eMainMenuState_Start,hplNew( cMainMenuWidget_TdNewGame,(mpInit,vPos,_W("New Game"))) );
+	else
+		AddWidgetToState(eMainMenuState_Start,hplNew( cMainMenuWidget_MainButton,(mpInit,vPos,kTranslate("MainMenu","New Game"),eMainMenuState_NewGame)) );
 	vPos.y += 51;
-	AddWidgetToState(eMainMenuState_Start,hplNew( cMainMenuWidget_MainButton,(mpInit,vPos,kTranslate("MainMenu","Load Game"),eMainMenuState_LoadGameSpot)) ); 
-	vPos.y += 51;
+	if (!gbTechDemoMode) /* the tech demo's menu had Continue only */
+	{
+		AddWidgetToState(eMainMenuState_Start,hplNew( cMainMenuWidget_MainButton,(mpInit,vPos,kTranslate("MainMenu","Load Game"),eMainMenuState_LoadGameSpot)) );
+		vPos.y += 51;
+	}
 #ifdef PENUMBRA_MULTIPLAYER
 	/* v13: asks for a username first when multiplayer.cfg has none */
 	AddWidgetToState(eMainMenuState_Start,hplNew(
@@ -4960,6 +5234,31 @@ void cMainMenu::CreateWidgets()
 		const tString lastHost = MulTrimAscii(mpInit->mpConfig->GetString("Multiplayer", "LastJoinHost", "127.0.0.1"));
 
 		///////////////////////////////////
+		if (gbTechDemoMode)
+		{
+			/* the tech demo's plain column of words; the character is picked
+			   in the lobby, the microphone in Options > Sound */
+			vPos = cVector3f(400, 240, 40);
+			AddWidgetToState(eMainMenuState_Multiplayer,
+				hplNew(cMainMenuWidget_MultiOpenBrowser,(mpInit, vPos, _W("Server Browser"))));
+			vPos.y += 51;
+			AddWidgetToState(eMainMenuState_Multiplayer,
+				hplNew(cMainMenuWidget_MultiHostStartListen,(mpInit, vPos, _W("Host Game"))));
+			vPos.y += 51;
+			AddWidgetToState(eMainMenuState_Multiplayer,
+				hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, _W("Join by IP"), eMainMenuState_MultiplayerJoin)));
+			vPos.y += 51;
+			AddWidgetToState(eMainMenuState_Multiplayer,
+				hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, _W("Change Name"), eMainMenuState_MultiplayerName)));
+			vPos.y += 51;
+			AddWidgetToState(eMainMenuState_Multiplayer,
+				hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, _W("Back"), eMainMenuState_Start)));
+			vPos.y += 70;
+			gpMulNameShown = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W(""), 14, eFontAlign_Center));
+			AddWidgetToState(eMainMenuState_Multiplayer, gpMulNameShown); /* text set in Update */
+		}
+		else
+		{
 		vPos = vTextStart;
 		AddWidgetToState(eMainMenuState_Multiplayer,
 						 hplNew(cMainMenuWidget_Text,
@@ -4980,42 +5279,48 @@ void cMainMenu::CreateWidgets()
 								 _W("A Quasi Interactive mod  -  quasi-interactive.com"),
 								 13, eFontAlign_Center)));
 
-		/* five buttons + name line + character line + hint + Back must fit
-		   above y=600: 38 px pitch */
+		/* five buttons + name line + character line + microphone line and
+		   level bar + hint + Back must fit above y=600: 34 px button pitch */
 		vPos.y += 30;
 		AddWidgetToState(eMainMenuState_Multiplayer,
 						 hplNew(cMainMenuWidget_MultiHostStartListen,
 								(mpInit, vPos, _W("Host / listen"))));
-		vPos.y += 38;
+		vPos.y += 34;
 		AddWidgetToState(
 			eMainMenuState_Multiplayer,
 			hplNew(cMainMenuWidget_MultiOpenBrowser,(mpInit, vPos, _W("Server browser"))));
-		vPos.y += 38;
+		vPos.y += 34;
 		AddWidgetToState(
 			eMainMenuState_Multiplayer,
 			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, _W("Direct connect"), eMainMenuState_MultiplayerJoin)));
-		vPos.y += 38;
+		vPos.y += 34;
 		/* v13: username (multiplayer.cfg player_name) — shown to the party */
 		AddWidgetToState(
 			eMainMenuState_Multiplayer,
 			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, _W("Change name"), eMainMenuState_MultiplayerName)));
-		vPos.y += 38;
+		vPos.y += 34;
 		gpMulNameShown = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W(""), 13, eFontAlign_Center));
 		AddWidgetToState(eMainMenuState_Multiplayer, gpMulNameShown); /* text set in Update */
 		vPos.y += 22;
 		/* v18: 'Character: [<] Red [>]' (multiplayer.cfg character=) */
 		AddWidgetToState(eMainMenuState_Multiplayer, hplNew(cMainMenuWidget_MultiCharacter,(mpInit, vPos, false)));
-		vPos.y += 24;
+		vPos.y += 28;
+		/* 'Microphone: [<] name [>]' + live level bar (voice_capture_device=) */
+		/* centred right of the column: its 'Microphone:' label sits left of
+		   a 300 px box and ran off the screen at the column's x=220 */
+		AddWidgetToState(eMainMenuState_Multiplayer, hplNew(cMainMenuWidget_MultiMic,(mpInit, cVector3f(300, vPos.y, vPos.z))));
+		vPos.y += 44;
 
 		sprintf(sTempVec, "F11 toggles hosting | F10 joins 127.0.0.1:%s | Port %s", portBuf, portBuf);
 		AddWidgetToState(eMainMenuState_Multiplayer,
 						 hplNew(cMainMenuWidget_Text,
 								(mpInit, vPos, cString::To16Char(sTempVec), 13, eFontAlign_Center)));
-		vPos.y += 36;
+		vPos.y += 28;
 		AddWidgetToState(
 			eMainMenuState_Multiplayer,
 			hplNew(cMainMenuWidget_MainButton,(mpInit, vPos, kTranslate("MainMenu", "Back"),
 												eMainMenuState_Start)));
+		} /* Overture layout */
 
 		///////////////////////////////////
 		// Host lobby
@@ -5023,8 +5328,8 @@ void cMainMenu::CreateWidgets()
 		vPos = vTextStart;
 		AddWidgetToState(eMainMenuState_MultiplayerHostLobby,
 						 hplNew(cMainMenuWidget_Text,
-								(mpInit, vPos, _W("Hosting session"), 24, eFontAlign_Center)));
-		vPos.y += 42;
+								(mpInit, vPos, gbTechDemoMode ? tWString(_W("Hosting")) : tWString(_W("Hosting session")), 24, eFontAlign_Center)));
+		vPos.y += gbTechDemoMode ? 36 : 42;
 		{
 			tString lh = "Listening on UDP port ";
 			lh += cString::ToString((int)defPort);
@@ -5041,7 +5346,7 @@ void cMainMenu::CreateWidgets()
 			   internet; plain LAN ones only on the same network. */
 			std::vector<tString> vAddrLines;
 			mpInit->mpNetworkManager->GetLocalAddressLines(vAddrLines);
-			tString sAddrs = "Your addresses:   ";
+			tString sAddrs = gbTechDemoMode ? "Your address:  " : "Your addresses:   ";
 			if (vAddrLines.empty())
 				sAddrs += "(no network adapter found)";
 			for (size_t a = 0; a < vAddrLines.size(); ++a)
@@ -5055,12 +5360,15 @@ void cMainMenu::CreateWidgets()
 									(mpInit, vPos, cString::To16Char(sAddrs), 14,
 									 eFontAlign_Center)));
 			vPos.y += 24;
+			if (!gbTechDemoMode)
+			{
 			AddWidgetToState(eMainMenuState_MultiplayerHostLobby,
 							 hplNew(cMainMenuWidget_Text,
 									(mpInit, vPos,
 									 _W("Give a friend the Radmin/Hamachi one; they type it under 'Direct connect'."),
 									 13, eFontAlign_Center)));
-			vPos.y += 30;
+			}
+			vPos.y += gbTechDemoMode ? 12 : 30;
 			/* 'Public' toggle: multiplayer.cfg `public=` pins it; otherwise
 			   the last menu choice is remembered in the game config. */
 			if (!mpInit->mpNetworkManager->IsPublicFromCfg())
@@ -5080,7 +5388,7 @@ void cMainMenu::CreateWidgets()
 		AddWidgetToState(
 			eMainMenuState_MultiplayerHostLobby,
 			hplNew(cMainMenuWidget_MultiLaunchPlaying,(mpInit, vPos,
-													   _W("Launch new game"),
+													   gbTechDemoMode ? tWString(_W("Start Game")) : tWString(_W("Launch new game")),
 													   true, false, eGameDifficulty_Normal)));
 		vPos.y += 40;
 		/* Same screens the single-player Load Game button opens; hosting stays
@@ -5089,12 +5397,12 @@ void cMainMenu::CreateWidgets()
 		AddWidgetToState(
 			eMainMenuState_MultiplayerHostLobby,
 			hplNew(cMainMenuWidget_Button,(mpInit, vPos,
-										   _W("Load a save (friends follow you into it)"),
+										   gbTechDemoMode ? tWString(_W("Load Game")) : tWString(_W("Load a save (friends follow you into it)")),
 										   eMainMenuState_LoadGameSpot, 24, eFontAlign_Center)));
 		vPos.y += 52;
 		AddWidgetToState(
 			eMainMenuState_MultiplayerHostLobby,
-			hplNew(cMainMenuWidget_MultiLobbyBack,(mpInit, vPos, _W("Stop hosting / back"))));
+			hplNew(cMainMenuWidget_MultiLobbyBack,(mpInit, vPos, gbTechDemoMode ? tWString(_W("Back")) : tWString(_W("Stop hosting / back")))));
 
 		///////////////////////////////////
 		// Join
@@ -5102,14 +5410,15 @@ void cMainMenu::CreateWidgets()
 		vPos = vTextStart;
 		AddWidgetToState(eMainMenuState_MultiplayerJoin,
 						 hplNew(cMainMenuWidget_Text,
-								(mpInit, vPos, _W("Join host (direct UDP)"), 24, eFontAlign_Center)));
+								(mpInit, vPos, gbTechDemoMode ? tWString(_W("Join by IP")) : tWString(_W("Join host (direct UDP)")), 24, eFontAlign_Center)));
 		vPos.y += 42;
+		if (!gbTechDemoMode)
 		AddWidgetToState(eMainMenuState_MultiplayerJoin,
 						 hplNew(cMainMenuWidget_Text,
 								(mpInit, vPos,
 								 _W("Type the host's IP (their Radmin/Hamachi address works), then press Connect. Add :PORT if not 7777."),
 								 13, eFontAlign_Center)));
-		vPos.y += 52;
+		vPos.y += gbTechDemoMode ? 20 : 52;
 		gpMulTypedIp =
 			hplNew(cMainMenuWidget_MultiIpLine,(mpInit, vPos, lastHost, 20, eFontAlign_Center));
 		AddWidgetToState(eMainMenuState_MultiplayerJoin, gpMulTypedIp);
@@ -5128,14 +5437,17 @@ void cMainMenu::CreateWidgets()
 			eMainMenuState_MultiplayerJoin,
 			hplNew(cMainMenuWidget_MultiJoinTry,(mpInit, vPos, _W("Connect"))));
 		vPos.y += 40;
+		if (!gbTechDemoMode) /* the tech demo menu keeps just Connect / Back */
+		{
 		AddWidgetToState(
 			eMainMenuState_MultiplayerJoin,
 			hplNew(cMainMenuWidget_MultiLaunchPlaying,(mpInit, vPos, _W("Enter game manually (fallback)"),
 													   false, true, eGameDifficulty_Normal)));
 		vPos.y += 44;
+		}
 		AddWidgetToState(
 			eMainMenuState_MultiplayerJoin,
-			hplNew(cMainMenuWidget_MultiLobbyBack,(mpInit, vPos, _W("Cancel"))));
+			hplNew(cMainMenuWidget_MultiLobbyBack,(mpInit, vPos, gbTechDemoMode ? tWString(_W("Back")) : tWString(_W("Cancel")))));
 
 		///////////////////////////////////
 		// Username (v13) — reached from the Start screen's Multiplayer
@@ -5144,20 +5456,21 @@ void cMainMenu::CreateWidgets()
 		vPos = vTextStart;
 		AddWidgetToState(eMainMenuState_MultiplayerName,
 						 hplNew(cMainMenuWidget_Text,
-								(mpInit, vPos, _W("What's your username?"), 24, eFontAlign_Center)));
+								(mpInit, vPos, gbTechDemoMode ? tWString(_W("Your Name")) : tWString(_W("What's your username?")), 24, eFontAlign_Center)));
 		vPos.y += 42;
+		if (!gbTechDemoMode)
 		AddWidgetToState(eMainMenuState_MultiplayerName,
 						 hplNew(cMainMenuWidget_Text,
 								(mpInit, vPos,
 								 _W("Shown to the other players. Letters, digits and spaces, up to 24 characters. Saved to multiplayer.cfg."),
 								 13, eFontAlign_Center)));
-		vPos.y += 50;
+		vPos.y += gbTechDemoMode ? 20 : 50;
 		gpMulTypedName = hplNew(cMainMenuWidget_MultiIpLine,
 								(mpInit, vPos, mpInit->mpNetworkManager->GetLocalPlayerName(), 20,
 								 eFontAlign_Center, true));
 		AddWidgetToState(eMainMenuState_MultiplayerName, gpMulTypedName);
 		vPos.y += 50;
-		gpMulNameFoot = hplNew(cMainMenuWidget_Text,(mpInit, vPos, _W("Press Enter or click Save."), 14,
+		gpMulNameFoot = hplNew(cMainMenuWidget_Text,(mpInit, vPos, gbTechDemoMode ? tWString(_W("")) : tWString(_W("Press Enter or click Save.")), 14,
 													  eFontAlign_Center));
 		AddWidgetToState(eMainMenuState_MultiplayerName, gpMulNameFoot);
 		vPos.y += 50;
@@ -5762,20 +6075,35 @@ void cMainMenu::CreateWidgets()
 	///////////////////////////////////
 	vPos = vTextStart;//cVector3f(400, 230, 40);
 	//Head
-	AddWidgetToState(eMainMenuState_OptionsSound,hplNew( cMainMenuWidget_Text, (mpInit,vPos,kTranslate("MainMenu","Sound"),25,eFontAlign_Center)) ); 
+	AddWidgetToState(eMainMenuState_OptionsSound,hplNew( cMainMenuWidget_Text, (mpInit,vPos,kTranslate("MainMenu","Sound"),25,eFontAlign_Center)) );
 	vPos.y += 37;
-	
+
 	//Buttons
-	cMainMenuWidget *pWidgetSoundVolume = hplNew( cMainMenuWidget_SoundVolume, (mpInit,vPos,kTranslate("MainMenu","Sound Volume:"),20,eFontAlign_Right) );  
-	AddWidgetToState(eMainMenuState_OptionsSound,pWidgetSoundVolume); 
+	cMainMenuWidget *pWidgetSoundVolume = hplNew( cMainMenuWidget_SoundVolume, (mpInit,vPos,
+		gbTechDemoMode ? tWString(_W("Sound Volume:")) : kTranslate("MainMenu","Sound Volume:"),20,eFontAlign_Right) );
+	AddWidgetToState(eMainMenuState_OptionsSound,pWidgetSoundVolume);
 	vPos.y += 29;
-	cMainMenuWidget *pWidgetSoundHardware = hplNew( cMainMenuWidget_SoundHardware, (mpInit,vPos,kTranslate("MainMenu","Use Hardware:"),20,eFontAlign_Right) );
-	AddWidgetToState(eMainMenuState_OptionsSound,pWidgetSoundHardware); 
-	vPos.y += 29;
-	cMainMenuWidget *pWidgetSoundOutputDevice = hplNew( cMainMenuWidget_SoundOutputDevice, (mpInit,vPos,kTranslate("MainMenu","Output Device:"),20,eFontAlign_Right) );
+	/* the tech demo: no "Use Hardware" (meaningless on OpenAL Soft) */
+	cMainMenuWidget *pWidgetSoundHardware = NULL;
+	if (!gbTechDemoMode)
+	{
+		pWidgetSoundHardware = hplNew( cMainMenuWidget_SoundHardware, (mpInit,vPos,kTranslate("MainMenu","Use Hardware:"),20,eFontAlign_Right) );
+		AddWidgetToState(eMainMenuState_OptionsSound,pWidgetSoundHardware);
+		vPos.y += 29;
+	}
+	cMainMenuWidget *pWidgetSoundOutputDevice = hplNew( cMainMenuWidget_SoundOutputDevice, (mpInit,vPos,
+		gbTechDemoMode ? tWString(_W("Output:")) : kTranslate("MainMenu","Output Device:"),20,eFontAlign_Right) );
 	AddWidgetToState(eMainMenuState_OptionsSound,pWidgetSoundOutputDevice);
 	vPos.y += 35;
-    AddWidgetToState(eMainMenuState_OptionsSound,hplNew( cMainMenuWidget_GfxBack, (mpInit,vPos,kTranslate("MainMenu","Back"),23,eFontAlign_Center)) ); 
+#ifdef PENUMBRA_MULTIPLAYER
+	if (gbTechDemoMode)
+	{
+		/* co-op voice: the microphone lives here in the tech demo menu */
+		AddWidgetToState(eMainMenuState_OptionsSound, hplNew(cMainMenuWidget_MultiMic,(mpInit, cVector3f(400, vPos.y, 40))));
+		vPos.y += 56;
+	}
+#endif
+    AddWidgetToState(eMainMenuState_OptionsSound,hplNew( cMainMenuWidget_GfxBack, (mpInit,vPos,kTranslate("MainMenu","Back"),23,eFontAlign_Center)) );
 
 
 	//Text
@@ -5788,12 +6116,15 @@ void cMainMenu::CreateWidgets()
 	gpSoundVolumeText->SetExtraWidget(pWidgetSoundVolume);
 
 	vPos.y += 29;
-	sText = mpInit->mbUseSoundHardware ? kTranslate("MainMenu","On") : kTranslate("MainMenu","Off");
-	gpSoundHardwareText = hplNew( cMainMenuWidget_Text, (mpInit,vPos,sText,20,eFontAlign_Left) );
-	AddWidgetToState(eMainMenuState_OptionsSound,gpSoundHardwareText); 
-	gpSoundHardwareText->SetExtraWidget(pWidgetSoundHardware);
+	if (pWidgetSoundHardware)
+	{
+		sText = mpInit->mbUseSoundHardware ? kTranslate("MainMenu","On") : kTranslate("MainMenu","Off");
+		gpSoundHardwareText = hplNew( cMainMenuWidget_Text, (mpInit,vPos,sText,20,eFontAlign_Left) );
+		AddWidgetToState(eMainMenuState_OptionsSound,gpSoundHardwareText);
+		gpSoundHardwareText->SetExtraWidget(pWidgetSoundHardware);
 
-	vPos.y += 29;
+		vPos.y += 29;
+	}
 	// Set the default to what's really being used
 	mpInit->msDeviceName = tString(OAL_Info_GetDeviceName());
 

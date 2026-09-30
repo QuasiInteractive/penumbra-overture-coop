@@ -334,7 +334,10 @@ void cPlayer::SetActive(bool abActive)
 {
 	mbActive = abActive;
 
-	if(mbActive==false)
+	/* A message being read stays up: scripts (the tech demo's tutorials)
+	   show a message and THEN freeze the player until it is clicked away;
+	   leaving the message state here made that click impossible. */
+	if(mbActive==false && mState != ePlayerState_Message)
 	{
 		ChangeState(ePlayerState_Normal);
 	}

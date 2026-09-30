@@ -32,6 +32,9 @@ struct cDiscoveredServer
 	/** Internet rows: seconds since the host's last master beacon (0..65535);
 	    LAN rows: 0. */
 	uint16_t mlAgeSeconds;
+	/** v20: LAN rows: the host's per-session id from its pong (merges the
+	    replies it sends on each of its network adapters); internet rows: 0. */
+	uint32_t mlHostNonce;
 	/** true = came from the master server, false = LAN pong. */
 	bool mbInternet;
 
@@ -125,6 +128,27 @@ public:
 	/** v5 shared world. Called when the local player pockets an item — the
 	    other machines deactivate their copy (one-of-each items). */
 	void NetOnItemPicked(const hpl::tString &asEntityName);
+
+	/** v22 friendly fire. The melee swing asks for every other player's
+	    solid body (ghost colliders, incl. the offline preview ghost) ... */
+	void GetGhostHitBodies(std::vector<std::pair<uint8_t, hpl::iPhysicsBody *> > &avOut);
+	/** ... and reports a hit here. Routed to the victim's machine through
+	    the host, which enforces friendly_fire. */
+	void NetOnMeleeHitPlayer(uint8_t alTargetId, float afDamage, const hpl::cVector3f &avFrom);
+
+	//---------------- microphone picker (menu) ----------------
+	void GetMicrophoneNames(std::vector<hpl::tString> &avOut) const;
+	/** multiplayer.cfg voice_capture_device ("" = system default). */
+	const hpl::tString &GetMicrophone() const { return msVoiceCaptureDevice; }
+	/** Stores it, writes voice_capture_device= (every other line kept) and
+	    switches the live microphone. */
+	void SetMicrophone(const hpl::tString &asName);
+	/** The picker calls this every frame it is on screen; the test runs
+	    while it keeps coming (UpdateVoice). */
+	void KeepMicTestAlive() { mfMicTestKeepAlive = 0.3f; }
+	float GetMicTestLevel() const;
+	int GetMicTestState() const;
+	hpl::tString GetMicTestDeviceName() const;
 
 	/** Host lobby UI: guests currently on the socket. */
 	int GetConnectedGuestCount() const;
@@ -274,6 +298,8 @@ private:
 
 	uint8_t mlLocalPlayerId;
 	uint16_t mlListenPort;
+	uint32_t mlHostNonce; /**< v20: drawn in HostGame, stamped on every
+	    discovery pong (0 = not hosting) */
 	uint8_t mlNextGuestId;
 	uint16_t mlDefaultPort;
 
@@ -318,6 +344,13 @@ private:
 	    F6/F7 cycle clips, F8 toggles crouch, F2 cycles the treadmill
 	    (off / walk / run in a circle). */
 	bool mbGhostPreview;
+	bool mbFriendlyFire; /**< v22: multiplayer.cfg friendly_fire (host decides) */
+	bool mbSharedLoot;   /**< v23: multiplayer.cfg shared_loot (host decides) */
+	/** v23: a friend's pickup (or the late-join snapshot) gives us the item.
+	    alCount > 0 sets a counted item's amount (snapshot); -1 = the .ent's. */
+	void GiveSharedItem(const hpl::tString &asName, const hpl::tString &asFile, int alCount);
+	void ApplyPlayerHit(const cNetPlayerHit &aHit);
+	void HostRoutePlayerHit(uint8_t alAuthor, const void *apData, size_t alLen);
 	int mlGhostPreviewModel;      /**< ghost_preview_model: index into ghost_models */
 	cGhostPlayer *mpPreviewGhost;
 	uint16_t mlPreviewSeq;        /**< synthetic sender counter */
@@ -660,6 +693,7 @@ private:
 	float mfVoiceVolume;   /**< multiplayer.cfg voice_volume (default 1.0) */
 	float mfVoiceGateDb;               /**< multiplayer.cfg voice_gate_db (default -45) */
 	hpl::tString msVoiceCaptureDevice; /**< multiplayer.cfg voice_capture_device ("" = default) */
+	float mfMicTestKeepAlive;          /**< menu mic test runs while > 0 */
 #ifdef PENUMBRA_MULTIPLAYER
 	/** Per frame after UpdateGhosts: (de)initialise with the session,
 	    positions, PTT, capture/encode/playback, send the outbox. */

@@ -1752,6 +1752,59 @@ SCRIPT_DEFINE_FUNC_4(void, CreateSoundEntityAt, string, string, string, string)
 
 //-----------------------------------------------------------------------
 
+
+//-----------------------------------------------------------------------
+// Tech demo (2006) script signatures. Four functions grew parameters on
+// the way to Overture; the tech demo's level scripts still call the old
+// forms, and a call AngelScript cannot match fails the WHOLE level script.
+// Each old form is registered under the same script name (AngelScript
+// overloads by parameter list) and forwards with the value Overture's own
+// scripts use for the new parameter.
+//-----------------------------------------------------------------------
+
+static void __stdcall TD_ChangeMap6(std::string asMapFile, std::string asMapPos,
+									std::string asStartSound, std::string asStopSound,
+									float afFadeOutTime, float afFadeInTime)
+{
+	ChangeMap(asMapFile, asMapPos, asStartSound, asStopSound, afFadeOutTime, afFadeInTime, "", "");
+}
+SCRIPT_DEFINE_FUNC_6(void, TD_ChangeMap6, string, string, string, string, float, float)
+
+static void __stdcall TD_CreateSplashDamage7(std::string asAreaName, float afRadius,
+											 float afMinDamage, float afMaxDamage,
+											 float afMinForce, float afMaxForce, float afMaxImpulse)
+{
+	/* 8 = the strength Overture's dynamite uses */
+	CreateSplashDamage(asAreaName, afRadius, afMinDamage, afMaxDamage, afMinForce, afMaxForce,
+					   afMaxImpulse, 8);
+}
+SCRIPT_DEFINE_FUNC_7(void, TD_CreateSplashDamage7, string, float, float, float, float, float, float)
+
+static void __stdcall TD_GivePlayerDamage1(float afAmount)
+{
+	GivePlayerDamage(afAmount, "BloodSplash");
+}
+SCRIPT_DEFINE_FUNC_1(void, TD_GivePlayerDamage1, float)
+
+static void __stdcall TD_SetPlayerPose1(std::string asPose)
+{
+	SetPlayerPose(asPose, false);
+}
+SCRIPT_DEFINE_FUNC_1(void, TD_SetPlayerPose1, string)
+
+/* SCRIPT_REGISTER_FUNC with a script name other than the C++ one */
+#if defined(AS_MAX_PORTABILITY)
+	#define SCRIPT_REGISTER_FUNC_AS(funcname, scriptname) \
+		GenericScript::funcname##_return + " " scriptname " (" + GenericScript::funcname##_arg + ")", \
+		(void *)GenericScript::funcname##_Generic, asCALL_GENERIC
+#else
+	#define SCRIPT_REGISTER_FUNC_AS(funcname, scriptname) \
+		GenericScript::funcname##_return + " " scriptname " (" + GenericScript::funcname##_arg + ")", \
+		(void *)funcname, asCALL_STDCALL
+#endif
+
+//-----------------------------------------------------------------------
+
 void cGameScripts::Init()
 {
 	iLowLevelSystem *pLowLevelSystem = gpInit->mpGame->GetSystem()->GetLowLevel();
@@ -1782,6 +1835,11 @@ void cGameScripts::Init()
 	pLowLevelSystem->AddScriptFunc(SCRIPT_REGISTER_FUNC(SetMessagesOverCallback));
 
 	pLowLevelSystem->AddScriptFunc(SCRIPT_REGISTER_FUNC(ChangeMap));
+	/* tech demo forms (see TD_ above) */
+	pLowLevelSystem->AddScriptFunc(SCRIPT_REGISTER_FUNC_AS(TD_ChangeMap6, "ChangeMap"));
+	pLowLevelSystem->AddScriptFunc(SCRIPT_REGISTER_FUNC_AS(TD_CreateSplashDamage7, "CreateSplashDamage"));
+	pLowLevelSystem->AddScriptFunc(SCRIPT_REGISTER_FUNC_AS(TD_GivePlayerDamage1, "GivePlayerDamage"));
+	pLowLevelSystem->AddScriptFunc(SCRIPT_REGISTER_FUNC_AS(TD_SetPlayerPose1, "SetPlayerPose"));
 
 	pLowLevelSystem->AddScriptFunc(SCRIPT_REGISTER_FUNC(SetMapGameName));
 	pLowLevelSystem->AddScriptFunc(SCRIPT_REGISTER_FUNC(SetMapGameNameTrans));

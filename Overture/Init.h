@@ -55,12 +55,30 @@ class cMainMenu;
 
 #include "GameTypes.h"
 
+/* where multiplayer.cfg is read and written, and the co-op character
+   models folder: the game folder normally; the tech demo co-op install
+   keeps multiplayer.cfg in Documents (see gbTechDemoCoopFolder) */
+extern tString gsMultiplayerCfg;
+extern tString gsGhostModelDir;
+extern bool gbTechDemoCoopFolder;
+extern tString gsTechDemoDir;
+extern bool gbTechDemoMode;
+
 #if defined(WIN32)
 	#define PERSONAL_RELATIVEROOT
 	#define PERSONAL_RELATIVEPIECES
 	#define PERSONAL_RELATIVEPIECES_COUNT 0
 	#define PERSONAL_RELATIVEGAME_PARENT _W("Penumbra Overture/")
-	#define PERSONAL_RELATIVEGAME _W("Penumbra Overture/Episode1/")
+	/* Tech demo co-op mode (-techdemo) keeps its own settings, log and
+	   saves next to Overture's, never mixed with them. A function, so it
+	   is joined with '+', not by literal concatenation. */
+	extern bool gbTechDemoMode;
+	inline tWString PersonalRelativeGame()
+	{
+		return gbTechDemoMode ? tWString(_W("Penumbra Overture/TechDemo/")) :
+								tWString(_W("Penumbra Overture/Episode1/"));
+	}
+	#define PERSONAL_RELATIVEGAME PersonalRelativeGame()
 #elif defined(__linux__)
 	#define PERSONAL_RELATIVEROOT _W(".frictionalgames/")
 	#define PERSONAL_RELATIVEPIECES _W(".frictionalgames"),

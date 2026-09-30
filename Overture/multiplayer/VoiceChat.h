@@ -62,8 +62,25 @@ public:
 	float GetOpenMicThresholdDb() const { return mfGateDbfs; }
 	/** multiplayer.cfg voice_capture_device: an OpenAL capture device name
 	    as hpl.log lists it (" voice: capture device: ..."); empty = the
-	    system default recording device. Takes effect on the next open. */
-	void SetCaptureDevice(const hpl::tString &asName) { msCaptureDevice = asName; }
+	    system default recording device. Changing it closes the microphone
+	    (and the menu test) so the next use opens the new device. */
+	void SetCaptureDevice(const hpl::tString &asName);
+	const hpl::tString &GetCaptureDevice() const { return msCaptureDevice; }
+
+	/** Menu microphone picker: every recording device OpenAL can open, in
+	    its order (empty in the stub build / with no microphone). */
+	static void GetCaptureDeviceNames(std::vector<hpl::tString> &avOut);
+
+	/** Menu microphone test (no session needed). abActive = the picker is on
+	    screen this frame: opens the chosen device (retrying every 2 s if it
+	    fails), reads it and tracks a level; inactive closes it again. */
+	void UpdateMicTest(float afTimeStep, bool abActive);
+	/** 0..1 input level for the meter (peak-held, decays). */
+	float GetMicTestLevel() const;
+	/** 0 = not running, 1 = no microphone opened, 2 = listening. */
+	int GetMicTestState() const;
+	/** The device the test actually opened (resolves "system default"). */
+	hpl::tString GetMicTestDeviceName() const;
 
 	/** Create the Opus encoder and check for an OpenAL context. Called when
 	    a session goes live (hosting, or a synced guest). Idempotent; returns

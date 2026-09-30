@@ -83,8 +83,32 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
         host's list index, and a guest with another order showed the host
         as Malik). mCharacter stays as the fallback when the name is not in
         the receiver's list. Every list is also put in the fixed character
-        order now (phillip first), ghost_models= included. */
-static const uint16_t kNetProtocolVersion = 19;
+        order now (phillip first), ghost_models= included.
+    v20: cNetDiscoveryPong grew mlHostNonce, a random id the host draws
+        each time it starts hosting. A host with several network adapters
+        (LAN, Hamachi, Radmin, virtual NICs) answers the browser's ping on
+        every one of them, each reply from a different source address, so
+        one game showed up as ~10 rows. The browser now merges replies with
+        the same nonce into one row, and a browser that is itself hosting
+        drops replies carrying its OWN nonce.
+    v21: held items — cNetPlayerState grew mHeldLeft / mHeldRight
+        (eNetHeldItem): what the sender holds in each hand (the first-person
+        hands' slot 0 = left: flashlight/glowstick/flare, slot 1 = right:
+        melee weapons and throwables). The ghost shows the item's world
+        model in that hand; its flashlight beam starts at the held lens.
+    v22: friendly fire — reliable cNetPlayerHit (type 31): a melee swing hit
+        another player's body. Guest -> host; the HOST decides (multiplayer.cfg
+        friendly_fire, default on), stamps the attacker from the peer and
+        applies it to itself or forwards it to the victim's machine only.
+        The victim's machine applies the damage (health lives there).
+    v23: shared loot — cNetItemPickup grew msFile (the item's .ent) and
+        mbGive: when set, every receiver ALSO gets the item (Inventory::
+        AddItemFromFile, which runs the level's pick-up callback locally).
+        The HOST decides (multiplayer.cfg shared_loot, default on) and
+        re-stamps mbGive on guests' pickups it relays. New world-snapshot
+        section eNetSnap_SharedItem: the host's inventory (name, .ent,
+        count), so a late joiner starts with the party's items. */
+static const uint16_t kNetProtocolVersion = 23;
 
 
 /** v13: cNetPlayerName::msName capacity. A name is at most this many
@@ -123,6 +147,7 @@ static const uint16_t kNetDiscoveryPort = 7778;
 
 enum eNetPacketType : uint8_t
 {
+	eNetPacketType_PlayerHit = 31, /* v22: melee hit on another player (see history) */
 	eNetPacketType_PlayerState = 1,
 	eNetPacketType_PlayerJoin = 2,
 	eNetPacketType_PlayerLeave = 3,
@@ -253,8 +278,18 @@ enum eNetSnapSection : uint8_t
 	eNetSnap_PartyItem = 5, /* char name[32][] — inventory names the party holds */
 	eNetSnap_Enemy = 6,     /* cNetEnemyState[] */
 	eNetSnap_Timer = 7,     /* cNetSnapTimer[]  — the host's LOCAL timers */
+	eNetSnap_SharedItem = 8, /* cNetSnapSharedItem[] — v23: the host's inventory
+	                            (shared loot: a late joiner gets these) */
 	eNetSnap_End = 255,     /* mCount = ObjectState body chunks that were sent
 	                           between Begin and End (informational) */
+};
+
+/** v23: one item of the host's inventory in the world snapshot. */
+struct cNetSnapSharedItem
+{
+	char msName[32];
+	char msFile[64];
+	int32_t mlCount; /**< HasCount items: how many; others 1 */
 };
 
 /** cNetSnapEntity::mFlags */
@@ -326,6 +361,24 @@ enum eNetPlayerFlags : uint8_t
     (+-3.175 m/s covers Movement_Run ForwardSpeed with margin). */
 static const float kNetPlayerVelScale = 40.0f;
 
+/** v21: cNetPlayerState::mHeldLeft / mHeldRight. Values are FROZEN wire
+    ids; a receiver treats anything >= eNetHeldItem_Count as empty-handed.
+    The name -> id -> world model table lives in GhostPlayer.cpp. */
+enum eNetHeldItem : uint8_t
+{
+	eNetHeldItem_None = 0,
+	eNetHeldItem_Flashlight = 1,
+	eNetHeldItem_Glowstick = 2,
+	eNetHeldItem_Flare = 3,      /* the lit flare, left hand */
+	eNetHeldItem_Hammer = 4,
+	eNetHeldItem_PickAxe = 5,
+	eNetHeldItem_Broom = 6,      /* modern mine broom (BroomWeapon) */
+	eNetHeldItem_Dynamite = 7,
+	eNetHeldItem_Meat = 8,
+	eNetHeldItem_FlareThrow = 9, /* a flare readied for throwing, right hand */
+	eNetHeldItem_Count
+};
+
 #pragma pack(push, 1)
 struct cNetPlayerState
 {
@@ -349,6 +402,8 @@ struct cNetPlayerState
 	int8_t mVelRight; /**< v11: same along the view right */
 	uint8_t mFlags;   /**< v11: eNetPlayerFlags */
 	uint8_t mHealth;  /**< v12: sender's cPlayer health, 0-100 rounded */
+	uint8_t mHeldLeft;  /**< v21: eNetHeldItem in the left hand */
+	uint8_t mHeldRight; /**< v21: eNetHeldItem in the right hand */
 };
 
 /** Server tells a joining peer their wire id (= eNetPacketType_PlayerJoin). */
@@ -428,6 +483,8 @@ struct cNetItemPickup
 	    PARTY inventory, so script HasItem() checks pass when ANY member
 	    holds the item (a split torch+glowstick could otherwise deadlock
 	    the boat-cabin door for everyone). */
+	char msFile[64];  /**< v23: the item's .ent (bare file name); "" = unknown */
+	uint8_t mbGive;   /**< v23: receivers get the item too (host-stamped) */
 };
 
 /** Host -> guest immediately on connect (reliable ch0, BEFORE PlayerJoin). */
@@ -468,6 +525,8 @@ struct cNetDiscoveryPong
 	uint8_t mlMaxPlayers;
 	char msServerName[32];    /* null-terminated, truncated */
 	char msMapName[32];
+	uint32_t mlHostNonce;     /* v20: random per hosting session (never 0) —
+	                             one row per host, however many adapters */
 };
 #pragma pack(pop)
 
@@ -624,6 +683,18 @@ struct cNetEnemyDamage
 	uint32_t mlNameHash;
 	float mfDamage; /**< RAW damage — the host applies its own scaling */
 	int8_t mlStrength;
+};
+
+/** v22: one melee hit on a player. mAttackerID is re-stamped by the host
+    from the sending peer; mfFrom = the attacker's camera position (the
+    victim's damage direction). */
+struct cNetPlayerHit
+{
+	uint8_t mType;       /**< eNetPacketType_PlayerHit */
+	uint8_t mTargetID;
+	uint8_t mAttackerID;
+	float mfDamage;
+	float mfFromX, mfFromY, mfFromZ;
 };
 
 struct cNetPlayerDamage
@@ -802,9 +873,9 @@ static_assert(sizeof(cNetPlayerLeave) == 2, "");
 static_assert(sizeof(cNetPlayerName) == 51, ""); /* v13; v17: +mCharacter; v19: +msCharacter */
 static_assert(sizeof(cNetCharacterRequest) == 25, ""); /* v18 */
 static_assert(sizeof(cNetVoice) == 5, "");       /* v16 */
-static_assert(sizeof(cNetPlayerState) == 30, ""); /* v7: +mSeq; v11: +vel/flags; v12: +mHealth */
+static_assert(sizeof(cNetPlayerState) == 32, ""); /* v7: +mSeq; v11: +vel/flags; v12: +mHealth; v21: +held */
 static_assert(sizeof(cNetDiscoveryPing) == 7, "");
-static_assert(sizeof(cNetDiscoveryPong) == 75, "");
+static_assert(sizeof(cNetDiscoveryPong) == 79, ""); /* v20: +mlHostNonce */
 static_assert(sizeof(cNetObjectState) == 33, "");
 static_assert(sizeof(cNetObjectStateBatch) == 5, ""); /* v7: +mSeq */
 static_assert(sizeof(cNetBodyCensus) == 8, "");
@@ -814,7 +885,7 @@ static_assert(sizeof(cNetBodyGrabEnd) == 17, "");
 static_assert(sizeof(cNetBodyPush) == 30, "");
 static_assert(sizeof(cNetBodyGrabDeny) == 5, "");
 static_assert(sizeof(cNetMapChange) == 129, "");
-static_assert(sizeof(cNetItemPickup) == 37, ""); /* v9: +msItemName */
+static_assert(sizeof(cNetItemPickup) == 102, ""); /* v9: +msItemName; v23: +msFile +mbGive */
 static_assert(sizeof(cNetItemDrop) == 137, "");
 static_assert(sizeof(cNetVersionAck) == 3, "");
 static_assert(sizeof(cNetEnemyBatch) == 5, "");
@@ -822,6 +893,8 @@ static_assert(sizeof(cNetEnemyState) == 29, "");
 static_assert(sizeof(cNetEnemyEvent) == 6, "");
 static_assert(sizeof(cNetEnemyDamage) == 10, "");
 static_assert(sizeof(cNetPlayerDamage) == 6, "");
+static_assert(sizeof(cNetPlayerHit) == 19, ""); /* v22 */
+static_assert(sizeof(cNetSnapSharedItem) == 100, ""); /* v23 */
 static_assert(sizeof(cNetScriptEvent) == 54, "");
 static_assert(sizeof(cNetEntityDamage) == 10, "");
 static_assert(sizeof(cNetMapReady) == 12, "");     /* v14 */

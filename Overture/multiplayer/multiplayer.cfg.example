@@ -62,6 +62,15 @@ character=
 #                 — every player is a different character, so with the four
 #                 shipped characters max_players=8 still means 4 (hpl.log:
 #                 "player cap 4 = min(max_players 8, 4 character(s))").
+# friendly_fire=1 — v22: melee weapons (hammer, pickaxe, broom) hurt other
+#                 players. HOST setting: the host decides for the whole
+#                 lobby (0 = off; guests' hits are then dropped). Default 1.
+# shared_loot=1 — v23: whoever picks an item up, EVERYONE gets it (a copy
+#                 each; stacking items like batteries add one per player).
+#                 The level's pick-up event runs for everyone, and a friend
+#                 who joins late gets the items the host carries. HOST
+#                 setting; 0 = one-of-each (the item goes to whoever grabbed
+#                 it; hand it over by dragging it out of the inventory).
 # server_name=Penumbra Server
 max_players=4
 port=7777
@@ -141,8 +150,10 @@ coop_respawn=1
 # voice_gate_db=-45 — open-mic gate in dBFS (-70..-10). hpl.log prints the
 #                     loudest level it saw if nothing ever passed the gate.
 # voice_capture_device= — record from this OpenAL capture device instead of
-#                     the Windows default recording device; hpl.log lists the
-#                     names (" voice: capture device: ..." lines). Empty = default.
+#                     the Windows default recording device. Easiest: pick it
+#                     in the Multiplayer menu ('Microphone: < name >' — the
+#                     level bar under it shows what the mic hears), which
+#                     writes this line. Empty = default.
 # Not heard / not sending? Search hpl.log for " voice:" — every stage logs once
 # (microphone opened, first samples, first packet out, first packet in, playback
 # started, per-burst mic level / distance / gain).

@@ -126,6 +126,12 @@ void cVoiceChat::DropPlayer(uint8_t) {}
 void cVoiceChat::DropAllPlayers() {}
 bool cVoiceChat::IsTalking(uint8_t) const { return false; }
 const char *cVoiceChat::GetStatusHint() const { return NULL; }
+void cVoiceChat::SetCaptureDevice(const tString &asName) { msCaptureDevice = asName; }
+void cVoiceChat::GetCaptureDeviceNames(std::vector<tString> &avOut) { avOut.clear(); }
+void cVoiceChat::UpdateMicTest(float, bool) {}
+float cVoiceChat::GetMicTestLevel() const { return 0.0f; }
+int cVoiceChat::GetMicTestState() const { return 0; }
+tString cVoiceChat::GetMicTestDeviceName() const { return tString(""); }
 
 #else /* PENUMBRA_MULTIPLAYER && PENUMBRA_VOICE */
 
@@ -379,6 +385,10 @@ struct cVoiceChat::Impl
 		  , mlTxBurstsLogged(0)
 		  , mbMicSilent(false)
 		  , mbSilentLogged(false)
+		  , mpTestCapture(NULL)
+		  , mfTestLevel(0.0f)
+		  , mfTestRetry(0.0f)
+		  , mbTestFailed(false)
 		  , mbTalkKeyLogged(false)
 	{
 		memset(mvEncodeBuf, 0, sizeof(mvEncodeBuf));
@@ -557,6 +567,27 @@ struct cVoiceChat::Impl
 			alcCaptureCloseDevice(mpCapture);
 			mpCapture = NULL;
 		}
+	}
+
+	//---------------- menu microphone test ----------------
+	ALCdevice *mpTestCapture;
+	float mfTestLevel;       /* 0..1, peak-held */
+	float mfTestRetry;
+	bool mbTestFailed;
+	tString msTestOpened;
+
+	void CloseTestCapture()
+	{
+		if (mpTestCapture)
+		{
+			alcCaptureStop(mpTestCapture);
+			alcCaptureCloseDevice(mpTestCapture);
+			mpTestCapture = NULL;
+		}
+		mfTestLevel = 0.0f;
+		mfTestRetry = 0.0f;
+		mbTestFailed = false;
+		msTestOpened = "";
 	}
 
 	/** Pull everything the device has into mvPending (bounded).
@@ -1575,6 +1606,133 @@ const char *cVoiceChat::GetStatusHint() const
 // Shared by the real and the stub build.
 //======================================================================
 
+#if defined(PENUMBRA_MULTIPLAYER) && defined(PENUMBRA_VOICE)
+//-----------------------------------------------------------------------
+// Microphone picker + menu test
+//-----------------------------------------------------------------------
+
+void cVoiceChat::SetCaptureDevice(const tString &asName)
+{
+	if (asName == msCaptureDevice)
+		return;
+	msCaptureDevice = asName;
+	if (mpImpl)
+	{
+		/* the session mic reopens on the next push-to-talk with the new
+		   device; the menu test reopens on its next frame */
+		mpImpl->CloseCapture();
+		mpImpl->mbCaptureFailed = false;
+		mpImpl->mfCaptureRetry = 0.0f;
+		mpImpl->mbCaptureStartLogged = false;
+		mpImpl->mbMicSilent = false;
+		mpImpl->CloseTestCapture();
+	}
+	mbMicOpen = false;
+	Log(" voice: microphone set to \"%s\"\n",
+		asName.empty() ? "<system default>" : asName.c_str());
+}
+
+void cVoiceChat::GetCaptureDeviceNames(std::vector<tString> &avOut)
+{
+	avOut.clear();
+	const ALCchar *list = alcGetString(NULL, ALC_CAPTURE_DEVICE_SPECIFIER);
+	for (const ALCchar *d = list; d && *d && avOut.size() < 32; d += strlen(d) + 1)
+		avOut.push_back(tString(d));
+}
+
+void cVoiceChat::UpdateMicTest(float afTimeStep, bool abActive)
+{
+	if (!mpImpl)
+		return;
+	Impl *im = mpImpl;
+	if (!abActive)
+	{
+		if (im->mpTestCapture || im->mbTestFailed)
+			im->CloseTestCapture();
+		return;
+	}
+	if (afTimeStep < 0.0f) afTimeStep = 0.0f;
+	else if (afTimeStep > 0.25f) afTimeStep = 0.25f;
+
+	if (im->mpTestCapture == NULL)
+	{
+		if (im->mbTestFailed)
+		{
+			im->mfTestRetry -= afTimeStep;
+			if (im->mfTestRetry > 0.0f)
+				return;
+		}
+		const char *sName = msCaptureDevice.empty() ? NULL : msCaptureDevice.c_str();
+		ALCdevice *d = alcCaptureOpenDevice(sName, (ALCuint)kNetVoiceSampleRate,
+			AL_FORMAT_MONO16, (ALCsizei)kCaptureRingSamples);
+		if (d)
+		{
+			alcCaptureStart(d);
+			if (alcGetError(d) != ALC_NO_ERROR)
+			{
+				alcCaptureCloseDevice(d);
+				d = NULL;
+			}
+		}
+		if (d == NULL)
+		{
+			if (!im->mbTestFailed)
+				Log(" voice: mic test could not open \"%s\"\n",
+					sName ? sName : "<system default>");
+			im->mbTestFailed = true;
+			im->mfTestRetry = 2.0f;
+			im->mfTestLevel = 0.0f;
+			return;
+		}
+		im->mpTestCapture = d;
+		im->mbTestFailed = false;
+		const ALCchar *nm = alcGetString(d, ALC_CAPTURE_DEVICE_SPECIFIER);
+		im->msTestOpened = (nm && *nm) ? tString(nm) : tString("");
+	}
+
+	/* read everything available; the loudest 20 ms frame drives the meter */
+	float fLoudest = -100.0f;
+	for (int lGuard = 0; lGuard < 16; ++lGuard)
+	{
+		ALCint avail = 0;
+		alcGetIntegerv(im->mpTestCapture, ALC_CAPTURE_SAMPLES, 1, &avail);
+		if (avail < kFrameSamples)
+			break;
+		int16_t frame[kFrameSamples];
+		alcCaptureSamples(im->mpTestCapture, frame, kFrameSamples);
+		const float fDb = FrameLevelDbfs(frame, kFrameSamples);
+		if (fDb > fLoudest)
+			fLoudest = fDb;
+	}
+	/* -60 dBFS (room hum) .. -6 dBFS (shouting) -> 0..1 */
+	float fNow = (fLoudest + 60.0f) / 54.0f;
+	if (fNow < 0.0f) fNow = 0.0f;
+	else if (fNow > 1.0f) fNow = 1.0f;
+	const float fDecayed = im->mfTestLevel - afTimeStep * 1.5f;
+	im->mfTestLevel = (fNow > fDecayed) ? fNow : (fDecayed > 0.0f ? fDecayed : 0.0f);
+}
+
+float cVoiceChat::GetMicTestLevel() const
+{
+	return mpImpl ? mpImpl->mfTestLevel : 0.0f;
+}
+
+int cVoiceChat::GetMicTestState() const
+{
+	if (!mpImpl)
+		return 0;
+	if (mpImpl->mpTestCapture)
+		return 2;
+	return mpImpl->mbTestFailed ? 1 : 0;
+}
+
+tString cVoiceChat::GetMicTestDeviceName() const
+{
+	return mpImpl ? mpImpl->msTestOpened : tString("");
+}
+
+#endif
+
 cVoiceChat::cVoiceChat()
 	: mbEnabled(true)
 	  , mbOpenMic(false)
@@ -1596,6 +1754,10 @@ cVoiceChat::cVoiceChat()
 cVoiceChat::~cVoiceChat()
 {
 	Shutdown();
+#if defined(PENUMBRA_MULTIPLAYER) && defined(PENUMBRA_VOICE)
+	if (mpImpl)
+		mpImpl->CloseTestCapture();
+#endif
 	delete mpImpl; /* NULL in the stub build */
 	mpImpl = NULL;
 }

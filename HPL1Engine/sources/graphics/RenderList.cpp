@@ -360,6 +360,18 @@ namespace hpl {
 	{
 		if(apObject->IsVisible()==false) return false;
 
+		//A mesh or particle whose material failed to load (content made for
+		//another game or engine version) is skipped, not dereferenced.
+		if(apObject->GetMaterial()==NULL &&
+			(apObject->GetRenderType()==eRenderableType_Normal ||
+			 apObject->GetRenderType()==eRenderableType_ParticleSystem))
+		{
+			static std::set<iRenderable*> setWarned;
+			if(setWarned.insert(apObject).second)
+				Warning("'%s' has no material, not drawn\n",apObject->GetName().c_str());
+			return false;
+		}
+
 		//Check if the object is culled by fog.
 		cRenderer3D *pRenderer = mpGraphics->GetRenderer3D();
 		if(pRenderer->GetFogActive() && pRenderer->GetFogCulling())

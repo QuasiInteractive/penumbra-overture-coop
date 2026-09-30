@@ -171,6 +171,9 @@ namespace hpl {
 		void ClearResourceDirs();
 
 		bool SetLanguageFile(const tString &asFile);
+		/** Overlay another language file (full path) on the loaded one:
+		    its entries replace same-named ones. */
+		bool AddLanguageOverlay(const tString &asPath);
 		const tWString& Translate(const tString& asCat, const tString& asName);
 
 		void AddEntity2DLoader(iEntity2DLoader* apLoader);

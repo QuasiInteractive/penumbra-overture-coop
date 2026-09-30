@@ -70,6 +70,12 @@ endif()
 # MSVC deprecation noise (sprintf, strncpy, fopen, …) across HPL + OALWrapper + Penumbra sources.
 if(MSVC)
 	add_definitions(-D_CRT_SECURE_NO_WARNINGS)
+	# Release builds carry debug symbols (overture.pdb next to the exe) so
+	# the crash reporter in Main.cpp can name functions and lines in
+	# hpl.log. Code generation stays fully optimised.
+	string(APPEND CMAKE_C_FLAGS_RELEASE " /Zi")
+	string(APPEND CMAKE_CXX_FLAGS_RELEASE " /Zi")
+	string(APPEND CMAKE_EXE_LINKER_FLAGS_RELEASE " /DEBUG /OPT:REF /OPT:ICF")
 endif()
 
 add_subdirectory("${OAL_ROOT}" "${CMAKE_BINARY_DIR}/thirdparty/oalwrapper")
@@ -224,6 +230,7 @@ target_include_directories(Overture PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/multipl
 if(MSVC AND WIN32)
 	target_link_options(Overture PRIVATE /SAFESEH:NO)
 	target_link_libraries(Overture PRIVATE legacy_stdio_definitions)
+	target_link_libraries(Overture PRIVATE dbghelp) # crash reporter (Main.cpp)
 endif()
 
 if(PENUMBRA_MULTIPLAYER)

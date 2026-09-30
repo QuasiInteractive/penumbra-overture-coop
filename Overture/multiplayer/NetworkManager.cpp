@@ -32,6 +32,9 @@ static void ScriptVarNetThunk(int alOp, const char* asName, int alVal)
 #include "MainMenu.h" 
 #include "Player.h"
 #include "PlayerHelper.h"
+#include "PlayerHands.h"  /* v21: held items */
+#include "FadeHandler.h"   /* v20: snapshot presentation hand-back */
+#include "EffectHandler.h"
 #include "input/ActionKeyboard.h"
 #include "scene/Camera3D.h"
 #include "scene/World3D.h"
@@ -43,6 +46,7 @@ static void ScriptVarNetThunk(int alOp, const char* asName, int alVal)
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <ctime>
 #include <ctime> /* v15: nonce seed */
 #include <algorithm> /* character discovery: std::sort */
 
@@ -64,6 +68,19 @@ int8_t EncodeNetVel(float afMetersPerSec)
 	else if (f < -127.0f) f = -127.0f;
 	const int l = (f >= 0.0f) ? (int)(f + 0.5f) : -(int)(-f + 0.5f);
 	return (int8_t)l;
+}
+
+/** v21: what the local player holds in first-person hand slot 0 (left)
+    or 1 (right), as a wire id. A model on its way out (unequip) already
+    counts as empty-handed. */
+uint8_t LocalHeldItem(cInit *apInit, int alSlot)
+{
+	if (apInit == NULL || apInit->mpPlayerHands == NULL)
+		return eNetHeldItem_None;
+	iHudModel *pModel = apInit->mpPlayerHands->GetCurrentModel(alSlot);
+	if (pModel == NULL || pModel->GetState() == eHudModelState_Unequip)
+		return eNetHeldItem_None;
+	return cGhostPlayer::HeldItemFromHudName(pModel->msName, alSlot);
 }
 }
 
@@ -92,6 +109,8 @@ bool cNetworkManager::BuildLocalSnapshot(cNetPlayerState *apOut) const
 	apOut->mfYaw = cMath::Wrap(cam->GetYaw(), -kPif, kPif);
 	cPlayerFlashLight *fl = mpInit->mpPlayer->GetFlashLight();
 	apOut->mbFlashlightOn = (uint8_t)(fl && fl->IsActive() && !fl->IsDisabled());
+	apOut->mHeldLeft = LocalHeldItem(mpInit, 0);  /* v21 */
+	apOut->mHeldRight = LocalHeldItem(mpInit, 1);
 	/* Engine -> wire stance mapping, explicit per state so an engine enum
 	   reorder cannot silently change the protocol (the wire values are frozen
 	   — see eNetMoveState). Unknown states go out as Run. */
@@ -176,9 +195,10 @@ cGhostPlayer *cNetworkManager::CreateGhost(uint8_t alId, size_t alMeshIdx)
 	   rounds of eyeball-grounding against verified-grounded clips measured
 	   in the pre-v11 camera-relative days) — that eye height is what the
 	   enemy senses and the lights get. */
-	float fCamAdd = 0.0f, fStandH = 1.9f, fCrouchH = 1.0f;
+	float fCamAdd = 0.0f, fStandH = 1.9f, fCrouchH = 1.0f, fWidth = 0.5f;
 	if (mpInit && mpInit->mpGameConfig)
 	{
+		fWidth = mpInit->mpGameConfig->GetFloat("Player", "Width", 0.5f);
 		fCamAdd = mpInit->mpGameConfig->GetFloat("Player", "CameraHeightAdd", 0);
 		fStandH = mpInit->mpGameConfig->GetFloat("Player", "Height", 1.9f);
 		fCrouchH = mpInit->mpGameConfig->GetFloat("Player", "CrouchHeight", 1.0f);
@@ -218,8 +238,12 @@ cGhostPlayer *cNetworkManager::CreateGhost(uint8_t alId, size_t alMeshIdx)
 		Log(" multiplayer: ghost_body_y* look camera-relative (pre-v11); v11 offsets are from the FEET — using %.2f/%.2f, set 0 or remove the keys\n",
 			fStandOffset, fCrouchOffset);
 
-	return hplNew(cGhostPlayer, (mpWorld, alId, sMesh, fStandOffset, fCrouchOffset,
+	cGhostPlayer *pGhost = hplNew(cGhostPlayer, (mpWorld, alId, sMesh, fStandOffset, fCrouchOffset,
 		fEyeStand, fEyeCrouch, &mGhostTuning));
+	/* the same body size as the real player (Player.cpp) */
+	if (pGhost)
+		pGhost->CreateCollider(cVector3f(fWidth, fStandH, fWidth), fCrouchH);
+	return pGhost;
 }
 
 void cNetworkManager::DestroyPreviewGhost(bool abOrphan)
@@ -289,6 +313,8 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mvGhostBodyYCrouchList()
 	  , mGhostTuning()
 	  , mbGhostPreview(false)
+	  , mbFriendlyFire(true)
+	  , mbSharedLoot(true)
 	  , mlGhostPreviewModel(0)
 	  , mpPreviewGhost(NULL)
 	  , mlPreviewSeq(0)
@@ -301,6 +327,7 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbPreviewCrouch(false)
 	  , mlPreviewTreadmill(0)
 	  , mvDiscovered()
+	  , mlHostNonce(0)
 	  , mbDiscoveryActive(false)
 	  , mfDiscoveryTimeLeft(0)
 	  , msServerName("") /* v13: empty = "<player_name>'s game" in the pong */
@@ -336,6 +363,7 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mlGuestViolationsLogged(0)
 	  , mvFreeGuestIds()
 	  , mpVoice(NULL)       /* v16: voice chat (created in Startup) */
+	  , mfMicTestKeepAlive(0.0f)
 	  , mbVoiceEnabled(true)
 	  , mbVoiceOpenMic(false)
 	  , mfVoiceVolume(1.0f)
@@ -494,6 +522,8 @@ void cNetworkManager::NetOnItemPicked(const hpl::tString &) {}
 void cNetworkManager::NetOnItemDropped(const hpl::tString &, const hpl::tString &,
 	const hpl::cVector3f &, const hpl::cVector3f &) {}
 int cNetworkManager::GetConnectedGuestCount() const { return 0; }
+void cNetworkManager::GetGhostHitBodies(std::vector<std::pair<uint8_t, hpl::iPhysicsBody *> > &avOut) { avOut.clear(); }
+void cNetworkManager::NetOnMeleeHitPlayer(uint8_t, float, const hpl::cVector3f &) {}
 bool cNetworkManager::IsEnemyPuppetMode() const { return false; }
 void cNetworkManager::GetGhostCamPositions(std::vector<std::pair<uint8_t, hpl::cVector3f> > &avOut) { avOut.clear(); }
 bool cNetworkManager::GetGhostSense(uint8_t, hpl::cVector3f *, uint8_t *) const { return false; }
@@ -777,7 +807,7 @@ static void ParseCsvFloats(const char *src, std::vector<float> &out)
 //-----------------------------------------------------------------------
 // Character slots (four-player lobbies).
 
-static const char *const kGhostModelDir = "multiplayer/models";
+#define kGhostModelDir (gsGhostModelDir.c_str()) /* Init.cpp: absolute in the tech demo co-op install */
 
 /* ASCII-only lowercase: the discovered order (and so which player gets which
    character) must be the same on every machine, whatever the C locale. */
@@ -1011,6 +1041,8 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mvGhostBodyYCrouchList()
 	  , mGhostTuning()
 	  , mbGhostPreview(false)
+	  , mbFriendlyFire(true)
+	  , mbSharedLoot(true)
 	  , mlGhostPreviewModel(0)
 	  , mpPreviewGhost(NULL)
 	  , mlPreviewSeq(0)
@@ -1023,6 +1055,7 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbPreviewCrouch(false)
 	  , mlPreviewTreadmill(0)
 	  , mvDiscovered()
+	  , mlHostNonce(0)
 	  , mbDiscoveryActive(false)
 	  , mfDiscoveryTimeLeft(0)
 	  , msServerName("") /* v13: empty = "<player_name>'s game" in the pong */
@@ -1058,6 +1091,7 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mlGuestViolationsLogged(0)
 	  , mvFreeGuestIds()
 	  , mpVoice(NULL)       /* v16: voice chat (created in Startup) */
+	  , mfMicTestKeepAlive(0.0f)
 	  , mbVoiceEnabled(true)
 	  , mbVoiceOpenMic(false)
 	  , mfVoiceVolume(1.0f)
@@ -1135,7 +1169,7 @@ void cNetworkManager::RegisterInputActions()
 */
 void cNetworkManager::TryLoadMultiplayerCfg()
 {
-	FILE *fp = fopen("multiplayer.cfg", "r");
+	FILE *fp = fopen(gsMultiplayerCfg.c_str(), "r");
 	if (!fp)
 		return;
 
@@ -1219,6 +1253,10 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 			ParseCsvFloats(val, mvGhostBodyYList);
 		else if (strcmp(key, "ghost_body_ys_crouch") == 0)
 			ParseCsvFloats(val, mvGhostBodyYCrouchList);
+		else if (strcmp(key, "shared_loot") == 0)
+			mbSharedLoot = (atoi(val) != 0); /* v23: host-enforced */
+		else if (strcmp(key, "friendly_fire") == 0)
+			mbFriendlyFire = (atoi(val) != 0); /* v22: host-enforced */
 		else if (strcmp(key, "ghost_preview") == 0)
 			mbGhostPreview = (atoi(val) != 0);
 		else if (strcmp(key, "ghost_preview_model") == 0)
@@ -1460,7 +1498,7 @@ void cNetworkManager::Startup()
 	/* Relative to cwd (folder with overture.exe). Character meshes + their
 	   <name>_<clip>.dae clips live here — see multiplayer.cfg.example. */
 	if (mpInit && mpInit->mpGame && mpInit->mpGame->GetResources())
-		mpInit->mpGame->GetResources()->AddResourceDir("multiplayer/models");
+		mpInit->mpGame->GetResources()->AddResourceDir(gsGhostModelDir);
 	/* Characters: the cfg list (entries that resolve), else every character
 	   found in multiplayer/models, else the shipped pair. Offsets stay AUTO:
 	   the exports have their origin exactly at the feet. */
@@ -2008,6 +2046,19 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		return;
 	}
 
+	if (t == eNetPacketType_PlayerHit)
+	{
+		/* guests only: the host already applied or routed it (HostRoutePlayerHit) */
+		if (!mbHosting && len >= sizeof(cNetPlayerHit))
+		{
+			cNetPlayerHit hit;
+			memcpy(&hit, data, sizeof(hit));
+			if (hit.mTargetID == mlLocalPlayerId)
+				ApplyPlayerHit(hit);
+		}
+		return;
+	}
+
 	if (t == eNetPacketType_PlayerDamage)
 	{
 		if (!mbHosting && len >= sizeof(cNetPlayerDamage) && mpInit && mpInit->mpPlayer)
@@ -2044,6 +2095,9 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 			if (ip.msItemName[0] != 0)
 				m_setPartyItems.insert(tString(ip.msItemName)); /* the party has it */
 			ApplyTakenItems(); /* now if we are on that map; else on its load */
+			ip.msFile[sizeof(ip.msFile) - 1] = 0;
+			if (ip.mbGive && ip.msItemName[0] != 0 && ip.msFile[0] != 0)
+				GiveSharedItem(tString(ip.msItemName), tString(ip.msFile), -1); /* v23 */
 		}
 		return;
 	}
@@ -2481,6 +2535,11 @@ void cNetworkManager::Service(int timeoutMs)
 					   the peer id is the requester, never a packet byte */
 					HostHandleCharacterRequest(ev.peer, author, pk->data, (size_t)pk->dataLength);
 				}
+				else if (author >= 2 && lFirst == eNetPacketType_PlayerHit)
+				{
+					/* v22: friendly fire — the host decides and routes */
+					HostRoutePlayerHit(author, pk->data, (size_t)pk->dataLength);
+				}
 				else if (author >= 2 && lFirst == eNetPacketType_MapReady)
 				{
 					/* v14: needs the peer to answer with the snapshot */
@@ -2521,14 +2580,25 @@ void cNetworkManager::Service(int timeoutMs)
 						if (peek.mOp == eNetScriptOp_LocalVarAdd || peek.mOp == eNetScriptOp_GlobalVarAdd)
 							bRelay = false;
 					}
+					/* v23: a guest's pickup carries OUR shared-loot rule onward */
+					const void *pOut = pk->data;
+					size_t lOut = (size_t)pk->dataLength;
+					cNetItemPickup ipStamped;
+					if (lFirst == eNetPacketType_ItemPickup && lOut >= sizeof(cNetItemPickup))
+					{
+						memcpy(&ipStamped, pk->data, sizeof(ipStamped));
+						ipStamped.mbGive = mbSharedLoot ? 1 : 0;
+						pOut = &ipStamped;
+						lOut = sizeof(ipStamped);
+					}
 					for (size_t i = 0; bRelay && i < mpImpl->mpHost->peerCount; ++i)
 					{
 						ENetPeer *dst = &mpImpl->mpHost->peers[i];
 						if (dst == ev.peer || !PeerLive(dst)) /* v15: accepted peers only */
 							continue;
-						SendStructToPeer(dst, pk->data, (size_t)pk->dataLength, true);
+						SendStructToPeer(dst, pOut, lOut, true);
 					}
-					DispatchIncoming(pk->data, (size_t)pk->dataLength);
+					DispatchIncoming(pOut, lOut);
 				}
 				else
 					DispatchIncoming(pk->data, (size_t)pk->dataLength);
@@ -2605,6 +2675,12 @@ void cNetworkManager::HostGame(uint16_t alPort)
 	ResetPeerGuards();
 	mbHadJoinPacket = true;
 	mlListenPort = alPort;
+	/* v20: a fresh id per hosting session. Only has to differ between the
+	   hosts one browser can see, so time/clock/address mixing is plenty. */
+	mlHostNonce = ((uint32_t)time(NULL) * 2654435761u) ^ (uint32_t)clock() ^
+		(uint32_t)(uintptr_t)this ^ ((uint32_t)alPort << 16);
+	if (mlHostNonce == 0)
+		mlHostNonce = 1;
 	mbClientConnected = false;
 	Log(" multiplayer: HOST udp/%u\n", (unsigned)alPort);
 	Log(" multiplayer: player cap %u = min(max_players %u, %u character(s)) - every player a different character\n",
@@ -2768,6 +2844,132 @@ void cNetworkManager::NetOnEntityDamaged(const hpl::tString &asName, float afDam
 	pkt.mfDamage = afDamage;
 	pkt.mlStrength = (int8_t)alStrength;
 	SendReliableEvent(&pkt, sizeof(pkt));
+}
+
+void cNetworkManager::GiveSharedItem(const hpl::tString &asName, const hpl::tString &asFile, int alCount)
+{
+	if (!mpInit || !mpInit->mpInventory || asName.empty() || asFile.empty())
+		return;
+	cInventory *pInv = mpInit->mpInventory;
+	cInventoryItem *pHave = pInv->GetItem(asName);
+	if (pHave && pHave->HasCount() == false)
+		return; /* a unique item we already hold: no duplicate */
+	if (pHave && alCount > 0)
+	{
+		pHave->SetCount(alCount); /* snapshot: match the host's amount */
+		return;
+	}
+
+	/* AddItemFromFile runs the item type's pick-up (battery power, journal
+	   note, ...) and the LEVEL's pick-up callback here too — the picker's
+	   machine ran the same callback and already replicated its effects, so
+	   ours stay local (no second broadcast). None of Overture's pick-up
+	   callbacks counts (AddVar) or gives items, so running it twice is safe. */
+	gbNetScriptApplying = true;
+	pInv->AddItemFromFile(asName, asFile, -1);
+	gbNetScriptApplying = false;
+
+	cInventoryItem *pItem = pInv->GetItem(asName);
+	if (pItem && alCount > 0 && pItem->HasCount())
+		pItem->SetCount(alCount);
+	if (pItem && mpInit->mpEffectHandler)
+		mpInit->mpEffectHandler->GetSubTitle()->Add(pItem->GetGameName(), 2.0f, true);
+	Log(" multiplayer: shared loot - got '%s' (%s)\n", asName.c_str(), asFile.c_str());
+}
+
+void cNetworkManager::GetGhostHitBodies(std::vector<std::pair<uint8_t, hpl::iPhysicsBody *> > &avOut)
+{
+	avOut.clear();
+	for (tGhostMap::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
+	{
+		iPhysicsBody *pBody = it->second ? it->second->GetHitBody() : NULL;
+		if (pBody)
+			avOut.push_back(std::make_pair(it->first, pBody));
+	}
+	/* offline check: the preview ghost can be hit too (logged, not sent) */
+	if (mpPreviewGhost)
+	{
+		iPhysicsBody *pBody = mpPreviewGhost->GetHitBody();
+		if (pBody)
+			avOut.push_back(std::make_pair(kPreviewGhostId, pBody));
+	}
+}
+
+void cNetworkManager::NetOnMeleeHitPlayer(uint8_t alTargetId, float afDamage, const hpl::cVector3f &avFrom)
+{
+	if (alTargetId == kPreviewGhostId)
+	{
+		Log(" multiplayer: melee hit the preview ghost for %.1f damage (friendly fire %s)\n",
+			afDamage, mbFriendlyFire ? "on" : "off");
+		return;
+	}
+	if (!mpImpl || !mpImpl->mpHost || alTargetId == 0 || alTargetId == mlLocalPlayerId)
+		return;
+
+	cNetPlayerHit hit;
+	memset(&hit, 0, sizeof(hit));
+	hit.mType = eNetPacketType_PlayerHit;
+	hit.mTargetID = alTargetId;
+	hit.mAttackerID = mlLocalPlayerId;
+	hit.mfDamage = afDamage;
+	hit.mfFromX = avFrom.x; hit.mfFromY = avFrom.y; hit.mfFromZ = avFrom.z;
+
+	if (mbHosting)
+	{
+		if (!mbFriendlyFire)
+			return; /* our own rule applies to our own swings too */
+		for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+		{
+			ENetPeer *pd = &mpImpl->mpHost->peers[i];
+			if (PeerLive(pd) && PeerGetId(pd) == alTargetId)
+			{
+				SendStructToPeer(pd, &hit, sizeof(hit), true);
+				break;
+			}
+		}
+	}
+	else if (mbClientConnected && mbHadJoinPacket && mpImpl->mpServerPeer)
+		SendStructToPeer(mpImpl->mpServerPeer, &hit, sizeof(hit), true);
+}
+
+/** Host: a guest's melee hit. Never trusts the packet's attacker byte. */
+void cNetworkManager::HostRoutePlayerHit(uint8_t alAuthor, const void *apData, size_t alLen)
+{
+	if (alLen < sizeof(cNetPlayerHit))
+		return;
+	cNetPlayerHit hit;
+	memcpy(&hit, apData, sizeof(hit));
+	hit.mAttackerID = alAuthor;
+	if (!mbFriendlyFire || hit.mTargetID == alAuthor || hit.mTargetID == 0)
+		return;
+	if (hit.mTargetID == mlLocalPlayerId)
+	{
+		ApplyPlayerHit(hit);
+		return;
+	}
+	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+	{
+		ENetPeer *pd = &mpImpl->mpHost->peers[i];
+		if (PeerLive(pd) && PeerGetId(pd) == hit.mTargetID)
+		{
+			SendStructToPeer(pd, &hit, sizeof(hit), true);
+			break;
+		}
+	}
+}
+
+/** The victim's machine: health lives here, so the damage lands here —
+    blood splash, and the hurt direction points at the attacker. */
+void cNetworkManager::ApplyPlayerHit(const cNetPlayerHit &aHit)
+{
+	if (!mpInit || !mpInit->mpPlayer || mpInit->mpPlayer->IsDead())
+		return;
+	cPlayer *pPlayer = mpInit->mpPlayer;
+	pPlayer->mbDamageFromPos = true;
+	pPlayer->mvDamagePos = cVector3f(aHit.mfFromX, aHit.mfFromY, aHit.mfFromZ);
+	pPlayer->Damage(aHit.mfDamage, ePlayerDamageType_BloodSplash);
+	pPlayer->mbDamageFromPos = false;
+	Log(" multiplayer: player %u hit us for %.1f (melee)\n", (unsigned)aHit.mAttackerID, aHit.mfDamage);
 }
 
 bool cNetworkManager::IsEnemyPuppetMode() const
@@ -3033,6 +3235,19 @@ void cNetworkManager::NetOnItemPicked(const hpl::tString &asEntityName)
 	pkt.mType = eNetPacketType_ItemPickup;
 	pkt.mlQualHash = QualifiedItemHash(asEntityName);
 	strncpy(pkt.msItemName, asEntityName.c_str(), sizeof(pkt.msItemName) - 1);
+	/* v23 shared loot: the item's .ent travels so receivers can have it too;
+	   a guest's mbGive is ignored — the host re-stamps it with its rule */
+	if (mpInit && mpInit->mpMapHandler)
+	{
+		iGameEntity *pEnt = mpInit->mpMapHandler->GetGameEntity(asEntityName, false);
+		if (pEnt)
+		{
+			const tString sFile = cString::GetFileName(pEnt->GetFileName());
+			if (sFile.size() < sizeof(pkt.msFile))
+				strncpy(pkt.msFile, sFile.c_str(), sizeof(pkt.msFile) - 1);
+		}
+	}
+	pkt.mbGive = (mbHosting && mbSharedLoot) ? 1 : 0;
 	SendReliableEvent(&pkt, sizeof(pkt));
 	/* v14 (5a): our OWN picks belong in the taken set too — it is what the
 	   world snapshot serialises for a joiner (only received pickups were
@@ -3730,7 +3945,15 @@ void cNetworkManager::UpdatePreviewGhost(float afTimeStep)
 		st.mfPosZ = vPos.z;
 		st.mfPitch = 0.0f;
 		st.mfYaw = fYaw;
-		st.mbFlashlightOn = 0;
+		/* v21: the preview mirrors what the local player holds (and the
+		   flashlight), so held-item props can be checked with no second
+		   machine: equip the hammer, switch the flashlight on. */
+		{
+			cPlayerFlashLight *pFl = mpInit->mpPlayer ? mpInit->mpPlayer->GetFlashLight() : NULL;
+			st.mbFlashlightOn = (uint8_t)(pFl && pFl->IsActive() && !pFl->IsDisabled());
+		}
+		st.mHeldLeft = LocalHeldItem(mpInit, 0);
+		st.mHeldRight = LocalHeldItem(mpInit, 1);
 		st.mMoveState = lMoveState;
 		st.mVelFwd = EncodeNetVel(fSpeed);
 		st.mVelRight = 0;
@@ -4195,6 +4418,7 @@ void cNetworkManager::HandleMasterEntries(const char *apBuf, int alLen)
 		sv.mbPassword = (e.mFlags & kNetMasterFlag_Password) != 0;
 		sv.mlAgeSeconds = e.mlAgeSeconds;
 		sv.mbInternet = true;
+		sv.mlHostNonce = 0; /* v20: only LAN pongs carry one */
 		mvInternet.push_back(sv);
 
 		Log(" multiplayer: internet server '%s' map='%s' %u/%u at %s age %us%s%s\n",
@@ -4335,6 +4559,7 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 			pong.mlGamePort = mlListenPort;
 			pong.mlPlayerCount = (uint8_t)(CountConnectedPeers(true) + 1); /* accepted guests + me */
 			pong.mlMaxPlayers = GetMaxPlayers(); /* v17: effective cap (one per character) */
+			pong.mlHostNonce = mlHostNonce;      /* v20: one browser row per host */
 			{
 				/* v13: no server_name -> "<player_name>'s game" (or the old default) */
 				hpl::tString sAdvertised = msServerName;
@@ -4399,12 +4624,21 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 			pong.mlProtocolMagic != kNetProtocolMagic)
 			continue;
 
+		/* v20: our own game answers our own ping — a hosting window must not
+		   list itself */
+		if (mbHosting && pong.mlHostNonce != 0 && pong.mlHostNonce == mlHostNonce)
+			continue;
+
 		char addr[64];
 		FormatAddrPort(from, pong.mlGamePort, addr, sizeof(addr));
 
+		/* v20: the same host answers once per network adapter, each reply
+		   from a different address — one row per host nonce. The first
+		   reply wins: it proved that address reaches the host from here. */
 		bool known = false;
 		for (size_t i = 0; i < mvDiscovered.size(); ++i)
-			if (mvDiscovered[i].msAddress == addr)
+			if (mvDiscovered[i].msAddress == addr ||
+				(pong.mlHostNonce != 0 && mvDiscovered[i].mlHostNonce == pong.mlHostNonce))
 			{
 				known = true;
 				break;
@@ -4425,6 +4659,7 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 		sv.mbPassword = false; /* LAN pongs predate the flag; the host refuses a wrong password anyway */
 		sv.mlAgeSeconds = 0;
 		sv.mbInternet = false;
+		sv.mlHostNonce = pong.mlHostNonce;
 		mvDiscovered.push_back(sv);
 
 		Log(" multiplayer: discovered '%s' map='%s' %u/%u at %s%s\n",
@@ -4848,6 +5083,33 @@ void cNetworkManager::SendWorldSnapshot(ENetPeer *apPeer)
 			++lTaken;
 		}
 
+		/* v23 shared loot: the host's inventory itself, so a late joiner
+		   starts with the party's items (an empty section when shared_loot=0) */
+		w.Begin(eNetSnap_SharedItem);
+		if (mbSharedLoot && mpInit->mpInventory)
+		{
+			for (tInventoryItemMapIt it = mpInit->mpInventory->m_mapItems.begin();
+				it != mpInit->mpInventory->m_mapItems.end(); ++it)
+			{
+				cInventoryItem *pItem = it->second;
+				if (pItem == NULL)
+					continue;
+				const tString sFile = cString::GetFileName(pItem->GetEntityFile());
+				cNetSnapSharedItem e;
+				memset(&e, 0, sizeof(e));
+				if (pItem->GetName().empty() || pItem->GetName().size() >= sizeof(e.msName) ||
+					sFile.empty() || sFile.size() >= sizeof(e.msFile))
+				{
+					++lSkipped;
+					continue;
+				}
+				strncpy(e.msName, pItem->GetName().c_str(), sizeof(e.msName) - 1);
+				strncpy(e.msFile, sFile.c_str(), sizeof(e.msFile) - 1);
+				e.mlCount = pItem->HasCount() ? pItem->GetCount() : 1;
+				w.Add(&e, sizeof(e));
+			}
+		}
+
 		w.Begin(eNetSnap_PartyItem);
 		std::set<tString> setParty(m_setPartyItems);
 		if (mpInit->mpInventory)
@@ -4994,7 +5256,7 @@ void cNetworkManager::HandleSnapshotChunk(const void *apData, size_t alLen)
 		ResetSnapshotBuffer();
 		return;
 	}
-	if (hdr.mSection < eNetSnap_LocalVar || hdr.mSection > eNetSnap_Timer)
+	if (hdr.mSection < eNetSnap_LocalVar || hdr.mSection > eNetSnap_SharedItem) /* v23 */
 		return; /* unknown section */
 	if (mvSnapChunks.size() >= 4096)
 	{
@@ -5293,6 +5555,31 @@ void cNetworkManager::ApplyWorldSnapshot()
 		}
 	}
 
+	/* 5c. v23 shared loot: the host's inventory — a late joiner (or a
+	   reconnect) gets what the party already carries. Items we hold are
+	   skipped (counted ones take the host's amount). */
+	int lShared = 0;
+	for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+	{
+		const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(cNetSnapSharedItem), &hdr, &pFirst);
+		if (hdr.mSection != eNetSnap_SharedItem)
+			continue;
+		for (size_t i = 0; i < lCount; ++i)
+		{
+			cNetSnapSharedItem e;
+			memcpy(&e, pFirst + i * sizeof(e), sizeof(e));
+			e.msName[sizeof(e.msName) - 1] = 0;
+			e.msFile[sizeof(e.msFile) - 1] = 0;
+			if (e.msName[0] == 0 || !NetBareFileNameOk(e.msFile, sizeof(e.msFile), "ent"))
+				continue;
+			GiveSharedItem(tString(e.msName), tString(e.msFile),
+				(e.mlCount > 0 && e.mlCount < 1000) ? (int)e.mlCount : -1);
+			++lShared;
+		}
+	}
+	if (lShared > 0)
+		Log(" multiplayer: world snapshot: %d shared item(s) from the host's inventory\n", lShared);
+
 	/* 6. local timers: ours (created by our own OnStart) are replaced by
 	   the host's — theirs fire later on both machines alike. */
 	for (size_t c = 0; c < mvSnapChunks.size(); ++c)
@@ -5319,6 +5606,26 @@ void cNetworkManager::ApplyWorldSnapshot()
 				pTimer->mbPaused = t.mbPaused != 0;
 			++lTimers;
 		}
+	}
+
+	/* 6b. Presentation hand-back. Our own OnStart ran before this snapshot
+	   and may have started an intro: FadeOut(0), player frozen, widescreen,
+	   a scripted look-at, depth of field — each undone later by one of OUR
+	   timers. Step 6 just replaced those timers with the host's, and the
+	   host fired its intro timers long ago, so nothing would ever undo it:
+	   a permanent black screen (the boat cabin on a new game). The host is
+	   mid-game, so hand the guest a playable view. */
+	if (bHaveTimers && mpInit->mpFadeHandler && mpInit->mpPlayer)
+	{
+		mpInit->mpFadeHandler->FadeIn(1.0f);
+		mpInit->mpFadeHandler->SetWideScreenActive(false);
+		if (mpInit->mpPlayer->GetLookAt())
+			mpInit->mpPlayer->GetLookAt()->SetActive(false);
+		if (mpInit->mpEffectHandler && mpInit->mpEffectHandler->GetDepthOfField())
+			mpInit->mpEffectHandler->GetDepthOfField()->SetActive(false, 1.0f);
+		if (mpInit->mpPlayer->GetHealth() > 0 && !mpInit->mpPlayer->IsActive())
+			mpInit->mpPlayer->SetActive(true);
+		Log(" multiplayer: world snapshot replaced our intro timers - faded in and unfroze the player\n");
 	}
 
 	/* 7. done: the enemy stream restarts from whatever seq comes next. */
@@ -5370,7 +5677,7 @@ bool cNetworkManager::UpdateMultiplayerCfgKey(const char *asKey, const hpl::tStr
 
 	std::vector<hpl::tString> vLines;
 	{
-		FILE *fp = fopen("multiplayer.cfg", "r");
+		FILE *fp = fopen(gsMultiplayerCfg.c_str(), "r");
 		if (fp)
 		{
 			char buf[1024];
@@ -5409,7 +5716,8 @@ bool cNetworkManager::UpdateMultiplayerCfgKey(const char *asKey, const hpl::tStr
 		vLines.push_back(hpl::tString(asKey) + "=" + asValue + "\n");
 	}
 
-	const char *szTmp = "multiplayer.cfg.tmp";
+	const tString sTmp = gsMultiplayerCfg + ".tmp";
+	const char *szTmp = sTmp.c_str();
 	FILE *fo = fopen(szTmp, "w");
 	if (!fo)
 	{
@@ -5427,8 +5735,8 @@ bool cNetworkManager::UpdateMultiplayerCfgKey(const char *asKey, const hpl::tStr
 		remove(szTmp);
 		return false;
 	}
-	remove("multiplayer.cfg"); /* Windows rename() refuses to overwrite */
-	if (rename(szTmp, "multiplayer.cfg") != 0)
+	remove(gsMultiplayerCfg.c_str()); /* Windows rename() refuses to overwrite */
+	if (rename(szTmp, gsMultiplayerCfg.c_str()) != 0)
 	{
 		Log(" multiplayer: rename %s -> multiplayer.cfg failed\n", szTmp);
 		return false;
@@ -5807,6 +6115,7 @@ bool cNetworkManager::IsAllowedFrom(uint8_t alType, bool abFromHost)
 	case eNetPacketType_EntityDamage:
 	case eNetPacketType_PlayerName:
 	case eNetPacketType_Voice: /* v16: guest -> host, host relays / host -> guests */
+	case eNetPacketType_PlayerHit: /* v22: guest -> host, host routes to the victim */
 		return true;
 	/* host -> guest only */
 	case eNetPacketType_PlayerJoin:
@@ -6197,6 +6506,9 @@ bool cNetworkManager::ValidateEventPacket(unsigned char *apData, size_t alLen, b
 			st.mfYaw = cMath::Wrap(st.mfYaw, -kPif, kPif);
 			memcpy(apData, &st, sizeof(st));
 		}
+		/* v21: held items are closed ids; a new item means a protocol bump */
+		if (st.mHeldLeft >= eNetHeldItem_Count || st.mHeldRight >= eNetHeldItem_Count)
+			return false;
 		return true; /* velocities are int8, health is clamped on apply */
 	}
 	case eNetPacketType_MapChange:
@@ -6213,7 +6525,12 @@ bool cNetworkManager::ValidateEventPacket(unsigned char *apData, size_t alLen, b
 		if (alLen < sizeof(cNetItemPickup))
 			return false;
 		const cNetItemPickup *ip = (const cNetItemPickup *)apData;
-		return NetStringOk(ip->msItemName, sizeof(ip->msItemName), true);
+		if (!NetStringOk(ip->msItemName, sizeof(ip->msItemName), true))
+			return false;
+		/* v23: "" = unknown file (no give), else a bare .ent that resolves */
+		if (!NetStringOk(ip->msFile, sizeof(ip->msFile), true))
+			return false;
+		return ip->msFile[0] == 0 || NetBareFileNameOk(ip->msFile, sizeof(ip->msFile), "ent");
 	}
 	case eNetPacketType_ItemDrop:
 	{
@@ -6269,6 +6586,20 @@ bool cNetworkManager::ValidateEventPacket(unsigned char *apData, size_t alLen, b
 		if (!NetClampDamage(dmg.mfDamage))
 			return false;
 		memcpy(apData, &dmg, sizeof(dmg));
+		return true;
+	}
+	case eNetPacketType_PlayerHit:
+	{
+		if (alLen < sizeof(cNetPlayerHit))
+			return false;
+		cNetPlayerHit hit;
+		memcpy(&hit, apData, sizeof(hit));
+		if (hit.mTargetID == 0 || !NetClampDamage(hit.mfDamage))
+			return false;
+		if (!NetFiniteBounded(hit.mfFromX, kNetMaxCoord) || !NetFiniteBounded(hit.mfFromY, kNetMaxCoord) ||
+			!NetFiniteBounded(hit.mfFromZ, kNetMaxCoord))
+			return false;
+		memcpy(apData, &hit, sizeof(hit));
 		return true;
 	}
 	case eNetPacketType_PlayerDamage:
@@ -6675,10 +7006,48 @@ void cNetworkManager::RelayVoice(ENetPeer *apFrom, uint8_t alAuthor, const void 
 	DispatchIncoming(buf, alLen); /* and we hear it too */
 }
 
+void cNetworkManager::GetMicrophoneNames(std::vector<hpl::tString> &avOut) const
+{
+	avOut.clear();
+	if (mpVoice)
+		cVoiceChat::GetCaptureDeviceNames(avOut);
+}
+
+void cNetworkManager::SetMicrophone(const hpl::tString &asName)
+{
+	if (asName != msVoiceCaptureDevice)
+	{
+		msVoiceCaptureDevice = asName;
+		UpdateMultiplayerCfgKey("voice_capture_device", msVoiceCaptureDevice); /* every other line kept */
+	}
+	if (mpVoice)
+		mpVoice->SetCaptureDevice(msVoiceCaptureDevice);
+}
+
+float cNetworkManager::GetMicTestLevel() const
+{
+	return mpVoice ? mpVoice->GetMicTestLevel() : 0.0f;
+}
+
+int cNetworkManager::GetMicTestState() const
+{
+	return mpVoice ? mpVoice->GetMicTestState() : 0;
+}
+
+hpl::tString cNetworkManager::GetMicTestDeviceName() const
+{
+	return mpVoice ? mpVoice->GetMicTestDeviceName() : hpl::tString("");
+}
+
 void cNetworkManager::UpdateVoice(float afTimeStep)
 {
 	if (!mpVoice)
 		return;
+
+	/* menu microphone test: runs while the picker keeps it alive, session
+	   or not */
+	mfMicTestKeepAlive -= afTimeStep;
+	mpVoice->UpdateMicTest(afTimeStep, mfMicTestKeepAlive > 0.0f);
 
 	/* Opus/AL live exactly as long as a session: nothing in single-player,
 	   nothing while hosting an empty lobby is fine too (cheap), torn down
