@@ -147,7 +147,7 @@ can pick (below).
 `fisherman` -> The Fisherman, `red` -> Red, `malik` -> Malik, and any other
 base name to itself with the first letter capitalised (`kCharacterDisplayNames`
 at the tail of NetworkManager.cpp). Used by the party panel
-(`Deadl (The Fisherman)`, `Host (Philip) (host)`), the picker and the feed.
+(`Alex (The Fisherman)`, `Host (Philip) (host)`), the picker and the feed.
 
 **Picker (v18).** The host is **always slot 0 (Philip), locked**: the host
 lobby (and the Multiplayer screen while hosting) reads `You play Philip
@@ -231,7 +231,7 @@ packet re-creates it through `EnsureGhost` (seq/health/move state live
 outside the ghost; only the interpolation buffer refills, ~33 ms). The
 preview ghost keeps `ghost_preview_model`. `GetPlayerCharacterName(id)`
 ("fisherman") is shown in the party panel through its display name:
-`Deadl (The Fisherman)`, the host's line `Host (Philip) (host)`.
+`Alex (The Fisherman)`, the host's line `Host (Philip) (host)`.
 
 **Every machine needs the same character files.** Since v19 the name
 travels with the slot, so a different ORDER is harmless; a guest that lacks
@@ -591,7 +591,7 @@ handshake), `cNetVoice` = 5 bytes, constants `kNetVoice*` in
 | Location | What |
 |----------|------|
 | `../Init.cpp` / `Init.h` | Owns `mpNetworkManager`; `Startup()` after input exists; `Update()` each frame; config port load/save. |
-| `../Player.cpp` / `Player.h` | `DrawPartyHud()` — world-anchored party health bars in `OnDraw`; `DrawPartyPanel()` — top-left names/health panel + event feed (v13), `(talking)` / `[MIC]` voice indicators (v16), `(<character>)` after each name (v17; v18: display name, `Deadl (The Fisherman)`). |
+| `../Player.cpp` / `Player.h` | `DrawPartyHud()` — world-anchored party health bars in `OnDraw`; `DrawPartyPanel()` — top-left names/health panel + event feed (v13), `(talking)` / `[MIC]` voice indicators (v16), `(<character>)` after each name (v17; v18: display name, `Alex (The Fisherman)`). |
 | `../PlayerHelper.cpp` / `.h` | `cPlayerDeath` co-op respawn branch (`CoopRespawnApplies`, `UpdateCoopRespawn`). |
 | `../Inventory.cpp` / `.h` | `DrawParty()` — inventory party health list. |
 | `../GameEnemy.cpp`, `../TriggerHandler.cpp` | Host senses read `GetGhostHealth` (focus health, sight candidates, ghost footsteps). |

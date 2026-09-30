@@ -1886,7 +1886,7 @@ void cPlayer::DrawPartyPanel()
 
 	/* v17: "<name> (<character>)" — the host-assigned character, one of
 	   each per lobby. The bar column moves right of the longest line.
-	   v18: the character's display name ("Deadl (The Fisherman)"). */
+	   v18: the character's display name ("Alex (The Fisherman)"). */
 	std::vector<tWString> vTexts;
 	for(size_t i=0; i<vLines.size(); ++i)
 	{
