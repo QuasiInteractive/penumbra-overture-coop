@@ -214,6 +214,10 @@ public:
 	void SaveToGlobal(cMapHandler_GlobalSave *apSave);
 	void LoadFromGlobal(cMapHandler_GlobalSave *apSave);
 
+	/* co-op world snapshot: serialises / replaces the LOCAL timers
+	   (mlstTimers + RemoveLocalTimers), exactly like the save game does */
+	friend class cNetworkManager;
+
 private:
 	void RenderItemEffect();
 

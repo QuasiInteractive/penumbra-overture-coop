@@ -64,6 +64,8 @@ namespace hpl {
 
 		virtual void Update(float afTimeStep){}
 
+		cFileSearcher* GetFileSearcher(){ return mpFileSearcher;}
+
 	protected:
 		unsigned long mlHandleCount;
 		tResourceNameMap m_mapNameResources;

@@ -862,11 +862,26 @@ namespace hpl {
 	{
 		float fCos = QuaternionDot(aqA,aqB);
 
-		//If the rotations are the same, just return the first.
+		//Nearly identical rotations: sin(angle) is ~0 below, and the old
+		//early-out returned aqA UNCHANGED, so every joint rotating less than
+		//~1.6 deg between two keys held the previous key instead of blending
+		//(skinned meshes stepped at the key rate). A normalised linear blend
+		//is indistinguishable from slerp at these angles and never divides
+		//by ~0. Same treatment for the antipodal case on the shortest path.
 		if ( std::abs(fCos - 1) <= kEpsilonf)
 		{
-			return aqA;
+			cQuaternion qT(aqA * (1.0f - afT) + aqB * afT);
+			qT.Normalise();
+			return qT;
 		}
+		if ( abShortestPath && std::abs(fCos + 1) <= kEpsilonf)
+		{
+			cQuaternion qT(aqA * (1.0f - afT) + aqB * (-afT));
+			qT.Normalise();
+			return qT;
+		}
+		if (fCos > 1.0f) fCos = 1.0f;
+		else if (fCos < -1.0f) fCos = -1.0f;
 
 		float fAngle = acos(fCos);
 

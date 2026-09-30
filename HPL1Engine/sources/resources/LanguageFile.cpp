@@ -36,6 +36,7 @@ namespace hpl {
 	cLanguageFile::cLanguageFile(cResources *apResources)
 	{
 		mpResources = apResources;
+		mbOverlay = false;
 	}
 
 	//-----------------------------------------------------------------------
@@ -50,6 +51,16 @@ namespace hpl {
 	//////////////////////////////////////////////////////////////////////////
 	// PUBLIC METHODS
 	//////////////////////////////////////////////////////////////////////////
+
+	//-----------------------------------------------------------------------
+
+	bool cLanguageFile::AddOverlayFile(const tString asFile)
+	{
+		mbOverlay = true;
+		const bool bRet = LoadFromFile(asFile);
+		mbOverlay = false;
+		return bRet;
+	}
 
 	//-----------------------------------------------------------------------
 
@@ -77,7 +88,7 @@ namespace hpl {
 					mpResources->AddResourceDir(sPath);
 			}
 		}
-		else
+		else if(mbOverlay==false)
 		{
 			Warning("No resources element found in '%s'\n",asFile.c_str());
 		}
@@ -88,10 +99,21 @@ namespace hpl {
 		TiXmlElement *pCatElem = pRootElem->FirstChildElement("CATEGORY");
 		for(; pCatElem != NULL; pCatElem = pCatElem->NextSiblingElement("CATEGORY"))
 		{
-			cLanguageCategory *pCategory = hplNew( cLanguageCategory, () );
 			tString sCatName = pCatElem->Attribute("Name");
 
-			m_mapCategories.insert(tLanguageCategoryMap::value_type(sCatName, pCategory));
+			/* a category that already exists (a second file, see
+			   AddOverlayFile) is merged into, never replaced or leaked */
+			cLanguageCategory *pCategory = NULL;
+			tLanguageCategoryMap::iterator catIt = m_mapCategories.find(sCatName);
+			if(catIt != m_mapCategories.end())
+			{
+				pCategory = catIt->second;
+			}
+			else
+			{
+				pCategory = hplNew( cLanguageCategory, () );
+				m_mapCategories.insert(tLanguageCategoryMap::value_type(sCatName, pCategory));
+			}
 
 			///////////////////////////
 			//Iterate the entries
@@ -185,8 +207,17 @@ namespace hpl {
 
 				std::pair<tLanguageEntryMap::iterator,bool> ret = pCategory->m_mapEntries.insert(tLanguageEntryMap::value_type(sEntryName,pEntry));
 				if(ret.second==false){
-					Warning("Language entry '%s' in category '%s' already exists!\n",sEntryName.c_str(), sCatName.c_str());
-					hplDelete(pEntry);
+					if(mbOverlay)
+					{
+						/* overlay wins */
+						hplDelete(ret.first->second);
+						ret.first->second = pEntry;
+					}
+					else
+					{
+						Warning("Language entry '%s' in category '%s' already exists!\n",sEntryName.c_str(), sCatName.c_str());
+						hplDelete(pEntry);
+					}
 				}
 			}
 		}

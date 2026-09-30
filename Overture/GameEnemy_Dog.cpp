@@ -1145,9 +1145,13 @@ void cGameEnemyState_Dog_Attack::OnUpdate(float afTimeStep)
 			mpInit->mpPlayer->mbDamageFromPos = false;
 
 			/* Phase 6: ghost targets have no physics body for the shape
-			   attack to bite — their damage travels by packet instead */
+			   attack to bite — their damage travels by packet instead, and
+			   only if the ghost really is inside this same attack box with a
+			   clear line to it (the shape attack above keeps hurting the
+			   LOCAL player only when their body is physically in the box). */
 			mpEnemy->FocusAttackDamage(mpEnemyDog->mfAttackMinDamage,
-										mpEnemyDog->mfAttackMaxDamage);
+										mpEnemyDog->mfAttackMaxDamage,
+										mpEnemyDog->GetAttackShape(), mtxOffset);
 			mbAttacked = true;
 		}
 	}
@@ -1398,7 +1402,13 @@ void cGameEnemyState_Dog_CallBackup::OnEnterState(iGameEnemyState *apPrevState)
 
 		if(fDist <= mpEnemyDog->mfCallBackupRange)
 		{
+			/* IsFighting()==false is exactly ShowPlayer's IDLE/PATROL/
+			   INVESTIGATE condition: when the call takes, the backup hunts
+			   the SAME player we do (ShowPlayer itself defaults to the
+			   local one), not whoever it last had in mind. */
+			const bool bAnswers = pDog->IsFighting()==false;
 			pDog->ShowPlayer(mpEnemyDog->GetLastPlayerPos());
+			if(bAnswers) pDog->NetCopyFocusFrom(mpEnemy);
 			break; // Call only for one dog backup!
 		}
 	}
@@ -2055,6 +2065,8 @@ void cGameEnemy_Dog::ShowPlayer(const cVector3f& avPlayerFeetPos)
 	if(	mlCurrentState == STATE_IDLE || mlCurrentState == STATE_PATROL || 
 		mlCurrentState == STATE_INVESTIGATE)
 	{
+		NetFocusLocalPlayer(); /* the shown player is the local one (panic
+		   scare, scripts); a backup call overrides this right after */
 		mvLastPlayerPos = avPlayerFeetPos;
 		ChangeState(STATE_HUNT);
 	}

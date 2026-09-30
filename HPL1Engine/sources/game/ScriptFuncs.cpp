@@ -1377,7 +1377,7 @@ namespace hpl {
 	   variable WRITES to the other machines (NULL in single player). Ops:
 	   0 = local set, 1 = local add, 2 = global set, 3 = global add. Fired
 	   only for real changes so timer loops rewriting the same value do not
-	   spam the wire. */
+	   spam the wire. Add ops fire AFTER the increment (v14). */
 	void (*gpScriptVarNetCallback)(int alOp, const char* asName, int alVal) = NULL;
 
 	static void __stdcall CreateLocalVar(std::string asName, int alVal)
@@ -1402,9 +1402,11 @@ namespace hpl {
 	static void __stdcall AddLocalVar(std::string asName, int alVal)
 	{
 		cScriptVar* pVar = gpScene->CreateLocalVar(asName);
+		pVar->mlVal += alVal;
+		/* co-op v14: fired AFTER the add (still passing the delta) so the
+		   listener can read the resulting absolute value from the scene */
 		if(gpScriptVarNetCallback && alVal != 0)
 			gpScriptVarNetCallback(1, asName.c_str(), alVal);
-		pVar->mlVal += alVal;
 	}
 	SCRIPT_DEFINE_FUNC_2(void, AddLocalVar, string, int)
 
@@ -1448,9 +1450,10 @@ namespace hpl {
 	static void __stdcall AddGlobalVar(std::string asName, int alVal)
 	{
 		cScriptVar* pVar = gpScene->CreateGlobalVar(asName);
+		pVar->mlVal += alVal;
+		/* co-op v14: callback after the add, see AddLocalVar */
 		if(gpScriptVarNetCallback && alVal != 0)
 			gpScriptVarNetCallback(3, asName.c_str(), alVal);
-		pVar->mlVal += alVal;
 	}
 	SCRIPT_DEFINE_FUNC_2(void, AddGlobalVar, string, int)
 

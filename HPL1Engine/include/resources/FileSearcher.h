@@ -55,6 +55,10 @@ namespace hpl {
 		 */
 		tString GetFilePath(tString asName);
 
+		/** Dev aid: when set, every file found OUTSIDE this folder is logged
+		    once (which files a mod still borrows from another install). */
+		static void SetTraceOutside(const tString &asFolder);
+
 	private:
 		tFilePathMap m_mapFiles;
 		tStringSet m_setLoadedDirs;

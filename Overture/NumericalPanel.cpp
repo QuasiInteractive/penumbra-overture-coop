@@ -19,6 +19,7 @@
 #include "NumericalPanel.h"
 
 #include "Init.h"
+#include "GameScripts.h" /* co-op: cNetScriptPlayerScope */
 #include "Player.h"
 #include "HapticGameCamera.h"
 
@@ -372,6 +373,7 @@ void cNumericalPanel::AddDigit(int alNum)
 		tString sCorrect = bCorrect ? "true" : "false";
 
 		tString sCommand = msCallback + "(\""+msName+"\", "+sCorrect+")";
+		cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 		mpInit->RunScriptCommand(sCommand);
 
 		SetActive(false);

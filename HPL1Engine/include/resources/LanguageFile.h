@@ -61,11 +61,16 @@ namespace hpl {
 		~cLanguageFile();
 
 		bool LoadFromFile(const tString asFile);
+		/** Load a second file ON TOP of what is loaded: its categories merge
+		    into existing ones and its entries replace same-named ones (a
+		    game running another game's text over its own). */
+		bool AddOverlayFile(const tString asFile);
 
 		const tWString& Translate(const tString& asCat, const tString& asName);
 
 	private:
 		tLanguageCategoryMap m_mapCategories;
+		bool mbOverlay; /* AddOverlayFile in progress: replace, do not warn */
 		tWString mwsEmpty;
 
 		cResources *mpResources;

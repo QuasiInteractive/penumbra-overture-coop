@@ -431,6 +431,28 @@ namespace hpl {
 				//Update fps counter.
 				mpFPSCounter->AddFrame();
 
+				//Dev aid: HPL_AUTOSHOT="<seconds>|<file.bmp>[|<seconds>|<file.bmp>...]"
+				//saves the finished frame(s) without anyone looking at the screen.
+				{
+					static tStringVec vShots;
+					static bool bShotsRead = false;
+					static unsigned long lShotStart = GetApplicationTime();
+					if(!bShotsRead)
+					{
+						bShotsRead = true;
+						const char *pEnv = getenv("HPL_AUTOSHOT");
+						tString sSep = "|";
+						if(pEnv) cString::GetStringVec(pEnv,vShots,&sSep);
+					}
+					while(vShots.size() >= 2 &&
+						  GetApplicationTime() - lShotStart >= (unsigned long)(cString::ToFloat(vShots[0].c_str(),0)*1000))
+					{
+						mpGraphics->GetLowLevel()->SaveScreenToBMP(vShots[1]);
+						Log(" autoshot: saved '%s'\n",vShots[1].c_str());
+						vShots.erase(vShots.begin(),vShots.begin()+2);
+					}
+				}
+
 				//Update the screen.
 				mpGraphics->GetLowLevel()->SwapBuffers();
 				//Log("Swap done: %d\n", GetApplicationTime());

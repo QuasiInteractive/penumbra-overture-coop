@@ -275,13 +275,30 @@ public:
 
 	float GetHeighAdd(){ return mfHeightAdd;}
 
+	/** v12 co-op: the death fade is up and we are waiting to respawn next
+	    to a living party member instead of showing the death menu. */
+	bool IsCoopRespawnPending(){ return mbCoopRespawnPending;}
+
 private:
+	/** v12 co-op death rule. Applies() decides at the moment the fade
+	    would hand over to cDeathMenu (live session, coop_respawn=1, some
+	    OTHER member alive per mirrored health); Update() then waits
+	    kCoopRespawnDelay, teleports to the nearest living member and
+	    restores the player; a party that dies out meanwhile (or never
+	    reports a position) falls back to the vanilla death menu. */
+	bool CoopRespawnApplies();
+	void UpdateCoopRespawn(float afTimeStep);
+	void CoopGiveUp(const char *asWhy);
+
 	bool mbActive;
 
 	float mfHeightAdd;
 	float mfRoll;
 
 	float mfMinHeightAdd;
+
+	bool mbCoopRespawnPending;
+	float mfCoopRespawnTimer;
 
 	cGfxObject *mpFadeGfx;
 	cGfxObject *mpBlackGfx;

@@ -21,6 +21,7 @@
 #include "multiplayer/NetworkManager.h"
 
 #include "Init.h"
+#include "GameScripts.h" /* co-op: cNetScriptPlayerScope */
 #include "Player.h"
 #include "PlayerState.h"
 #include "PlayerHelper.h"
@@ -327,6 +328,7 @@ void iGameEntity::PlayerPick()
 	if(mvCallbackScripts[eGameEntityScriptType_PlayerPick])
 	{
 		tString sCommand = GetScriptCommand(eGameEntityScriptType_PlayerPick);
+		cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 		mpInit->RunScriptCommand(sCommand);
 	}
 
@@ -345,6 +347,7 @@ void iGameEntity::PlayerInteract()
 		if(mvCallbackScripts[eGameEntityScriptType_PlayerInteract])
 		{
 			tString sCommand = GetScriptCommand(eGameEntityScriptType_PlayerInteract);
+			cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 			mpInit->RunScriptCommand(sCommand);
 		}
 	}
@@ -362,6 +365,7 @@ void iGameEntity::PlayerExamine()
 		if(mvCallbackScripts[eGameEntityScriptType_PlayerExamine])
 		{
 			tString sCommand = GetScriptCommand(eGameEntityScriptType_PlayerExamine);
+			cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 			mpInit->RunScriptCommand(sCommand);
 		}
 	}

@@ -77,6 +77,44 @@ namespace hpl {
 
 	//-----------------------------------------------------------------------
 
+	//-----------------------------------------------------------------------
+
+	/**
+	 * Entity nodes are named "_<type>_<file>_<name>" (Overture) but the 2006
+	 * Penumbra tech demo used "_<type>_<name>_<file>". Both split on "_" and
+	 * either part may itself hold "_", so pick the order whose file exists
+	 * (Overture's when neither or both do).
+	 * avStrings[0] is the type; asExt the file extension to look for.
+	 */
+	static void SplitEntityNodeName(const tStringVec &avStrings, const tString &asExt,
+									cFileSearcher *apSearcher, tString &asName, tString &asFile)
+	{
+		asName = avStrings[avStrings.size()-1];
+		asFile = "";
+		for(size_t i=1; i<avStrings.size()-1; ++i)
+		{
+			asFile += avStrings[i];
+			if(i != avStrings.size()-2) asFile+="_";
+		}
+		if(apSearcher==NULL || avStrings.size() < 4) return; /* one way to split */
+
+		if(apSearcher->GetFilePath(cString::SetFileExt(asFile,asExt)) != "") return;
+
+		tString sOldFile = "";
+		for(size_t i=2; i<avStrings.size(); ++i)
+		{
+			sOldFile += avStrings[i];
+			if(i != avStrings.size()-1) sOldFile+="_";
+		}
+		if(apSearcher->GetFilePath(cString::SetFileExt(sOldFile,asExt)) != "")
+		{
+			asName = avStrings[1];
+			asFile = sOldFile;
+		}
+	}
+
+	//-----------------------------------------------------------------------
+
 	cMeshLoaderCollada::cMeshLoaderCollada(iLowLevelGraphics *apLowLevelGraphics)
 		: iMeshLoader(apLowLevelGraphics)
 	{
@@ -579,13 +617,8 @@ namespace hpl {
 					}
 					else
 					{
-						tString sName = vStrings[vStrings.size()-1];
-						tString sFile = "";
-						for(size_t i2=1; i2<vStrings.size()-1; ++i2)
-						{
-							sFile += vStrings[i2];
-							if(i2 != vStrings.size()-2) sFile+="_";
-						}
+						tString sName, sFile;
+						SplitEntityNodeName(vStrings,"bnt",mpMaterialManager->GetFileSearcher(),sName,sFile);
 
 						cMeshBillboard *pBillboard = pMesh->CreateBillboard();
 
@@ -646,13 +679,8 @@ namespace hpl {
 					}
 					else
 					{
-						tString sName = vStrings[vStrings.size()-1];
-						tString sType = "";
-						for(size_t i2=1; i2<vStrings.size()-1; ++i2)
-						{
-							sType += vStrings[i2];
-							if(i2 != vStrings.size()-2) sType+="_";
-						}
+						tString sName, sType;
+						SplitEntityNodeName(vStrings,"ps",mpMaterialManager->GetFileSearcher(),sName,sType);
 
 						cMeshParticleSystem *pPS = pMesh->CreateParticleSystem();
 
@@ -672,13 +700,8 @@ namespace hpl {
 					}
 					else
 					{
-						tString sFile = "";
-						for(size_t i2=1; i2<vStrings.size()-1; ++i2)
-						{
-							sFile += vStrings[i2];
-							if(i2 != vStrings.size()-2) sFile+="_";
-						}
-						tString sName = vStrings[vStrings.size()-1];
+						tString sName, sFile;
+						SplitEntityNodeName(vStrings,"ent",mpMaterialManager->GetFileSearcher(),sName,sFile);
 
 						cMeshReference *pRef = pMesh->CreateReference();
 
@@ -697,13 +720,8 @@ namespace hpl {
 					}
 					else
 					{
-						tString sType = "";
-						for(size_t i2=1; i2<vStrings.size()-1; ++i2)
-						{
-							sType += vStrings[i2];
-							if(i2 != vStrings.size()-2) sType+="_";
-						}
-						tString sName = vStrings[vStrings.size()-1];
+						tString sName, sType;
+						SplitEntityNodeName(vStrings,"snt",mpMaterialManager->GetFileSearcher(),sName,sType);
 
 						cMeshSoundEntity *pSound = pMesh->CreateSoundEntity();
 
@@ -1959,13 +1977,8 @@ namespace hpl {
 				}
 				else
 				{
-					tString sFile = "";
-					for(size_t i=1; i<vParams.size()-1; ++i)
-					{
-						sFile += vParams[i];
-						if(i != vParams.size()-2) sFile+="_";
-					}
-					tString sName = vParams[vParams.size()-1];
+					tString sName, sFile;
+					SplitEntityNodeName(vParams,"snt",mpMaterialManager->GetFileSearcher(),sName,sFile);
 
 					cSoundEntity *pEntity = apWorld->CreateSoundEntity(sName,sFile,false);
 
@@ -2007,13 +2020,8 @@ namespace hpl {
 				}
 				else
 				{
-					tString sFile = "";
-					for(size_t i=1; i<vParams.size()-1; ++i)
-					{
-						sFile += vParams[i];
-						if(i != vParams.size()-2) sFile+="_";
-					}
-					tString sName = vParams[vParams.size()-1];
+					tString sName, sFile;
+					SplitEntityNodeName(vParams,"ent",mpMaterialManager->GetFileSearcher(),sName,sFile);
 
 					iEntity3D* pEntity = apWorld->CreateEntity(sName,apNode->m_mtxWorldTransform,sFile, true);
 
@@ -2061,13 +2069,8 @@ namespace hpl {
 					cVector2f vSize(apNode->mvScale.x,apNode->mvScale.y);
 					float fOffset = apNode->mvScale.z;
 
-					tString sName = vParams[vParams.size()-1];
-					tString sFile = "";
-					for(size_t i=1; i<vParams.size()-1; ++i)
-					{
-						sFile += vParams[i];
-						if(i != vParams.size()-2) sFile+="_";
-					}
+					tString sName, sFile;
+					SplitEntityNodeName(vParams,"bnt",mpMaterialManager->GetFileSearcher(),sName,sFile);
 
 					cBillboard *pBill = apWorld->CreateBillboard(sName,vSize);
 
@@ -2153,13 +2156,8 @@ namespace hpl {
 				}
 				else
 				{
-					tString sName = vParams[vParams.size()-1];
-					tString sType = "";
-					for(size_t i=1; i<vParams.size()-1; ++i)
-					{
-						sType += vParams[i];
-						if(i != vParams.size()-2) sType+="_";
-					}
+					tString sName, sType;
+					SplitEntityNodeName(vParams,"ps",mpMaterialManager->GetFileSearcher(),sName,sType);
 
 					cParticleSystem3D *pPS = apWorld->CreateParticleSystem(sName,sType,apNode->mvScale,
 																		apNode->m_mtxWorldTransform);

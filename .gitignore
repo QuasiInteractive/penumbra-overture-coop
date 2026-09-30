@@ -8,3 +8,5 @@ Debug/
 *.obj
 *.pdb
 *.ilk
+__pycache__/
+.claude/worktrees/

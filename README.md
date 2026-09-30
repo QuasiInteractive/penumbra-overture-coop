@@ -1,8 +1,8 @@
 # Penumbra: Overture — Co-op Mod
 
-**Two-player online co-op for Penumbra: Overture**, by [Quasi Interactive](https://quasi-interactive.com).
+**Online co-op for Penumbra: Overture, up to 4 players**, by [Quasi Interactive](https://quasi-interactive.com).
 
-One of you hosts, the other joins, and you play the campaign together in one
+One of you hosts, the others join, and you play the campaign together in one
 shared world: shared physics, shared items, party level transitions, loot
 handovers — you can even hand your friend the pickaxe.
 Only way to join each other currently is via Hamachi or RadminVPN. or any type of virtual lan server.
@@ -11,7 +11,24 @@ Only way to join each other currently is via Hamachi or RadminVPN. or any type o
 into your game's `redist` folder and the Multiplayer entry appears in the main
 menu. You need to own Penumbra: Overture (Steam).
 
-## Features (v0.10)
+## New in v0.11
+
+- **Up to 4 players, 4 characters** — Philip (the host), The Fisherman, Red
+  and Malik; pick yours in the menu
+- **Redesigned server browser** — Internet/LAN tabs, pages, password-protected
+  games; each game listed once
+- **Health bars and a party panel**, co-op respawn while a friend is alive
+- **Proximity voice chat** (hold V) with a microphone picker and level meter
+- **Friends hold their items** — flashlight, glowstick, flare, hammer,
+  pickaxe and more, with working flashlight beams and glowing flares
+- **Solid players** — no walking through each other; players shove crates
+- **Friendly fire** for melee weapons (`friendly_fire=0` to disable)
+- **Shared loot** — every pickup goes to the whole party
+  (`shared_loot=0` for one-of-each); late joiners get the party's items
+- Smoother motion-capture animations and rewritten physics sync
+- Fixes: no black screen when joining a new game; crash reports in `hpl.log`
+
+## Features (since v0.10)
 
 - See each other as animated characters (walk/run/crouch/jump, flashlights)
 - One-click joining: connect, auto-launch into the host's map, spawn at their side
@@ -35,9 +52,11 @@ menu. You need to own Penumbra: Overture (Steam).
 
 ### Known limits (roadmap)
 
+- Some timed level events (e.g. the boat horn) only play for the player
+  who set them off
+
 - Spider/worm set-pieces stay single-target on the host (deliberate — their
   scripted sequences assume vanilla senses); they still position-sync
-- Enemies cannot *hear* guests yet, only see them
 - Notebook/journal entries are per-player by design
 
 ## Repository layout

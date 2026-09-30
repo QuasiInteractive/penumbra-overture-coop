@@ -82,10 +82,24 @@ namespace hpl {
 
 	//-----------------------------------------------------------------------
 
+	static tString gsTraceOutside = "";
+	static tStringSet gsetTraced;
+
+	void cFileSearcher::SetTraceOutside(const tString &asFolder)
+	{
+		gsTraceOutside = cString::ToLowerCase(cString::ReplaceCharTo(asFolder,"\\","/"));
+	}
+
 	tString cFileSearcher::GetFilePath(tString asName)
 	{
 		tFilePathMapIt it = m_mapFiles.find(cString::ToLowerCase(asName));
 		if(it == m_mapFiles.end())return "";
+
+		if(gsTraceOutside != "" && it->second.find(gsTraceOutside) != 0 &&
+			gsetTraced.insert(it->second).second)
+		{
+			Log(" file-trace: %s\n", it->second.c_str());
+		}
 
 		return it->second;
 	}

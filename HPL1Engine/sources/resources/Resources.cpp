@@ -204,6 +204,15 @@ namespace hpl {
 
 	//-----------------------------------------------------------------------
 
+	bool cResources::AddLanguageOverlay(const tString &asPath)
+	{
+		if(mpLanguageFile == NULL)
+			return false;
+		return mpLanguageFile->AddOverlayFile(asPath);
+	}
+
+	//-----------------------------------------------------------------------
+
 	bool cResources::SetLanguageFile(const tString &asFile)
 	{
 		if(mpLanguageFile){

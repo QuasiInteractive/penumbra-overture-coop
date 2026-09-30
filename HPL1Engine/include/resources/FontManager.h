@@ -49,7 +49,13 @@ namespace hpl {
 		void Destroy(iResourceBase* apResource);
 		void Unload(iResourceBase* apResource);
 
+		/** Every later request for asName loads asAlias instead, rendered at
+		    alSize when it is a TrueType font (a game made for other content
+		    showing that content's fonts). */
+		void SetAlias(const tString& asName, const tString& asAlias, int alSize);
+
 	private:
+		std::map<tString, std::pair<tString,int> > m_mapAliases;
 		cGraphics* mpGraphics;
 		cResources *mpResources;
 		cGui *mpGui;

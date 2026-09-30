@@ -31,6 +31,7 @@
 #include "MapHandler.h"
 #include "PlayerHands.h"
 #include "GameMusicHandler.h"
+#include "multiplayer/NetworkManager.h" /* v12: co-op death rule */
 
 //////////////////////////////////////////////////////////////////////////
 // HIT GROUND CALLBACK
@@ -1174,6 +1175,16 @@ cPlayerDeath::cPlayerDeath(cInit *apInit)
 
 	mpFadeGfx = mpDrawer->CreateGfxObject("player_death_fade.bmp","smoke2d");
 	mpBlackGfx = mpDrawer->CreateGfxObject("player_death_black.bmp","smoke2d");
+
+	mbActive = false;
+	mfHeightAdd = 0;
+	mfRoll = 0;
+	mfMinHeightAdd = -1.3f;
+	mbStartFade = false;
+	mfFadeAlpha = 0;
+	mfBlackAlpha = 0;
+	mbCoopRespawnPending = false;
+	mfCoopRespawnTimer = 0;
 }
 
 cPlayerDeath::~cPlayerDeath()
@@ -1189,6 +1200,9 @@ void cPlayerDeath::Reset()
 
 	mfHeightAdd =0;
 	mfRoll =0;
+
+	mbCoopRespawnPending = false; /* v12: a save load / new game mid-fade cancels the wait */
+	mfCoopRespawnTimer = 0;
 
 	mpPostEffects->SetImageTrailActive(false);
 }
@@ -1219,6 +1233,8 @@ void cPlayerDeath::Start()
 
 	mbActive = true;
 	mbStartFade = false;
+	mbCoopRespawnPending = false;
+	mfCoopRespawnTimer = 0;
 
 	mfFadeAlpha =0;
 	mfBlackAlpha = 0;
@@ -1236,6 +1252,13 @@ void cPlayerDeath::Start()
 
 //-----------------------------------------------------------------------
 
+/* v12 co-op death rule — see PlayerHelper.h and UpdateCoopRespawn below. */
+static const float kCoopRespawnDelay = 3.0f;    /* fade + black before the teleport */
+static const float kCoopRespawnMaxWait = 15.0f; /* alive friend but no position yet (map change): give up after this */
+static const float kCoopRespawnHealth = 40.0f;
+
+//-----------------------------------------------------------------------
+
 void cPlayerDeath::Update(float afTimeStep)
 {
 	if(mbActive==false) return;
@@ -1243,8 +1266,19 @@ void cPlayerDeath::Update(float afTimeStep)
 	mfHeightAdd-= 0.95f*afTimeStep;
 	if(mfHeightAdd < mfMinHeightAdd){
 		mfHeightAdd = mfMinHeightAdd;
+		//v12 co-op: decided ONCE, the frame the fall lands (the moment the
+		//vanilla sequence hands over to the death menu). Offline this is
+		//false and the original two lines run untouched.
+		if(mbStartFade==false && CoopRespawnApplies())
+		{
+			mbCoopRespawnPending = true;
+			mfCoopRespawnTimer = 0;
+			Log(" multiplayer: died with a party member alive — respawning at their side in %.0f s\n",
+				kCoopRespawnDelay);
+		}
 		mbStartFade = true;
-		mpInit->mpDeathMenu->SetActive(true);
+		if(mbCoopRespawnPending==false)
+			mpInit->mpDeathMenu->SetActive(true);
 	}
 
 	mfRoll += cMath::ToRad(40.0f)*afTimeStep;
@@ -1262,6 +1296,113 @@ void cPlayerDeath::Update(float afTimeStep)
 			if(mfBlackAlpha >1) mfBlackAlpha =1;
 		}
 	}
+
+	if(mbCoopRespawnPending) UpdateCoopRespawn(afTimeStep);
+}
+
+//-----------------------------------------------------------------------
+
+/* v12 co-op death rule — see PlayerHelper.h. */
+
+bool cPlayerDeath::CoopRespawnApplies()
+{
+	cNetworkManager *pNet = mpInit->mpNetworkManager;
+	if(pNet==NULL) return false;
+	if(pNet->IsCoopRespawnEnabled()==false) return false;
+	if(pNet->IsSessionLive()==false) return false;
+
+	std::vector<cNetPartyMember> vParty;
+	pNet->GetPartyStatus(vParty);
+	for(size_t i=0; i<vParty.size(); ++i)
+	{
+		if(vParty[i].mfHealth > 0) return true;
+	}
+	return false; /* everybody else is dead (or never reported): vanilla menu */
+}
+
+void cPlayerDeath::CoopGiveUp(const char *asWhy)
+{
+	Log(" multiplayer: co-op respawn cancelled (%s) — death menu\n", asWhy ? asWhy : "");
+	mbCoopRespawnPending = false;
+	mfCoopRespawnTimer = 0;
+	if(mbActive) mpInit->mpDeathMenu->SetActive(true);
+}
+
+void cPlayerDeath::UpdateCoopRespawn(float afTimeStep)
+{
+	if(mbActive==false){ mbCoopRespawnPending = false; return; }
+
+	mfCoopRespawnTimer += afTimeStep;
+	if(mfCoopRespawnTimer < kCoopRespawnDelay) return;
+
+	cNetworkManager *pNet = mpInit->mpNetworkManager;
+	cPlayer *pPlayer = mpInit->mpPlayer;
+	if(pNet==NULL || pPlayer==NULL || pNet->IsSessionLive()==false)
+	{
+		CoopGiveUp("session ended");
+		return;
+	}
+	//A level change while we lie there: the body is rebuilt on load — wait.
+	if(	mpInit->mpMapHandler==NULL || mpInit->mpMapHandler->IsChangingMap() ||
+		mpInit->mpMapHandler->IsPreUpdating())
+	{
+		return;
+	}
+	iCharacterBody *pBody = pPlayer->GetCharacterBody();
+	if(pBody==NULL) return;
+
+	//Nearest LIVING member with a known position (re-evaluated every frame
+	//from here on: the friend we would have picked may have died or left
+	//during the fade).
+	std::vector<cNetPartyMember> vParty;
+	pNet->GetPartyStatus(vParty);
+	bool bAnyAlive = false;
+	int lBest = -1;
+	float fBestDist = 0;
+	const cVector3f vOwn = pBody->GetFeetPosition();
+	for(size_t i=0; i<vParty.size(); ++i)
+	{
+		if(vParty[i].mfHealth <= 0) continue;
+		bAnyAlive = true;
+		if(vParty[i].mbHasFeetPos==false) continue;
+		const float fDist = cMath::Vector3Dist(vOwn, vParty[i].mvFeetPos);
+		if(lBest < 0 || fDist < fBestDist)
+		{
+			lBest = (int)i;
+			fBestDist = fDist;
+		}
+	}
+	if(bAnyAlive==false)
+	{
+		CoopGiveUp("no party member alive");
+		return;
+	}
+	if(lBest < 0)
+	{
+		if(mfCoopRespawnTimer > kCoopRespawnMaxWait) CoopGiveUp("no position for a living member");
+		return; /* alive but between worlds — keep the black screen a while */
+	}
+
+	//////////////////////////////////////////
+	// Respawn: the spawn-at-host offset (feet + a hair up, ghosts have no
+	// collider so materializing inside one is safe), health back, stance
+	// and hidden state reset, sequence ended. Health FIRST: Reset() drops
+	// mbActive and cPlayer::Update would restart the death on health <= 0.
+	const cNetPartyMember &target = vParty[lBest];
+	const cVector3f vFeet = target.mvFeetPos + cVector3f(0, 0.05f, 0);
+
+	pPlayer->SetHealth(kCoopRespawnHealth);
+	pBody->SetFeetPosition(vFeet);
+	if(pPlayer->GetMoveState()==ePlayerMoveState_Crouch)
+		pPlayer->ChangeMoveState(ePlayerMoveState_Walk);
+	if(pPlayer->GetHidden()) pPlayer->GetHidden()->UnHide();
+	if(pPlayer->GetCamera()) pPlayer->GetCamera()->SetRoll(0);
+	pPlayer->ChangeState(ePlayerState_Normal);
+
+	Reset(); /* mbActive=false, height/roll 0, image trail off, pending cleared */
+
+	Log(" multiplayer: respawned next to player %d at (%.1f %.1f %.1f) with %.0f health\n",
+		(int)target.mlId, vFeet.x, vFeet.y, vFeet.z, kCoopRespawnHealth);
 }
 
 //-----------------------------------------------------------------------

@@ -176,6 +176,7 @@ namespace hpl {
 
 		mlFirstChar = alFirstChar;
 		mlLastChar = alLastChar;
+		mvSizeRatio = 1; /* before the glyphs: CreateGlyph scales by it (was set after, so every TrueType glyph had zero size) */
 
 		TTF_Font* pFont = TTF_OpenFont(asFileName.c_str(), alSize);
 		if(pFont==NULL){
@@ -190,8 +191,8 @@ namespace hpl {
 			unsigned short lUniCode = i;
 			/*char c = (char)i;
 
-			if(c == 'ö')lUniCode = 'o';
-			else if(c == 'Ö')lUniCode = 'O';*/
+			if(c == 'ï¿½')lUniCode = 'o';
+			else if(c == 'ï¿½')lUniCode = 'O';*/
 
 			pGlyph = RenderGlyph(pFont, lUniCode, alSize);
 			AddGlyph(pGlyph);
@@ -256,6 +257,7 @@ namespace hpl {
 
 				Pix[3] = Pix[0];
 			}
+
 
 		//Create the Glyph
 		int lHeight = TTF_FontHeight(apFont);

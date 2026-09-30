@@ -248,16 +248,16 @@ cSaveHandler::cSaveHandler(cInit *apInit)  : iUpdateable("SaveHandler")
 	}
 
 	//Set to the name of directory
-	msSaveDir = sPeronalDir + PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME;
+	msSaveDir = sPeronalDir + tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME;
 
 	//The directories that should be created
 	tWString vDirs[] = { PERSONAL_RELATIVEPIECES
 						PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME_PARENT,
-						PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME,
-						PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME _W("save"),
-						PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME _W("save/auto"),
-						PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME _W("save/spot"),
-						PERSONAL_RELATIVEROOT PERSONAL_RELATIVEGAME _W("save/favorite")};
+						tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME,
+						tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME + _W("save"),
+						tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME + _W("save/auto"),
+						tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME + _W("save/spot"),
+						tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME + _W("save/favorite")};
 	int lDirNum = PERSONAL_RELATIVEPIECES_COUNT + 6;
         
 	//Check if directories exist and if not create

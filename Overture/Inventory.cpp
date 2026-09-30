@@ -19,6 +19,7 @@
 #include "Inventory.h"
 
 #include "Init.h"
+#include "GameScripts.h" /* co-op: cNetScriptPlayerScope */
 #include "Player.h"
 #include "GameItem.h"
 #include "GameItemType.h"
@@ -28,6 +29,11 @@
 #include "RadioHandler.h"
 #include "Notebook.h"
 #include "HapticGameCamera.h"
+#include "PlayerHands.h"
+#include "PlayerState_Weapon.h"      /* co-op held-item safety */
+#include "PlayerState_WeaponHaptX.h"
+#include "HudModel_Weapon.h"
+#include "HudModel_Throw.h"
 
 #include "GlobalInit.h"
 #include "multiplayer/NetworkManager.h"
@@ -66,6 +72,18 @@ cInventory::cInventory(cInit *apInit)  : iUpdateable("Inventory")
 	mfMessageAlpha =0;
 
 	mpMessageBackground = mpDrawer->CreateGfxObject("effect_black.bmp","diffalpha2d");
+
+	//v12 party health bar image (solid white, tinted per draw)
+	mpGfxPartyBar = NULL;
+	{
+		iBitmap2D *pBmp = mpInit->mpGame->GetGraphics()->GetLowLevel()->CreateBitmap2D(cVector2l(4,4),32);
+		if(pBmp)
+		{
+			pBmp->FillRect(cRect2l(0,0,4,4),cColor(1,1,1,1));
+			mpGfxPartyBar = mpDrawer->CreateGfxObject(pBmp,"diffalpha2d");
+			hplDelete(pBmp);
+		}
+	}
 
 	///////////////////////////////////
 	//Init normal slots
@@ -132,6 +150,7 @@ cInventory::cInventory(cInit *apInit)  : iUpdateable("Inventory")
 cInventory::~cInventory(void)
 {
 	hplDelete( mpContext );
+	if(mpGfxPartyBar) mpDrawer->DestroyGfxObject(mpGfxPartyBar);
 
 	ClearCallbacks();
 	
@@ -931,6 +950,9 @@ void cInventory::OnStart()
 
 void cInventory::Update(float afTimeStep)
 {
+	//co-op backstop: never stay in a weapon/use state whose item is gone
+	if(NetItemRulesActive()) NetCheckHeldItems();
+
 	////////////////////////////////
 	// Change alpha
 	if(mbActive==false)
@@ -1099,6 +1121,10 @@ void cInventory::OnDraw()
 	}
 
 	//////////////////////////////
+	//v12: party health (no-op offline)
+	DrawParty();
+
+	//////////////////////////////
 	//Draw Selected item
 	if(mpCurrentItem)
 	{
@@ -1146,6 +1172,61 @@ void cInventory::OnDraw()
 							msItemDesc.c_str());
 		mpFont->DrawWordWrap(cVector3f(80+1,480+1,9),640,16,17,cColor(0,0,0,fTextAlpha),eFontAlign_Left,
 							msItemDesc.c_str());
+	}
+}
+
+//-----------------------------------------------------------------------
+
+/* v12 party health: right of the slot grid (x 680.., from the grid's top
+   at y 89), "Party" then "<name>  <hp>" (v13: the player's name, "Player
+   <id>" until one is known) + a 100x8 bar per connected player,
+   coloured like cInventoryHealth (red..green), "dead" in red. */
+void cInventory::DrawParty()
+{
+	cNetworkManager *pNet = mpInit->mpNetworkManager;
+	if(pNet==NULL || mpGfxPartyBar==NULL || mpFont==NULL) return;
+
+	std::vector<cNetPartyMember> vParty;
+	pNet->GetPartyStatus(vParty);
+	if(vParty.empty()) return;
+
+	const float fX = 682.0f;
+	float fY = 89.0f;
+	const float fZ = 12.0f;
+	const float kBarW = 100.0f, kBarH = 8.0f;
+
+	mpFont->Draw(cVector3f(fX, fY, fZ),cVector2f(15,15),cColor(1,1,1,mfAlpha),eFontAlign_Left,_W("Party"));
+	mpFont->Draw(cVector3f(fX+1, fY+1, fZ-1),cVector2f(15,15),cColor(0,0,0,mfAlpha),eFontAlign_Left,_W("Party"));
+	fY += 20;
+
+	for(size_t i=0; i<vParty.size() && fY < 360; ++i)
+	{
+		const cNetPartyMember &m = vParty[i];
+		const float fHealth = (m.mfHealth < 0) ? 0.0f : ((m.mfHealth > 100) ? 100.0f : m.mfHealth);
+		const float fPercent = fHealth / 100.0f;
+
+		//v13: the player's name ("Player <id>" until one is known)
+		const tWString sName = cString::To16Char(pNet->GetPlayerName(m.mlId));
+		if(fHealth > 0)
+		{
+			mpFont->Draw(cVector3f(fX, fY, fZ),cVector2f(13,13),cColor(1,1,1,mfAlpha),eFontAlign_Left,
+							_W("%ls  %.0f"),sName.c_str(), fHealth);
+		}
+		else
+		{
+			mpFont->Draw(cVector3f(fX, fY, fZ),cVector2f(13,13),cColor(1,0.3f,0.3f,mfAlpha),eFontAlign_Left,
+							_W("%ls  dead"),sName.c_str());
+		}
+		fY += 15;
+
+		mpDrawer->DrawGfxObject(mpGfxPartyBar,cVector3f(fX-1, fY-1, fZ),cVector2f(kBarW+2, kBarH+2),
+								cColor(0,0,0,0.6f*mfAlpha));
+		if(fPercent > 0)
+		{
+			mpDrawer->DrawGfxObject(mpGfxPartyBar,cVector3f(fX, fY, fZ+1),cVector2f(kBarW*fPercent, kBarH),
+									cColor(1.0f-fPercent, fPercent, 0, mfAlpha));
+		}
+		fY += kBarH + 8;
 	}
 }
 
@@ -1344,6 +1425,11 @@ void cInventory::AddItemFromFile(const tString &asName,const tString &asFile, in
 
 void cInventory::RemoveItem(cInventoryItem *apItem)
 {
+	/* co-op: dropping / giving away / losing (script or a friend's
+	   consumption replicated here) the item the player is HOLDING must put
+	   it away first, or the weapon state outlives its item forever. */
+	NetReleaseHeldItem(apItem);
+
 	tInventorySlotListIt SlotIt = mlstSlots.begin();
 	for(; SlotIt != mlstSlots.end();SlotIt++)
 	{
@@ -1370,6 +1456,203 @@ void cInventory::RemoveItem(cInventoryItem *apItem)
 	}
 
 	hplDelete( apItem );
+}
+
+//-----------------------------------------------------------------------
+
+//////////////////////////////////////////////////////////////////////////
+// CO-OP HELD ITEM SAFETY
+//
+// Single-player never lets a weapon leave the inventory (the .ent files say
+// CanBeDropped="false"), so vanilla never had to leave ePlayerState_Melee /
+// ePlayerState_Throw because the item vanished: the only exits are
+// re-activating the item (GameItemType.cpp OnAction toggle) and the Holster
+// key. With a session live every item can be dragged out (OnMouseUp), and
+// items also leave through replicated script RemoveItem — so a player who
+// dropped the equipped hammer kept it in hand for good, with left click
+// bound to the swing (no grabbing / picking up) and nothing in the
+// inventory to toggle it off. These keep that from happening. All no-op
+// offline.
+//////////////////////////////////////////////////////////////////////////
+
+//-----------------------------------------------------------------------
+
+bool cInventory::NetItemRulesActive()
+{
+	cNetworkManager *pNet = mpInit->mpNetworkManager;
+	return pNet && (pNet->IsHosting() || pNet->IsClientSynced());
+}
+
+//-----------------------------------------------------------------------
+
+bool cInventory::HasItem(cInventoryItem *apItem)
+{
+	if(apItem==NULL) return false;
+	for(tInventoryItemMapIt it = m_mapItems.begin(); it != m_mapItems.end(); ++it)
+	{
+		if(it->second == apItem) return true;
+	}
+	return false;
+}
+
+//-----------------------------------------------------------------------
+
+static bool NetSameHudName(const tString &asA, const tString &asB)
+{
+	return asA != "" && cString::ToLowerCase(asA) == cString::ToLowerCase(asB);
+}
+
+bool cInventory::HasItemWithHudModel(const tString &asHudName, cInventoryItem *apIgnore)
+{
+	if(asHudName=="") return false;
+	for(tInventoryItemMapIt it = m_mapItems.begin(); it != m_mapItems.end(); ++it)
+	{
+		cInventoryItem *pItem = it->second;
+		if(pItem == NULL || pItem == apIgnore) continue;
+		if(NetSameHudName(pItem->GetHudModelName(), asHudName)) return true;
+	}
+	return false;
+}
+
+//-----------------------------------------------------------------------
+
+/* The hud models the weapon / throw states are driving (whatever state the
+   player is in now: they are only meaningful while that state is current,
+   or while a message box will return to it). */
+static iHudModel* NetMeleeHud(cInit *apInit)
+{
+	iPlayerState *pState = apInit->mpPlayer->GetStateData(ePlayerState_WeaponMelee);
+	if(pState==NULL) return NULL;
+	if(apInit->mbHasHaptics)
+		return static_cast<cPlayerState_WeaponMeleeHaptX*>(pState)->GetHudWeapon();
+	return static_cast<cPlayerState_WeaponMelee*>(pState)->GetHudWeapon();
+}
+
+static iHudModel* NetThrowHud(cInit *apInit)
+{
+	iPlayerState *pState = apInit->mpPlayer->GetStateData(ePlayerState_Throw);
+	if(pState==NULL) return NULL;
+	if(apInit->mbHasHaptics)
+		return static_cast<cPlayerState_ThrowHaptX*>(pState)->GetHudObject();
+	return static_cast<cPlayerState_Throw*>(pState)->GetHudObject();
+}
+
+/* Put hud model apHud away: leave its state for normal (its LeaveState
+   starts the unequip animation, exactly like the vanilla toggle), and if the
+   model is still in hand (e.g. a message box is up and will return to the
+   weapon state) unequip it directly — never twice, SetCurrentModel(1,"") on
+   a model already unequipping flips its animation time. */
+static void NetHolster(cInit *apInit, iHudModel *apHud, ePlayerState aState)
+{
+	cPlayer *pPlayer = apInit->mpPlayer;
+	if(pPlayer->GetState() == aState)
+		pPlayer->ChangeState(ePlayerState_Normal);
+
+	iHudModel *pCurrent = apInit->mpPlayerHands->GetCurrentModel(1);
+	if(pCurrent && pCurrent == apHud && pCurrent->GetState() != eHudModelState_Unequip)
+		apInit->mpPlayerHands->SetCurrentModel(1,"");
+}
+
+//-----------------------------------------------------------------------
+
+void cInventory::NetReleaseHeldItem(cInventoryItem *apItem)
+{
+	if(apItem==NULL || NetItemRulesActive()==false) return;
+	cPlayer *pPlayer = mpInit->mpPlayer;
+	if(pPlayer==NULL || mpInit->mpPlayerHands==NULL) return;
+
+	const tString &sHud = apItem->GetHudModelName();
+
+	////////////////////////////
+	// Melee weapon (hammer, pickaxe): the state only knows its hud model, so
+	// match by hud name — and only if no other carried item drives it
+	// (dropping the hammer while swinging the pickaxe changes nothing).
+	if(apItem->GetItemType() == eGameItemType_WeaponMelee)
+	{
+		iHudModel *pHud = NetMeleeHud(mpInit);
+		if(pHud && NetSameHudName(pHud->msName, sHud) &&
+		   HasItemWithHudModel(sHud, apItem)==false)
+		{
+			bool bHeld = pPlayer->GetState() == ePlayerState_WeaponMelee ||
+						 mpInit->mpPlayerHands->GetCurrentModel(1) == pHud;
+			if(bHeld)
+			{
+				Log(" multiplayer: '%s' left the inventory while equipped - holstering\n",
+					apItem->GetName().c_str());
+				NetHolster(mpInit, pHud, ePlayerState_WeaponMelee);
+			}
+		}
+	}
+	////////////////////////////
+	// Throw item: its hud keeps a raw pointer to THIS inventory item, so it
+	// must not stay equipped past the delete. Count <= 0 is the hud's own
+	// last throw (HudModel_Throw.cpp) which holsters right after — skip it.
+	else if(apItem->GetItemType() == eGameItemType_Throw && apItem->GetCount() > 0)
+	{
+		iHudModel *pHud = NetThrowHud(mpInit);
+		if(pHud && NetSameHudName(pHud->msName, sHud))
+		{
+			bool bHeld = pPlayer->GetState() == ePlayerState_Throw ||
+						 mpInit->mpPlayerHands->GetCurrentModel(1) == pHud;
+			if(bHeld)
+			{
+				Log(" multiplayer: '%s' left the inventory while equipped - holstering\n",
+					apItem->GetName().c_str());
+				NetHolster(mpInit, pHud, ePlayerState_Throw);
+			}
+		}
+	}
+
+	////////////////////////////
+	// "Use item on..." cursor: the player keeps a raw pointer to the item
+	// (crosshair icon, OnUse). Drop it and the cursor with it.
+	if(pPlayer->GetCurrentItem() == apItem)
+	{
+		if(pPlayer->GetState() == ePlayerState_UseItem)
+			pPlayer->ChangeState(ePlayerState_Normal);
+		pPlayer->SetCurrentItem(NULL);
+	}
+}
+
+//-----------------------------------------------------------------------
+
+void cInventory::NetCheckHeldItems()
+{
+	cPlayer *pPlayer = mpInit->mpPlayer;
+	if(pPlayer==NULL || mpInit->mpPlayerHands==NULL) return;
+
+	const ePlayerState state = pPlayer->GetState();
+	if(state == ePlayerState_WeaponMelee)
+	{
+		iHudModel *pHud = NetMeleeHud(mpInit);
+		if(pHud==NULL || HasItemWithHudModel(pHud->msName)==false)
+		{
+			Log(" multiplayer: melee weapon '%s' is no longer carried - holstering\n",
+				pHud ? pHud->msName.c_str() : "(none)");
+			if(pHud) NetHolster(mpInit, pHud, ePlayerState_WeaponMelee);
+			else pPlayer->ChangeState(ePlayerState_Normal);
+		}
+	}
+	else if(state == ePlayerState_Throw)
+	{
+		iHudModel *pHud = NetThrowHud(mpInit);
+		if(pHud==NULL || HasItemWithHudModel(pHud->msName)==false)
+		{
+			Log(" multiplayer: throw item '%s' is no longer carried - holstering\n",
+				pHud ? pHud->msName.c_str() : "(none)");
+			if(pHud) NetHolster(mpInit, pHud, ePlayerState_Throw);
+			else pPlayer->ChangeState(ePlayerState_Normal);
+		}
+	}
+	else if(state == ePlayerState_UseItem)
+	{
+		if(HasItem(pPlayer->GetCurrentItem())==false)
+		{
+			Log(" multiplayer: used item is no longer carried - leaving use mode\n");
+			pPlayer->ChangeState(ePlayerState_Normal);
+			pPlayer->SetCurrentItem(NULL);
+		}
+	}
 }
 
 //-----------------------------------------------------------------------
@@ -1460,12 +1743,12 @@ void cInventory::OnMouseUp(eMButton aButton)
 			   into the meter) still cannot drop: they no longer exist as
 			   discrete world entities. */
 			bool bCanDrop = mpCurrentItem->CanBeDropped();
-			if(mpInit->mpNetworkManager &&
-			   (mpInit->mpNetworkManager->IsHosting() ||
-			    mpInit->mpNetworkManager->IsClientSynced()))
+			if(NetItemRulesActive())
 				bCanDrop = true;
 			if(bCanDrop && mpCurrentItem->HasCount()==false)
 			{
+				/* Dropping the weapon in hand is allowed: RemoveItem below
+				   holsters it (NetReleaseHeldItem) before the item is freed. */
 				mpCurrentItem->Drop();
 				RemoveItem(mpCurrentItem);
 			}
@@ -1698,6 +1981,7 @@ void cInventory::CheckPickupCallback(const tString &asItem)
 	cInventoryPickupCallback *pCallback = it->second;
 
 	tString sCommand = pCallback->msFunction + "(\""+asItem+"\")";
+	cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 	mpInit->RunScriptCommand(sCommand);
 }
 
@@ -1724,6 +2008,7 @@ bool cInventory::CheckUseCallback(const tString &asItem, const tString &asObject
 
 	if(sCommand!="")
 	{
+		cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 		mpInit->RunScriptCommand(sCommand);
 		return true;
 	}
@@ -1760,6 +2045,7 @@ bool cInventory::CheckCombineCallback(const tString &asItem1,const tString &asIt
 
 		tString sCommand = pFinalCallback->msFunction + "(\""+asItem1+"\", \""+asItem2+"\", "+
 														cString::ToString(sString,"")+")";
+		cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 		mpInit->RunScriptCommand(sCommand);
 		return true;
 	}

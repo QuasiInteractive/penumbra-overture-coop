@@ -470,7 +470,7 @@ void cPreMenu::Update(float afTimeStep)
 
 		if (!mbPlayingMusic)
 		{
-			mpInit->mpGame->GetSound()->GetMusicHandler()->Play("music_theme.ogg",1,0,false);
+			mpInit->mpGame->GetSound()->GetMusicHandler()->Play(gbTechDemoMode ? "music_theme.mp3" : "music_theme.ogg",1,0,false);
 			mbPlayingMusic = true;
 		}
 
@@ -570,7 +570,7 @@ void cPreMenu::Update(float afTimeStep)
 		{
 			if (!mbPlayingMusic) 
 			{
-				mpInit->mpGame->GetSound()->GetMusicHandler()->Play("music_theme.ogg",1,0,false);
+				mpInit->mpGame->GetSound()->GetMusicHandler()->Play(gbTechDemoMode ? "music_theme.mp3" : "music_theme.ogg",1,0,false);
 				mbPlayingMusic = true;
 			}
 		}

@@ -304,6 +304,7 @@ cPlayerState_WeaponMeleeHaptX::cPlayerState_WeaponMeleeHaptX(cInit *apInit,cPlay
 {
 	mfLastForward = 1.0f;
 	mfLastSideways = 1.0f;
+	mpHudWeapon = NULL; /* co-op: GetHudWeapon() may be read before the first equip */
 
 	mpLowLevelHaptic = mpInit->mpGame->GetHaptic()->GetLowLevel();
 
