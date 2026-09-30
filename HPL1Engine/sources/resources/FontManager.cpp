@@ -58,12 +58,27 @@ namespace hpl {
 
 	//-----------------------------------------------------------------------
 
+	void cFontManager::SetAlias(const tString& asName, const tString& asAlias, int alSize)
+	{
+		m_mapAliases[cString::ToLowerCase(asName)] = std::pair<tString,int>(cString::ToLowerCase(asAlias), alSize);
+	}
+
+	//-----------------------------------------------------------------------
+
 	iFontData* cFontManager::CreateFontData(const tString& asName, int alSize,unsigned short alFirstChar,
 											unsigned short alLastChar)
 	{
 		tString sPath;
 		iFontData* pFont;
 		tString asNewName = cString::ToLowerCase(asName);
+
+		std::map<tString, std::pair<tString,int> >::iterator aliasIt = m_mapAliases.find(asNewName);
+		if(aliasIt != m_mapAliases.end() && aliasIt->second.first != asNewName)
+		{
+			iFontData *pAliasFont = CreateFontData(aliasIt->second.first, aliasIt->second.second,
+													alFirstChar, alLastChar);
+			if(pAliasFont) return pAliasFont;
+		}
 
 		BeginLoad(asName);
 

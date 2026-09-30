@@ -112,7 +112,7 @@ namespace hpl {
 
 		if(mpFile)
 		{
-			fprintf(mpFile, asMessage.c_str());
+			fputs(asMessage.c_str(), mpFile); /* already formatted: a "%" in the text must not be read as a format */
 			fflush(mpFile);
 		}
 	}

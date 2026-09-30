@@ -158,7 +158,8 @@ cMapHandlerSoundCallback::cMapHandlerSoundCallback(cInit *apInit)
 	
 	///////////////////////////////////////////
 	//Load all sounds that can heard by enemies
-	tString sFile = "sounds/EnemySounds.dat";
+	/* the tech demo lists its own sounds (the working folder is Overture's) */
+	tString sFile = gbTechDemoMode ? gsTechDemoDir + "/sounds/EnemySounds.dat" : tString("sounds/EnemySounds.dat");
 	TiXmlDocument* pXmlDoc = hplNew( TiXmlDocument, (sFile.c_str()) );
 	if(pXmlDoc->LoadFile()==false){
 		Error("Couldn't load XML file '%s'!\n",sFile.c_str());

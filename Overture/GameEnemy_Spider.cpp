@@ -42,7 +42,7 @@ iGameEnemyState_Spider_Base::iGameEnemyState_Spider_Base(int alId, cInit *apInit
 
 void iGameEnemyState_Spider_Base::OnSeePlayer(const cVector3f &avPosition, float afChance)
 {
-	if(mpPlayer->GetHealth() <=0) return;
+	if(mpEnemy->GetFocusHealth() <=0) return;
 
 	if(afChance >= mpEnemySpider->mfIdleMinSeeChance)
 	{
@@ -230,7 +230,10 @@ void cGameEnemyState_Spider_Hunt::OnLeaveState(iGameEnemyState *apNextState)
 
 void cGameEnemyState_Spider_Hunt::OnUpdate(float afTimeStep)
 {
-	if(mpPlayer->GetHealth() <=0){
+	/* Phase 6: the focus accessors are the local player offline and the
+	   nearest seen player (host or ghost) online — same values as the old
+	   direct mpPlayer reads for the local case. */
+	if(mpEnemy->GetFocusHealth() <=0){
 		mpEnemy->ChangeState(STATE_IDLE);
 		return;
 	}
@@ -243,7 +246,7 @@ void cGameEnemyState_Spider_Hunt::OnUpdate(float afTimeStep)
 	}
 
 	//Check if he should attack.
-	if(mpMover->DistanceToChar2D(mpPlayer->GetCharacterBody()) < mpEnemySpider->mfAttackDistance)
+	if(mpEnemy->FocusDist2D() < mpEnemySpider->mfAttackDistance)
 	{
 		mpEnemy->ChangeState(STATE_ATTACK);
 	}
@@ -257,7 +260,7 @@ void cGameEnemyState_Spider_Hunt::OnUpdate(float afTimeStep)
 			cAINodeContainer *pNodeCont = mpEnemy->GetMover()->GetNodeContainer();
 			
 			//Check if there is a free path to the player
-			if(mbLostPlayer == false && mpMover->FreeDirectPathToChar(mpPlayer->GetCharacterBody()))
+			if(mbLostPlayer == false && mpEnemy->FocusDirectPath())
 			{
 				mbFreePlayerPath = true;
 				mpMover->Stop();
@@ -305,7 +308,7 @@ void cGameEnemyState_Spider_Hunt::OnUpdate(float afTimeStep)
 	if(mbFreePlayerPath)
 	{
 		//Go towards player
-		mpMover->MoveDirectToPos(mpPlayer->GetCharacterBody()->GetFeetPosition(),afTimeStep);
+		mpMover->MoveDirectToPos(mpEnemy->GetFocusFeetPos(),afTimeStep);
 	}
 	////////////////////////////////
 	//Update path search
@@ -422,7 +425,7 @@ void cGameEnemyState_Spider_Attack::OnUpdate(float afTimeStep)
 
 		if(mfJumpTimer <= 0)
 		{
-			cVector3f vDirection =	mpInit->mpPlayer->GetCamera()->GetPosition() -
+			cVector3f vDirection =	mpEnemy->GetFocusCamPos() -
 									mpMover->GetCharBody()->GetPosition();
 			float fHeight = cMath::Abs(vDirection.y);
 			vDirection.Normalise();
@@ -433,7 +436,7 @@ void cGameEnemyState_Spider_Attack::OnUpdate(float afTimeStep)
 		}
 	}
 	
-	cVector3f vStart = mpPlayer->GetCharacterBody()->GetPosition();
+	cVector3f vStart = mpEnemy->GetFocusPos();
 	vStart.y =0;
 	cVector3f vEnd = mpMover->GetCharBody()->GetPosition();
 	vEnd.y = 0;
@@ -472,6 +475,12 @@ void cGameEnemyState_Spider_Attack::OnUpdate(float afTimeStep)
 				mpEnemySpider->PlaySound(mpEnemySpider->msAttackHitSound);
 			}
 			mpInit->mpPlayer->mbDamageFromPos = false;
+
+			/* Phase 6: a ghost focus is hurt by packet, and only if it is
+			   inside this attack box with a clear line (no-op offline) */
+			mpEnemy->FocusAttackDamage(mpEnemySpider->mfAttackMinDamage,
+										mpEnemySpider->mfAttackMaxDamage,
+										mpEnemySpider->GetAttackShape(), mtxOffset);
 			mbAttacked = true;
 		}
 	}
@@ -536,7 +545,7 @@ void cGameEnemyState_Spider_Flee::OnEnterState(iGameEnemyState *apPrevState)
 	mpEnemy->SetupBody();
 	mpMover->GetCharBody()->SetMaxPositiveMoveSpeed(eCharDir_Forward,mpEnemySpider->mfHuntSpeed);
 
-	cVector3f vDir = mpMover->GetCharBody()->GetPosition() - mpPlayer->GetCharacterBody()->GetPosition();
+	cVector3f vDir = mpMover->GetCharBody()->GetPosition() - mpEnemy->GetFocusPos();
 	vDir.Normalise();
 	
 	cVector3f vStart = 	mpMover->GetCharBody()->GetPosition() + vDir*mpEnemySpider->mfFleeMaxDistance;
@@ -744,6 +753,9 @@ void cGameEnemyState_Spider_Dead::OnUpdate(float afTimeStep)
 
 cGameEnemy_Spider::cGameEnemy_Spider(cInit *apInit,const tString& asName,TiXmlElement *apGameElem) : iGameEnemy(apInit,asName,apGameElem)
 {
+	mbNetMultiTarget = true; /* Phase 6: hunt/attack/flee use the focus
+	    accessors now — nearest player, host or ghost. The only scripted
+	    entry (ShowEnemyPlayer) pins the focus to the local player first. */
 	LoadBaseProperties(apGameElem);
 	
 	//////////////////////////////
@@ -842,6 +854,7 @@ void cGameEnemy_Spider::ShowPlayer(const cVector3f& avPlayerFeetPos)
 	if(	mlCurrentState == STATE_IDLE || mlCurrentState == STATE_PATROL || 
 		mlCurrentState == STATE_INVESTIGATE)
 	{
+		NetFocusLocalPlayer(); /* the shown player is the local one */
 		mvLastPlayerPos = avPlayerFeetPos;
 		ChangeState(STATE_HUNT);
 	}

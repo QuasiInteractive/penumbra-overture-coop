@@ -70,6 +70,7 @@ public:
 	bool OnStartInventoryShortCut(int alNum);
 
 	void SetHudObject(cHudModel_Throw* apHudObject){ mpHudObject = apHudObject;}
+	cHudModel_Throw* GetHudObject(){ return mpHudObject;}
 
 private:
 	cHudModel_Throw *mpHudObject;

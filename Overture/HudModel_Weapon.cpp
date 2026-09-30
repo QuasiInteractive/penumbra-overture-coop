@@ -28,6 +28,7 @@
 #include "EffectHandler.h"
 
 #include "GlobalInit.h"
+#include "multiplayer/NetworkManager.h" /* v22: friendly fire */
 
 
 //////////////////////////////////////////////////////////////////////////
@@ -632,6 +633,40 @@ void cHudModel_WeaponMelee::Attack()
 		}
 	}
 	
+	////////////////////////////////
+	//Co-op: other players (v22 friendly fire). Their solid bodies are
+	//character bodies, which the body loop below skips; the host decides
+	//whether the hit counts (multiplayer.cfg friendly_fire).
+	if(mpInit->mpNetworkManager)
+	{
+		std::vector<std::pair<uint8_t, iPhysicsBody*> > vFriends;
+		mpInit->mpNetworkManager->GetGhostHitBodies(vFriends);
+		for(size_t i=0; i<vFriends.size(); ++i)
+		{
+			iPhysicsBody *pBody = vFriends[i].second;
+			if(cMath::CheckCollisionBV(tempBV, *pBody->GetBV())==false) continue;
+			if(pPhysicsWorld->CheckShapeCollision(pBody->GetShape(),pBody->GetLocalMatrix(),
+											mvAttacks[mlCurrentAttack].mpCollider,
+											mtxDamage,collideData,1)==false)
+			{
+				continue;
+			}
+
+			//No hits through walls (the ray skips character bodies, so any
+			//body in the way is something solid between us)
+			mRayCallback.Reset();
+			pPhysicsWorld->CastRay(&mRayCallback,pCamera->GetPosition(),
+									collideData.mvContactPoints[0].mvPoint,true,true,true,false);
+			if(mRayCallback.mpClosestBody) continue;
+
+			float fDamage = cMath::RandRectf(	mvAttacks[mlCurrentAttack].mfMinDamage,
+												mvAttacks[mlCurrentAttack].mfMaxDamage);
+			mpInit->mpNetworkManager->NetOnMeleeHitPlayer(vFriends[i].first, fDamage,
+															pCamera->GetPosition());
+			bHit = true;
+		}
+	}
+
 	std::set<iPhysicsBody*> m_setHitBodies;
 
 	////////////////////////////////

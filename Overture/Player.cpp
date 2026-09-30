@@ -20,6 +20,7 @@
 
 #include "PlayerHelper.h"
 #include "Init.h"
+#include "GameScripts.h" /* co-op: cNetScriptPlayerScope */
 #include "GameEntity.h"
 #include "MapHandler.h"
 #include "PlayerMoveStates.h"
@@ -44,6 +45,9 @@
 #include "Triggers.h"
 
 #include "GlobalInit.h"
+#include "NumericalPanel.h"
+#include "DeathMenu.h"
+#include "multiplayer/NetworkManager.h" /* v12: party health HUD */
 
 //////////////////////////////////////////////////////////////////////////
 // CONSTRUCTORS
@@ -157,6 +161,19 @@ cPlayer::cPlayer(cInit *apInit)  : iUpdateable("Player")
 
 	//Create flashlight
 	mpFlashLight = hplNew( cPlayerFlashLight,(mpInit) );
+
+	//v12 party health bars: one solid white 4x4 image, tinted per draw.
+	//Built from a bitmap so no new art file is needed.
+	mpGfxPartyBar = NULL;
+	{
+		iBitmap2D *pBmp = mpGraphics->GetLowLevel()->CreateBitmap2D(cVector2l(4,4),32);
+		if(pBmp)
+		{
+			pBmp->FillRect(cRect2l(0,0,4,4),cColor(1,1,1,1));
+			mpGfxPartyBar = mpGfxDrawer->CreateGfxObject(pBmp,"diffalpha2d");
+			hplDelete(pBmp);
+		}
+	}
 	
 	//Create Glowstick
 	mpGlowStick = hplNew( cPlayerGlowStick,(mpInit) );
@@ -265,6 +282,7 @@ cPlayer::~cPlayer(void)
 	hplDelete( mpBodyCallback);
 	hplDelete( mpDamage);
 	hplDelete( mpDeath);
+	if(mpGfxPartyBar) mpGfxDrawer->DestroyGfxObject(mpGfxPartyBar);
 	hplDelete( mpFlashLight);
 	hplDelete( mpLean);
 	hplDelete( mpEarRing);
@@ -316,7 +334,10 @@ void cPlayer::SetActive(bool abActive)
 {
 	mbActive = abActive;
 
-	if(mbActive==false)
+	/* A message being read stays up: scripts (the tech demo's tutorials)
+	   show a message and THEN freeze the player until it is clicked away;
+	   leaving the message state here made that click impossible. */
+	if(mbActive==false && mState != ePlayerState_Message)
 	{
 		ChangeState(ePlayerState_Normal);
 	}
@@ -1220,6 +1241,7 @@ void cPlayer::Update(float afTimeStep)
 					tString sCommand = GetCollideCommand(
 						pCallback->msFuncName[eGameCollideScriptType_During],
 						"Player", CollideIt->first);
+					cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 					mpInit->RunScriptCommand(sCommand);
 				}
 			}
@@ -1230,6 +1252,7 @@ void cPlayer::Update(float afTimeStep)
 					tString sCommand = GetCollideCommand(
 						pCallback->msFuncName[eGameCollideScriptType_Enter],
 						"Player", CollideIt->first);
+					cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 					mpInit->RunScriptCommand(sCommand);
 				}
 
@@ -1245,6 +1268,7 @@ void cPlayer::Update(float afTimeStep)
 					tString sCommand = GetCollideCommand(
 						pCallback->msFuncName[eGameCollideScriptType_Leave],
 						"Player", CollideIt->first);
+					cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 					mpInit->RunScriptCommand(sCommand);
 				}
 
@@ -1440,6 +1464,12 @@ void cPlayer::OnDraw()
 	mpHidden->Draw();
 	
 	mpHealth->Draw();
+
+	////////////////////////////////
+	//v12: party health bars above the ghosts (no-op offline)
+	DrawPartyHud();
+	//v13: top-left party panel + event feed (only hosting / live session)
+	DrawPartyPanel();
 	
 	////////////////////////////////
 	//Cross hair
@@ -1717,6 +1747,212 @@ void cPlayer::OnDraw()
 	
 	mvStates[mState]->OnDraw();
 }
+
+//-----------------------------------------------------------------------
+
+/* v12 party health: a 60x6 bar + "P<id>" label projected from ~2 m above
+   each ghost's feet, hidden behind the camera / beyond kFarDist, fading
+   from kFadeDist. Same view*proj + MatrixMulDivideW projection the HaptX
+   crosshair uses (OnDraw above); 800x600 virtual HUD coordinates. Drawn
+   only while the world is the thing on screen: not over the inventory,
+   notebook, panel or death menu, and not during our own death fade. */
+void cPlayer::DrawPartyHud()
+{
+	cNetworkManager *pNet = mpInit->mpNetworkManager;
+	if(pNet==NULL || mpGfxPartyBar==NULL || mpFont==NULL || mpCamera==NULL) return;
+	if(mpScene==NULL || mpScene->GetWorld3D()==NULL) return;
+	if(IsDead()) return;
+	if(	(mpInit->mpInventory && mpInit->mpInventory->IsActive()) ||
+		(mpInit->mpNotebook && mpInit->mpNotebook->IsActive()) ||
+		(mpInit->mpNumericalPanel && mpInit->mpNumericalPanel->IsActive()) ||
+		(mpInit->mpDeathMenu && mpInit->mpDeathMenu->IsActive()))
+	{
+		return;
+	}
+
+	std::vector<cNetPartyMember> vParty;
+	pNet->GetPartyStatus(vParty);
+	if(vParty.empty()) return;
+
+	const float kHeadHeight = 2.0f;  /* bar anchor above the feet */
+	const float kFarDist = 25.0f;    /* hidden beyond this */
+	const float kFadeDist = 15.0f;   /* full alpha up to here, then fades to 0 at kFarDist */
+	const float kBarW = 60.0f, kBarH = 6.0f;
+	const float fZ = 90.0f;
+
+	const cMatrixf &mtxView = mpCamera->GetViewMatrix();
+	const cMatrixf &mtxProj = mpCamera->GetProjectionMatrix();
+	const cVector3f vCamPos = mpCamera->GetPosition();
+
+	for(size_t i=0; i<vParty.size(); ++i)
+	{
+		const cNetPartyMember &m = vParty[i];
+		if(m.mbHasRenderPos==false) continue; /* not in this world (yet) */
+
+		const cVector3f vHead = m.mvRenderFeetPos + cVector3f(0, kHeadHeight, 0);
+		const float fDist = cMath::Vector3Dist(vCamPos, vHead);
+		if(fDist > kFarDist) continue;
+		float fAlpha = 1.0f;
+		if(fDist > kFadeDist) fAlpha = 1.0f - (fDist - kFadeDist) / (kFarDist - kFadeDist);
+		if(fAlpha <= 0.02f) continue;
+
+		//Behind the camera: the view space z is positive (camera looks down -z)
+		cVector3f vView = cMath::MatrixMul(mtxView, vHead);
+		if(vView.z > -0.05f) continue;
+		cVector3f vProj = cMath::MatrixMulDivideW(mtxProj, vView);
+		if(vProj.x < -1.2f || vProj.x > 1.2f || vProj.y < -1.2f || vProj.y > 1.2f) continue;
+
+		cVector2f vPos((vProj.x+1) * 0.5f, (-vProj.y+1) * 0.5f);
+		vPos *= cVector2f(800,600);
+
+		const float fHealth = (m.mfHealth < 0) ? 0.0f : ((m.mfHealth > 100) ? 100.0f : m.mfHealth);
+		const float fPercent = fHealth / 100.0f;
+
+		//Background, fill, label
+		mpGfxDrawer->DrawGfxObject(mpGfxPartyBar,
+									cVector3f(vPos.x - kBarW*0.5f - 1, vPos.y - kBarH*0.5f - 1, fZ),
+									cVector2f(kBarW + 2, kBarH + 2), cColor(0,0,0,0.6f*fAlpha));
+		if(fPercent > 0)
+		{
+			mpGfxDrawer->DrawGfxObject(mpGfxPartyBar,
+										cVector3f(vPos.x - kBarW*0.5f, vPos.y - kBarH*0.5f, fZ+1),
+										cVector2f(kBarW * fPercent, kBarH),
+										cColor(1.0f-fPercent, fPercent, 0, fAlpha));
+		}
+		//v13: the player's name ("Player <id>" until one is known)
+		const tWString sName = cString::To16Char(pNet->GetPlayerName(m.mlId));
+		if(fHealth > 0)
+		{
+			mpFont->Draw(cVector3f(vPos.x, vPos.y - kBarH*0.5f - 15, fZ+2),cVector2f(12,12),
+							cColor(1,1,1,fAlpha),eFontAlign_Center,_W("%ls"),sName.c_str());
+		}
+		else
+		{
+			mpFont->Draw(cVector3f(vPos.x, vPos.y - kBarH*0.5f - 15, fZ+2),cVector2f(12,12),
+							cColor(1,0.3f,0.3f,fAlpha),eFontAlign_Center,_W("%ls dead"),sName.c_str());
+		}
+	}
+}
+
+//-----------------------------------------------------------------------
+
+/* v13 party panel, top-left of the HUD: one line per party member, us
+   included and in id order (the host, id 1, first with a "(host)" tag) —
+   name + a 50x5 health bar (red..green), "dead" in red — then the last
+   cNetworkManager::kPartyEventMax feed lines ("<name> joined / left /
+   died / respawned"), each fading out over its final 1.5 s of the 6 s
+   life. Drawn only while hosting or in a live session, under the same
+   screen guards as DrawPartyHud, so single-player never sees it. */
+void cPlayer::DrawPartyPanel()
+{
+	cNetworkManager *pNet = mpInit->mpNetworkManager;
+	if(pNet==NULL || mpGfxPartyBar==NULL || mpFont==NULL) return;
+	if(pNet->IsHosting()==false && pNet->IsSessionLive()==false) return;
+	if(IsDead()) return;
+	if(	(mpInit->mpInventory && mpInit->mpInventory->IsActive()) ||
+		(mpInit->mpNotebook && mpInit->mpNotebook->IsActive()) ||
+		(mpInit->mpNumericalPanel && mpInit->mpNumericalPanel->IsActive()) ||
+		(mpInit->mpDeathMenu && mpInit->mpDeathMenu->IsActive()))
+	{
+		return;
+	}
+
+	std::vector<cNetPartyMember> vParty;
+	pNet->GetPartyStatus(vParty); /* remote members, id ascending */
+
+	//Merge ourselves in at our id (the party vector is already sorted).
+	std::vector<std::pair<int,float> > vLines;
+	const int lLocalId = (int)pNet->GetLocalPlayerID();
+	bool bLocalPlaced = false;
+	for(size_t i=0; i<vParty.size(); ++i)
+	{
+		const int lId = (int)vParty[i].mlId;
+		if(bLocalPlaced==false && lLocalId < lId)
+		{
+			vLines.push_back(std::make_pair(lLocalId, GetHealth()));
+			bLocalPlaced = true;
+		}
+		vLines.push_back(std::make_pair(lId, vParty[i].mfHealth));
+	}
+	if(bLocalPlaced==false) vLines.push_back(std::make_pair(lLocalId, GetHealth()));
+
+	const float fX = 12.0f;
+	float fY = 12.0f;
+	const float fZ = 90.0f;
+	float fBarX = 150.0f;           /* bar column, right of the names (widened below) */
+	const float kBarW = 50.0f, kBarH = 5.0f;
+	const float kLineH = 16.0f;
+	const cVector2f vFontSize(12,12);
+
+	/* v17: "<name> (<character>)" — the host-assigned character, one of
+	   each per lobby. The bar column moves right of the longest line.
+	   v18: the character's display name ("Alex (The Fisherman)"). */
+	std::vector<tWString> vTexts;
+	for(size_t i=0; i<vLines.size(); ++i)
+	{
+		const int lId = vLines[i].first;
+		const float fHealth = (vLines[i].second < 0) ? 0.0f : ((vLines[i].second > 100) ? 100.0f : vLines[i].second);
+
+		tWString sName = cString::To16Char(pNet->GetPlayerName((uint8_t)lId));
+		const tString sChar = cNetworkManager::GetCharacterDisplayName(pNet->GetPlayerCharacterName((uint8_t)lId));
+		if(sChar.empty()==false) sName += _W(" (") + cString::To16Char(sChar) + _W(")");
+		if(lId == 1) sName += _W(" (host)");
+		/* column from the stable part + the longest status suffix, so it
+		   neither jumps while somebody talks nor runs into the bar */
+		const tWString sWorst = sName + _W("  (talking)");
+		const float fLen = mpFont->GetLength(vFontSize, sWorst.c_str()) + 10.0f;
+		if(fLen > fBarX) fBarX = fLen;
+		if(fHealth <= 0) sName += _W("  dead");
+		/* v16 voice: who is heard right now; our own line shows the live mic */
+		if(lId == lLocalId)
+		{
+			if(pNet->IsMicOpen()) sName += _W("  [MIC]");
+			const char *sVoiceHint = pNet->GetVoiceStatusHint();
+			if(sVoiceHint) sName += _W("  [") + cString::To16Char(sVoiceHint) + _W("]");
+		}
+		else if(pNet->IsPlayerTalking((uint8_t)lId)) sName += _W("  (talking)");
+		vTexts.push_back(sName);
+	}
+
+	for(size_t i=0; i<vLines.size(); ++i)
+	{
+		const float fHealth = (vLines[i].second < 0) ? 0.0f : ((vLines[i].second > 100) ? 100.0f : vLines[i].second);
+		const float fPercent = fHealth / 100.0f;
+		const tWString &sName = vTexts[i];
+		const cColor col = (fHealth > 0) ? cColor(1,1,1,0.9f) : cColor(1,0.3f,0.3f,0.9f);
+
+		mpFont->Draw(cVector3f(fX+1, fY+1, fZ+1),vFontSize,cColor(0,0,0,0.7f),eFontAlign_Left,_W("%ls"),sName.c_str());
+		mpFont->Draw(cVector3f(fX, fY, fZ+2),vFontSize,col,eFontAlign_Left,_W("%ls"),sName.c_str());
+
+		mpGfxDrawer->DrawGfxObject(mpGfxPartyBar,
+									cVector3f(fX + fBarX - 1, fY + 4 - 1, fZ),
+									cVector2f(kBarW + 2, kBarH + 2), cColor(0,0,0,0.6f));
+		if(fPercent > 0)
+		{
+			mpGfxDrawer->DrawGfxObject(mpGfxPartyBar,
+										cVector3f(fX + fBarX, fY + 4, fZ+1),
+										cVector2f(kBarW * fPercent, kBarH),
+										cColor(1.0f-fPercent, fPercent, 0, 0.9f));
+		}
+		fY += kLineH;
+	}
+
+	//Event feed: oldest first, fading out over the last 1.5 s.
+	const std::vector<cNetworkManager::cNetPartyEvent> &vEvents = pNet->GetPartyEvents();
+	if(vEvents.empty()==false) fY += 4;
+	for(size_t i=0; i<vEvents.size(); ++i)
+	{
+		float fAlpha = (cNetworkManager::kPartyEventLifeSeconds - vEvents[i].mfAge) / 1.5f;
+		if(fAlpha > 1) fAlpha = 1;
+		if(fAlpha <= 0.02f) continue;
+		const tWString sText = cString::To16Char(vEvents[i].msText);
+		mpFont->Draw(cVector3f(fX+1, fY+1, fZ+1),vFontSize,cColor(0,0,0,0.7f*fAlpha),eFontAlign_Left,_W("%ls"),sText.c_str());
+		mpFont->Draw(cVector3f(fX, fY, fZ+2),vFontSize,cColor(0.85f,0.85f,1,0.9f*fAlpha),eFontAlign_Left,_W("%ls"),sText.c_str());
+		fY += 14;
+	}
+}
+
+//-----------------------------------------------------------------------
 
 void cPlayer::OnPostSceneDraw()
 {

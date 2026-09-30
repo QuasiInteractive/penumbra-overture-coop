@@ -3,30 +3,211 @@
 # join=HOST:PRT — auto-connect once a map is loaded
 # port=7777    — default listen / F10 localhost join port
 #
-# Remote-player body mesh — put .dae files in:
-#   multiplayer/models/greenlandman.dae
-#   multiplayer/models/phillip.dae
-# PlayerID 1 (host) uses the first mesh, ID 2 the second — same order everywhere.
+# Remote-player characters — .dae files (+ their <name>_<clip>.dae siblings) in
+# multiplayer/models/. By DEFAULT (no ghost_models= line) every
+# <name>.dae there whose <name> has no '_' and that has at least one
+# <name>_<clip>.dae clip next to it (malik.dae + malik_idle.dae, ...) is a
+# character. v17: the list is ordered phillip, fisherman, red, malik, then
+# any other character alphabetically, and the HOST gives every player a
+# different one (host = 1st = always Philip, each guest the lowest free one
+# — The Fisherman, Red, Malik in join order, unless it picked one with
+# character= below — freed when it leaves): one of
+# each, never a duplicate, so the lobby holds at most as many players as
+# there are characters (see max_players). Adding one = drop
+# <name>.dae + <name>_*.dae (+ <name>.mat/.tga, <name>_clips.json) into the
+# folder on EVERY machine: only the slot number travels, so all machines
+# need the same files (a guest with fewer characters than the host logs a
+# WARNING and shows that player as another character). hpl.log lists them:
+#   multiplayer: 4 character(s) (auto-discovered in multiplayer/models): phillip.dae, fisherman.dae, red.dae, malik.dae
 #
-# ghost_body_y is offset from synced camera Y (eyes) to mesh origin — tune until feet touch the floor.
+# v11: the wire carries the sender's FEET height and the shipped meshes have
+# their origin at the feet, so no grounding offset is needed any more.
+# ghost_body_y / ghost_body_y_crouch are now extra offsets FROM THE FEET
+# (default 0). Values below -0.9 are treated as the old camera-relative
+# numbers and converted (logged) — delete them from an old cfg.
 
 host=0
-# server_name=  — shown in the LAN server browser (spaces OK, 31 chars max)
-# max_players=  — advertised in discovery pongs (2..31, default 4)
-server_name=Penumbra Server
+# ---- Username (v13) ----------------------------------------------------------
+# player_name=  — the name the other players see: over each friend's head,
+#                 in the inventory party list and in the top-left party panel
+#                 ("<name> joined / left / died / respawned"). Printable ASCII,
+#                 spaces OK, 24 characters max; anything else is stripped.
+#                 Leave it empty (or out) and the Multiplayer menu asks for it
+#                 the first time and writes it here ("Change name" edits it;
+#                 every other line of this file is kept). Friends without a
+#                 name show as "Player <id>".
+player_name=
+# ---- Character (v18) ---------------------------------------------------------
+# character=    — the character you want to play as a GUEST, by file base
+#                 name (the .dae in multiplayer/models without ".dae"):
+#                 fisherman, red, malik, ... (shown as The Fisherman, Red,
+#                 Malik; phillip = Philip is always the HOST and cannot be
+#                 picked). Empty (or out) = no preference: the host gives you
+#                 the lowest free one. The Multiplayer and Direct-connect
+#                 screens have a 'Character: < Red >' line that cycles through
+#                 the free ones and writes this key (every other line of this
+#                 file is kept); in a session the host moves you at once
+#                 (also from the in-game Esc menu). First come, first served:
+#                 a character somebody else plays shows "(taken)" and you
+#                 keep your current one. The host ignores the key.
+character=
+# server_name=  — shown in the LAN server browser (spaces OK, 31 chars max).
+#                 Empty / not set = "<player_name>'s game" ("Penumbra Server"
+#                 when there is no player_name either).
+# max_players=  — advertised in discovery pongs / master listing AND enforced at connect
+#                 (2..31, default 4, host included): one more is refused
+#                 with "server full". The host lobby and the server browser
+#                 show "players/max" (e.g. 3/4).
+#                 v17: the real cap is min(max_players, number of characters)
+#                 — every player is a different character, so with the four
+#                 shipped characters max_players=8 still means 4 (hpl.log:
+#                 "player cap 4 = min(max_players 8, 4 character(s))").
+# friendly_fire=1 — v22: melee weapons (hammer, pickaxe, broom) hurt other
+#                 players. HOST setting: the host decides for the whole
+#                 lobby (0 = off; guests' hits are then dropped). Default 1.
+# shared_loot=1 — v23: whoever picks an item up, EVERYONE gets it (a copy
+#                 each; stacking items like batteries add one per player).
+#                 The level's pick-up event runs for everyone, and a friend
+#                 who joins late gets the items the host carries. HOST
+#                 setting; 0 = one-of-each (the item goes to whoever grabbed
+#                 it; hand it over by dragging it out of the inventory).
+# server_name=Penumbra Server
 max_players=4
 port=7777
-# join=127.0.0.1:7777
-# Host (id 1) appears as greenlandman.dae to others; client (id 2) survivor2 — more peers rotate.
-ghost_models=greenlandman.dae,phillip.dae
-# Alternative: single mesh — ghost_model=foo.dae
-ghost_body_y=-1.72
-# ghost_body_y_crouch= — same offset while the remote player crouches (their camera
-# drops ~0.7 m but their feet don't). Unset = ghost_body_y + 0.7. Tune by eye.
-# ghost_body_y_crouch=-1.02
 
-# Per-mesh ghost grounding (CSV, indexed like ghost_models — different rigs
-# ground at different heights). Overrides ghost_body_y/_crouch per mesh.
+# ---- Passwords (v15) --------------------------------------------------------
+# server_password= — what a HOST demands. Empty (or out) = open server: anyone
+#                   with the address can join. Set one before forwarding the
+#                   game port to the internet or listing the server in a
+#                   public lobby. Printable ASCII, spaces OK, 48 chars max.
+#                   Never sent in the clear: the guest answers a per-connection
+#                   challenge with a digest of it (README "Security").
+# join_password=   — what a GUEST sends when joining (the join screen / lobby
+#                   can set it too). Wrong or missing = "Host REFUSED: wrong
+#                   password" on the join screen.
+server_password=
+join_password=
+# join=127.0.0.1:7777
+
+# ---- Internet server browser (README.md 'Public servers') ----
+# master_server=HOST:PORT — a running tools/master_server.py (udp, default port
+#   7779). Hosts register here while hosting; the Internet tab lists from here.
+#   Setting it implies public=1 unless public=0 is given. Empty = LAN only.
+# public=1 — register this host with the master while hosting (the host lobby
+#   has a 'Public' checkbox for the same switch; a value here pins it).
+#   With public=1 and NO master_server=, a placeholder that resolves to
+#   nothing is used, so nothing is ever listed without opting in.
+#   A host with server_password= (above) is listed with a [pw] mark; the
+#   browser asks for the password when such a row is clicked.
+# master_server=
+public=0
+# ghost_models= pins the list and its ORDER instead of auto-discovery (see
+# the top of this file). Entries whose file does not exist are skipped (one
+# hpl.log line each), so a list naming four characters works before all four
+# are exported. Nothing left / nothing found = phillip.dae, malik.dae.
+# v19: the list is put in the fixed order phillip, fisherman, red, malik
+# (others after, in cfg order) — the host is ALWAYS phillip when it is
+# listed. The host's list decides the player cap (one player per entry);
+# characters travel by name, but every machine still needs every file.
+# ghost_models=phillip.dae,malik.dae
+# ghost_model=foo.dae — a single character. v17: that means a SOLO host (one
+# player per character, nobody can join); only useful for ghost_preview.
+# ghost_body_y=0
+# ghost_body_y_crouch=0
+
+# Per-mesh grounding overrides (CSV, indexed like the FINAL character list —
+# ghost_models order, or the sorted auto-discovered order — for a rig whose
+# origin is NOT at its feet). A list with exactly one value per ghost_models
+# entry loses the values of skipped (missing) entries so it stays aligned.
+# Overrides ghost_body_y/_crouch per mesh.
 # More negative = mesh lower.
-# ghost_body_ys=-1.45,-1.48
-# ghost_body_ys_crouch=-1.10,-1.13
+# ghost_body_ys=0,0
+# ghost_body_ys_crouch=0,0
+
+# ---- Co-op death (v12) ------------------------------------------------------
+# Every player's health rides on the 30 Hz state packet (protocol v12): a
+# bar above each friend's head (within 25 m) and a "Party" list in the
+# inventory show it, and the host's enemies stop attacking a dead guest.
+# coop_respawn=1 — when you die in a live session while at least one other
+#                  party member is still alive, the death fade plays as usual
+#                  but the death menu does NOT appear: ~3 s later you come
+#                  back with 40 health next to the nearest living member
+#                  (hpl.log says who). If everybody is dead you get the normal
+#                  death menu. 0 = vanilla death menu online too.
+coop_respawn=1
+
+# ---- Voice chat (v16) -------------------------------------------------------
+# Hold V to talk. Friends hear you as a 3D sound from your character's head:
+# full volume within 2 m, fading with distance, quietest at 25 m and beyond.
+# The party panel shows "(talking)" after whoever is heard and "[MIC]" on your
+# own line while your microphone is live. The default OpenAL capture device
+# (Windows default recording device) is opened on the first press, only in a
+# session. Opus 16 kHz, ~3 KB/s while talking.
+# voice_enabled=1   — 0 = no voice on this machine (no microphone, no playback)
+# voice_volume=1.0  — playback gain for the others' voices (0..2)
+# voice_open_mic=0  — 1 = no key: the mic streams whenever its level is above
+#                     voice_gate_db (0.4 s hold). Push-to-talk is the default.
+# voice_gate_db=-45 — open-mic gate in dBFS (-70..-10). hpl.log prints the
+#                     loudest level it saw if nothing ever passed the gate.
+# voice_capture_device= — record from this OpenAL capture device instead of
+#                     the Windows default recording device. Easiest: pick it
+#                     in the Multiplayer menu ('Microphone: < name >' — the
+#                     level bar under it shows what the mic hears), which
+#                     writes this line. Empty = default.
+# Not heard / not sending? Search hpl.log for " voice:" — every stage logs once
+# (microphone opened, first samples, first packet out, first packet in, playback
+# started, per-burst mic level / distance / gain).
+voice_enabled=1
+voice_volume=1.0
+voice_open_mic=0
+voice_gate_db=-45
+voice_capture_device=
+
+# ---- Ghost animation (v11) ------------------------------------------------
+# ghost_interp_ms=100   — render remote players this far behind their newest
+#                         state (3 packets at 30 Hz). Lower = snappier, higher
+#                         = smoother on a jittery link. 0..250.
+# ghost_turn_rate=720   — body yaw follows the remote view yaw at most this
+#                         fast (deg/s). 30..3600.
+# ghost_gait_<slot>=    — metres per second the clip covers at playback
+#                         speed 1.0; the ghost plays each locomotion clip at
+#                         (real speed / gait), clamped 0.6..1.8, so the feet
+#                         stop sliding. Defaults are measured from the shipped
+#                         phillip clips (each model's <name>_clips.json is read
+#                         when present). Slots: walk, run, crouch_walk,
+#                         walk_back, strafe_walk (both sides), strafe_run (both
+#                         sides); an exact clip name (strafe_walk_l) overrides
+#                         one clip.
+# ghost_gait_walk=1.28
+# ghost_gait_run=1.92
+# ghost_gait_crouch_walk=0.76
+# ghost_gait_walk_back=0.72
+# ghost_gait_strafe_walk=0.65
+# ghost_gait_strafe_run=1.97
+# ghost_anim_trace=0    — 1 logs every clip change and a 5-second state trace
+#                         per ghost to hpl.log (synchronous disk writes: leave
+#                         off in real sessions).
+
+# ---- Ghost preview (offline animation check) -------------------------------
+# ghost_preview=1 puts a LOCAL ghost 2 m in front of you, facing you, as soon
+# as a map is up (no session needed). It is driven through the same path a
+# network ghost is. Keys while it exists:
+#   F6 / F7 — next / previous clip (all loaded clips, one-shots replay)
+#   F8      — toggle crouch stance (plays the stand<->crouch transitions)
+#   F2      — treadmill off / walk / run: walks a 1 m circle at the real
+#             game.cfg speeds so gait scaling + clip selection can be judged
+# One hpl.log line per change.
+# ghost_preview=0
+# ghost_preview_model=0 — which character (final list, 0-based) the preview uses
+
+# ---- Windowed test instances (read by Init.cpp at startup) ----
+# force_windowed=1 overrides the Documents settings.cfg FullScreen setting for
+# THIS install only; window_width/height set the size and window_x/window_y
+# the top-left corner, so two installs on one PC can sit side by side:
+#   redist       (host):  force_windowed=1 window_width=960 window_height=540 window_x=0   window_y=0
+#   redist_guest (guest): force_windowed=1 window_width=960 window_height=540 window_x=960 window_y=0
+# force_windowed=0
+# window_width=960
+# window_height=540
+# window_x=0
+# window_y=0

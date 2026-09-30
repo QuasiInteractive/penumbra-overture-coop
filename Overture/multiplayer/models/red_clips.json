@@ -1,0 +1,1222 @@
+{
+ "model": "red",
+ "base": "red.dae",
+ "generator": "bvh_to_hpl_clip.py",
+ "fps": 30.0,
+ "scale_m_per_cm": 0.008453,
+ "stand_hips_cm": 99.8,
+ "base_hips_rest_m": [
+  0.00385,
+  0.94614,
+  0.02862
+ ],
+ "floor_lock": true,
+ "target_floor_m": 0.03945,
+ "clip_mesh": "stub",
+ "joint_order": [
+  "mixamorigwHips",
+  "mixamorigwLeftUpLeg",
+  "mixamorigwLeftLeg",
+  "mixamorigwLeftFoot",
+  "mixamorigwLeftToeBase",
+  "mixamorigwRightUpLeg",
+  "mixamorigwRightLeg",
+  "mixamorigwRightFoot",
+  "mixamorigwRightToeBase",
+  "mixamorigwSpine",
+  "mixamorigwSpine1",
+  "mixamorigwSpine2",
+  "mixamorigwLeftShoulder",
+  "mixamorigwLeftArm",
+  "mixamorigwLeftForeArm",
+  "mixamorigwLeftHand",
+  "mixamorigwRightShoulder",
+  "mixamorigwRightArm",
+  "mixamorigwRightForeArm",
+  "mixamorigwRightHand",
+  "mixamorigwNeck",
+  "mixamorigwHead",
+  "mixamorigwHeadTop_End",
+  "mixamorigwHeadFront"
+ ],
+ "clips": {
+  "idle": {
+   "source": "idle_neutral.bvh",
+   "bvh_frames": [
+    125,
+    217
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 93,
+   "fps": 30.0,
+   "length_s": 3.06667,
+   "loop": true,
+   "gait_speed_bvh_cms": 0.06,
+   "gait_speed_mps": 0.0005,
+   "hips_height_m": {
+    "min": 0.9551,
+    "max": 0.956,
+    "mean": 0.9556,
+    "first": 0.9554,
+    "last": 0.9554
+   },
+   "hips_height_bvh_cm": {
+    "first": 99.84,
+    "last": 99.82
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     -0.18,
+     0.06
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": 0.0088,
+     "max": 0.009
+    }
+   },
+   "foot_min_y_m": 0.0435,
+   "foot_min_joint": "LeftToeBase",
+   "bvh_foot_min_y_cm": 0.48,
+   "seam": {
+    "pos_rms_m": 0.0026,
+    "hips_pos_m": 0.0003,
+    "rot_max_deg": 2.0698
+   },
+   "hip_sway": 1.0,
+   "hip_sway_deviation": null,
+   "hip_sway_leg_fix_deg": null,
+   "notes": "only pack idle without body yaw drift; seam 0.13 cm",
+   "file": "red_idle.dae",
+   "validated": true
+  },
+  "walk": {
+   "source": "walk_forward.bvh",
+   "bvh_frames": [
+    79,
+    113
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 35,
+   "fps": 30.0,
+   "length_s": 1.13333,
+   "loop": true,
+   "gait_speed_bvh_cms": 142.61,
+   "gait_speed_mps": 1.2054,
+   "hips_height_m": {
+    "min": 0.8836,
+    "max": 0.9467,
+    "mean": 0.9201,
+    "first": 0.9262,
+    "last": 0.9262
+   },
+   "hips_height_bvh_cm": {
+    "first": 96.86,
+    "last": 96.34
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     -6.22,
+     161.5
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0125,
+     "max": 0.0079
+    }
+   },
+   "foot_min_y_m": 0.0327,
+   "foot_min_joint": "RightToeBase",
+   "bvh_foot_min_y_cm": -0.79,
+   "seam": {
+    "pos_rms_m": 0.0133,
+    "hips_pos_m": 0.0031,
+    "rot_max_deg": 7.6179
+   },
+   "hip_sway": 0.45,
+   "hip_sway_deviation": {
+    "roll": {
+     "before": [
+      -6.85,
+      8.79
+     ],
+     "after": [
+      -3.08,
+      3.95
+     ]
+    },
+    "yaw": {
+     "before": [
+      -4.51,
+      5.38
+     ],
+     "after": [
+      -2.03,
+      2.42
+     ]
+    },
+    "pitch": {
+     "before": [
+      -5.78,
+      0.91
+     ],
+     "after": [
+      -5.78,
+      0.91
+     ]
+    },
+    "lateral": {
+     "before": [
+      -2.6,
+      2.11
+     ],
+     "after": [
+      -1.17,
+      0.95
+     ]
+    }
+   },
+   "hip_sway_leg_fix_deg": 4.0,
+   "notes": "one gait cycle (T=35); use (37,106) for two cycles",
+   "file": "red_walk.dae",
+   "validated": true
+  },
+  "run": {
+   "source": "run_sprint.bvh",
+   "bvh_frames": [
+    68,
+    86
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 19,
+   "fps": 30.0,
+   "length_s": 0.6,
+   "loop": true,
+   "gait_speed_bvh_cms": 466.3,
+   "gait_speed_mps": 3.9415,
+   "hips_height_m": {
+    "min": 0.8333,
+    "max": 0.9242,
+    "mean": 0.8775,
+    "first": 0.836,
+    "last": 0.836
+   },
+   "hips_height_bvh_cm": {
+    "first": 92.93,
+    "last": 96.44
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     10.15,
+     279.59
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0716,
+     "max": 0.021
+    }
+   },
+   "foot_min_y_m": 0.0422,
+   "foot_min_joint": "LeftToeBase",
+   "bvh_foot_min_y_cm": 0.33,
+   "seam": {
+    "pos_rms_m": 0.0747,
+    "hips_pos_m": 0.0312,
+    "rot_max_deg": 23.4291
+   },
+   "hip_sway": 0.6,
+   "hip_sway_deviation": {
+    "roll": {
+     "before": [
+      -5.93,
+      8.99
+     ],
+     "after": [
+      -3.56,
+      5.39
+     ]
+    },
+    "yaw": {
+     "before": [
+      -4.02,
+      3.18
+     ],
+     "after": [
+      -2.41,
+      1.91
+     ]
+    },
+    "pitch": {
+     "before": [
+      -4.21,
+      8.69
+     ],
+     "after": [
+      -4.21,
+      8.69
+     ]
+    },
+    "lateral": {
+     "before": [
+      -1.08,
+      1.18
+     ],
+     "after": [
+      -0.65,
+      0.71
+     ]
+    }
+   },
+   "hip_sway_leg_fix_deg": 4.85,
+   "notes": "steady sprint stride (4.7 m/s BVH, frames 55-105 are the flat-speed part; 0-45 start, 110+ stop). run_jog 137-159 was rejected: elbows locked at 44-65 deg, hands at the chest, no arm swing. run_sprint pumps the arms (elbow 48-149 deg).",
+   "file": "red_run.dae",
+   "validated": true
+  },
+  "walk_back": {
+   "source": "walk_backward.bvh",
+   "bvh_frames": [
+    99,
+    138
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 40,
+   "fps": 30.0,
+   "length_s": 1.3,
+   "loop": true,
+   "gait_speed_bvh_cms": 79.99,
+   "gait_speed_mps": 0.6762,
+   "hips_height_m": {
+    "min": 0.9123,
+    "max": 0.9464,
+    "mean": 0.9307,
+    "first": 0.9331,
+    "last": 0.9331
+   },
+   "hips_height_bvh_cm": {
+    "first": 97.36,
+    "last": 97.64
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     1.19,
+     -103.98
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0217,
+     "max": 0.0079
+    }
+   },
+   "foot_min_y_m": 0.0054,
+   "foot_min_joint": "LeftToeBase",
+   "bvh_foot_min_y_cm": -4.02,
+   "seam": {
+    "pos_rms_m": 0.0108,
+    "hips_pos_m": 0.0008,
+    "rot_max_deg": 14.3411
+   },
+   "hip_sway": 0.5,
+   "hip_sway_deviation": {
+    "roll": {
+     "before": [
+      -8.79,
+      9.93
+     ],
+     "after": [
+      -4.4,
+      4.96
+     ]
+    },
+    "yaw": {
+     "before": [
+      -5.09,
+      5.82
+     ],
+     "after": [
+      -2.54,
+      2.91
+     ]
+    },
+    "pitch": {
+     "before": [
+      -8.27,
+      -2.05
+     ],
+     "after": [
+      -8.27,
+      -2.05
+     ]
+    },
+    "lateral": {
+     "before": [
+      -3.58,
+      3.37
+     ],
+     "after": [
+      -1.79,
+      1.69
+     ]
+    }
+   },
+   "hip_sway_leg_fix_deg": 6.6,
+   "notes": "",
+   "file": "red_walk_back.dae",
+   "validated": true
+  },
+  "strafe_walk_l": {
+   "source": "walk_strafe_left.bvh",
+   "bvh_frames": [
+    78,
+    179
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 102,
+   "fps": 30.0,
+   "length_s": 3.36667,
+   "loop": true,
+   "gait_speed_bvh_cms": 59.97,
+   "gait_speed_mps": 0.5069,
+   "hips_height_m": {
+    "min": 0.8918,
+    "max": 0.9431,
+    "mean": 0.9262,
+    "first": 0.9412,
+    "last": 0.9412
+   },
+   "hips_height_bvh_cm": {
+    "first": 99.4,
+    "last": 98.55
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     201.38,
+     -14.51
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.012,
+     "max": -0.0004
+    }
+   },
+   "foot_min_y_m": 0.0329,
+   "foot_min_joint": "LeftToeBase",
+   "bvh_foot_min_y_cm": -0.77,
+   "seam": {
+    "pos_rms_m": 0.0204,
+    "hips_pos_m": 0.0073,
+    "rot_max_deg": 20.6575
+   },
+   "hip_sway": 0.5,
+   "hip_sway_deviation": {
+    "roll": {
+     "before": [
+      -4.16,
+      0.61
+     ],
+     "after": [
+      -2.08,
+      0.3
+     ]
+    },
+    "yaw": {
+     "before": [
+      -14.85,
+      11.88
+     ],
+     "after": [
+      -7.43,
+      5.94
+     ]
+    },
+    "pitch": {
+     "before": [
+      3.98,
+      15.92
+     ],
+     "after": [
+      3.98,
+      15.92
+     ]
+    },
+    "lateral": {
+     "before": [
+      -7.94,
+      6.65
+     ],
+     "after": [
+      -3.97,
+      3.32
+     ]
+    }
+   },
+   "hip_sway_leg_fix_deg": 7.74,
+   "notes": "two cycles: the speed pulses inside one cycle",
+   "file": "red_strafe_walk_l.dae",
+   "validated": true
+  },
+  "strafe_walk_r": {
+   "source": "walk_strafe_right.bvh",
+   "bvh_frames": [
+    116,
+    153
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 38,
+   "fps": 30.0,
+   "length_s": 1.23333,
+   "loop": true,
+   "gait_speed_bvh_cms": 86.23,
+   "gait_speed_mps": 0.7289,
+   "hips_height_m": {
+    "min": 0.8901,
+    "max": 0.9419,
+    "mean": 0.9253,
+    "first": 0.9365,
+    "last": 0.9365
+   },
+   "hips_height_bvh_cm": {
+    "first": 98.52,
+    "last": 98.34
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     -101.72,
+     -31.05
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0063,
+     "max": 0.0041
+    }
+   },
+   "foot_min_y_m": 0.0351,
+   "foot_min_joint": "RightToeBase",
+   "bvh_foot_min_y_cm": -0.51,
+   "seam": {
+    "pos_rms_m": 0.0143,
+    "hips_pos_m": 0.0025,
+    "rot_max_deg": 8.635
+   },
+   "hip_sway": 0.5,
+   "hip_sway_deviation": {
+    "roll": {
+     "before": [
+      0.42,
+      4.62
+     ],
+     "after": [
+      0.21,
+      2.31
+     ]
+    },
+    "yaw": {
+     "before": [
+      -11.13,
+      13.42
+     ],
+     "after": [
+      -5.56,
+      6.71
+     ]
+    },
+    "pitch": {
+     "before": [
+      1.84,
+      7.44
+     ],
+     "after": [
+      1.84,
+      7.44
+     ]
+    },
+    "lateral": {
+     "before": [
+      -3.13,
+      4.26
+     ],
+     "after": [
+      -1.57,
+      2.13
+     ]
+    }
+   },
+   "hip_sway_leg_fix_deg": 4.46,
+   "notes": "",
+   "file": "red_strafe_walk_r.dae",
+   "validated": true
+  },
+  "strafe_run_l": {
+   "source": "run_strafe_left.bvh",
+   "bvh_frames": [
+    117,
+    139
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 23,
+   "fps": 30.0,
+   "length_s": 0.73333,
+   "loop": true,
+   "gait_speed_bvh_cms": 235.12,
+   "gait_speed_mps": 1.9875,
+   "hips_height_m": {
+    "min": 0.875,
+    "max": 0.9382,
+    "mean": 0.8973,
+    "first": 0.8888,
+    "last": 0.8888
+   },
+   "hips_height_bvh_cm": {
+    "first": 93.19,
+    "last": 94.02
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     169.46,
+     31.81
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0353,
+     "max": 0.0011
+    }
+   },
+   "foot_min_y_m": 0.0351,
+   "foot_min_joint": "LeftToeBase",
+   "bvh_foot_min_y_cm": -0.52,
+   "seam": {
+    "pos_rms_m": 0.0416,
+    "hips_pos_m": 0.0038,
+    "rot_max_deg": 20.7085
+   },
+   "hip_sway": 0.6,
+   "hip_sway_deviation": {
+    "roll": {
+     "before": [
+      -1.92,
+      8.95
+     ],
+     "after": [
+      -1.15,
+      5.37
+     ]
+    },
+    "yaw": {
+     "before": [
+      -3.29,
+      4.89
+     ],
+     "after": [
+      -1.98,
+      2.94
+     ]
+    },
+    "pitch": {
+     "before": [
+      -4.8,
+      7.01
+     ],
+     "after": [
+      -4.8,
+      7.01
+     ]
+    },
+    "lateral": {
+     "before": [
+      -3.61,
+      3.34
+     ],
+     "after": [
+      -2.17,
+      2.0
+     ]
+    }
+   },
+   "hip_sway_leg_fix_deg": 3.33,
+   "notes": "frames 0-60 of the source are a standing start",
+   "file": "red_strafe_run_l.dae",
+   "validated": true
+  },
+  "strafe_run_r": {
+   "source": "run_strafe_right.bvh",
+   "bvh_frames": [
+    133,
+    157
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 25,
+   "fps": 30.0,
+   "length_s": 0.8,
+   "loop": true,
+   "gait_speed_bvh_cms": 205.4,
+   "gait_speed_mps": 1.7362,
+   "hips_height_m": {
+    "min": 0.8488,
+    "max": 0.9326,
+    "mean": 0.9028,
+    "first": 0.9214,
+    "last": 0.9214
+   },
+   "hips_height_bvh_cm": {
+    "first": 98.28,
+    "last": 100.49
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     -164.04,
+     9.53
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0297,
+     "max": 0.0028
+    }
+   },
+   "foot_min_y_m": 0.031,
+   "foot_min_joint": "RightToeBase",
+   "bvh_foot_min_y_cm": -1.0,
+   "seam": {
+    "pos_rms_m": 0.0263,
+    "hips_pos_m": 0.003,
+    "rot_max_deg": 19.89
+   },
+   "hip_sway": 0.6,
+   "hip_sway_deviation": {
+    "roll": {
+     "before": [
+      -3.37,
+      3.42
+     ],
+     "after": [
+      -2.02,
+      2.05
+     ]
+    },
+    "yaw": {
+     "before": [
+      -8.17,
+      7.72
+     ],
+     "after": [
+      -4.9,
+      4.63
+     ]
+    },
+    "pitch": {
+     "before": [
+      0.77,
+      8.71
+     ],
+     "after": [
+      0.77,
+      8.71
+     ]
+    },
+    "lateral": {
+     "before": [
+      -3.0,
+      4.16
+     ],
+     "after": [
+      -1.8,
+      2.49
+     ]
+    }
+   },
+   "hip_sway_leg_fix_deg": 2.14,
+   "notes": "frames 0-35 of the source are a standing start",
+   "file": "red_strafe_run_r.dae",
+   "validated": true
+  },
+  "crouch_idle": {
+   "source": "crouch_rise_up.bvh",
+   "bvh_frames": [
+    10,
+    14
+   ],
+   "reverse": false,
+   "stretch": 11.25,
+   "pingpong": true,
+   "frame_count": 89,
+   "fps": 30.0,
+   "length_s": 2.93333,
+   "loop": true,
+   "gait_speed_bvh_cms": 0.0,
+   "gait_speed_mps": 0.0,
+   "hips_height_m": {
+    "min": 0.4855,
+    "max": 0.5422,
+    "mean": 0.5132,
+    "first": 0.4855,
+    "last": 0.4855
+   },
+   "hips_height_bvh_cm": {
+    "first": 47.15,
+    "last": 53.7
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     0.11,
+     -0.51
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0156,
+     "max": -0.0143
+    }
+   },
+   "foot_min_y_m": 0.0309,
+   "foot_min_joint": "RightToeBase",
+   "bvh_foot_min_y_cm": -1.01,
+   "seam": {
+    "pos_rms_m": 0.0,
+    "hips_pos_m": 0.0,
+    "rot_max_deg": 0.0
+   },
+   "hip_sway": 1.0,
+   "hip_sway_deviation": null,
+   "hip_sway_leg_fix_deg": null,
+   "notes": "stretched pingpong hold of crouch_rise_up f10-13: key 0 == stand_to_crouch's last / crouch_to_stand's first key; alternative: crouch_idle.bvh loop:auto:75:105 (deep kneel, hips 0.42 m)",
+   "file": "red_crouch_idle.dae",
+   "validated": true
+  },
+  "crouch_walk": {
+   "source": "crouch_walk_forward.bvh",
+   "bvh_frames": [
+    82,
+    136
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 55,
+   "fps": 30.0,
+   "length_s": 1.8,
+   "loop": true,
+   "gait_speed_bvh_cms": 85.09,
+   "gait_speed_mps": 0.7193,
+   "hips_height_m": {
+    "min": 0.5309,
+    "max": 0.6783,
+    "mean": 0.6162,
+    "first": 0.5799,
+    "last": 0.5799
+   },
+   "hips_height_bvh_cm": {
+    "first": 61.63,
+    "last": 61.02
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     -8.78,
+     152.92
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0643,
+     "max": 0.0031
+    }
+   },
+   "foot_min_y_m": 0.0219,
+   "foot_min_joint": "RightToeBase",
+   "bvh_foot_min_y_cm": -2.08,
+   "seam": {
+    "pos_rms_m": 0.0342,
+    "hips_pos_m": 0.0042,
+    "rot_max_deg": 12.0184
+   },
+   "hip_sway": 0.5,
+   "hip_sway_deviation": {
+    "roll": {
+     "before": [
+      -8.87,
+      13.74
+     ],
+     "after": [
+      -4.44,
+      6.87
+     ]
+    },
+    "yaw": {
+     "before": [
+      -9.98,
+      9.41
+     ],
+     "after": [
+      -4.99,
+      4.71
+     ]
+    },
+    "pitch": {
+     "before": [
+      4.65,
+      12.76
+     ],
+     "after": [
+      4.65,
+      12.76
+     ]
+    },
+    "lateral": {
+     "before": [
+      -9.23,
+      9.93
+     ],
+     "after": [
+      -4.62,
+      4.97
+     ]
+    }
+   },
+   "hip_sway_leg_fix_deg": 6.03,
+   "notes": "",
+   "file": "red_crouch_walk.dae",
+   "validated": true
+  },
+  "jump": {
+   "source": "jump_standing.bvh",
+   "bvh_frames": [
+    44,
+    84
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 40,
+   "fps": 30.0,
+   "length_s": 1.3,
+   "loop": false,
+   "gait_speed_bvh_cms": 0.0,
+   "gait_speed_mps": 0.0,
+   "hips_height_m": {
+    "min": 0.7105,
+    "max": 0.9461,
+    "mean": 0.8805,
+    "first": 0.8955,
+    "last": 0.9461
+   },
+   "hips_height_bvh_cm": {
+    "first": 94.98,
+    "last": 100.31
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     -3.18,
+     16.16
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "flat"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.2765,
+     "max": -0.0037
+    }
+   },
+   "foot_min_y_m": -0.0114,
+   "foot_min_joint": "LeftToeBase",
+   "bvh_foot_min_y_cm": -0.94,
+   "seam": null,
+   "hip_sway": 1.0,
+   "hip_sway_deviation": null,
+   "hip_sway_leg_fix_deg": null,
+   "notes": "airborne 47-59 + landing; the runtime starts the clip on the airborne edge so the anticipation frames 26-46 are skipped",
+   "file": "red_jump.dae",
+   "validated": true
+  },
+  "stand_to_crouch": {
+   "source": "crouch_rise_up.bvh",
+   "bvh_frames": [
+    10,
+    42
+   ],
+   "reverse": true,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 32,
+   "fps": 30.0,
+   "length_s": 1.03333,
+   "loop": false,
+   "gait_speed_bvh_cms": 0.0,
+   "gait_speed_mps": 0.0,
+   "hips_height_m": {
+    "min": 0.4855,
+    "max": 0.9548,
+    "mean": 0.7785,
+    "first": 0.9548,
+    "last": 0.4855
+   },
+   "hips_height_bvh_cm": {
+    "first": 47.15,
+    "last": 100.25
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     1.0,
+     6.97
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0156,
+     "max": 0.0049
+    }
+   },
+   "foot_min_y_m": 0.0309,
+   "foot_min_joint": "RightToeBase",
+   "bvh_foot_min_y_cm": -1.01,
+   "seam": null,
+   "hip_sway": 1.0,
+   "hip_sway_deviation": null,
+   "hip_sway_leg_fix_deg": null,
+   "notes": "reverse of crouch_to_stand; frames 0-9 are a heel-sit squat",
+   "file": "red_stand_to_crouch.dae",
+   "validated": true
+  },
+  "crouch_to_stand": {
+   "source": "crouch_rise_up.bvh",
+   "bvh_frames": [
+    10,
+    42
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 32,
+   "fps": 30.0,
+   "length_s": 1.03333,
+   "loop": false,
+   "gait_speed_bvh_cms": 0.0,
+   "gait_speed_mps": 0.0,
+   "hips_height_m": {
+    "min": 0.4855,
+    "max": 0.9548,
+    "mean": 0.7785,
+    "first": 0.4855,
+    "last": 0.9548
+   },
+   "hips_height_bvh_cm": {
+    "first": 47.15,
+    "last": 100.25
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     1.0,
+     6.97
+    ],
+    "yaw_removed_deg": 0.0,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0156,
+     "max": 0.0049
+    }
+   },
+   "foot_min_y_m": 0.0309,
+   "foot_min_joint": "RightToeBase",
+   "bvh_foot_min_y_cm": -1.01,
+   "seam": null,
+   "hip_sway": 1.0,
+   "hip_sway_deviation": null,
+   "hip_sway_leg_fix_deg": null,
+   "notes": "",
+   "file": "red_crouch_to_stand.dae",
+   "validated": true
+  },
+  "turn_l": {
+   "source": "turn_left_90.bvh",
+   "bvh_frames": [
+    0,
+    40
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 40,
+   "fps": 30.0,
+   "length_s": 1.3,
+   "loop": false,
+   "gait_speed_bvh_cms": 0.0,
+   "gait_speed_mps": 0.0,
+   "hips_height_m": {
+    "min": 0.9091,
+    "max": 0.957,
+    "mean": 0.9476,
+    "first": 0.9091,
+    "last": 0.9515
+   },
+   "hips_height_bvh_cm": {
+    "first": 96.39,
+    "last": 99.51
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     -13.87,
+     -1.65
+    ],
+    "yaw_removed_deg": 92.67,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0082,
+     "max": 0.0087
+    }
+   },
+   "foot_min_y_m": 0.0281,
+   "foot_min_joint": "RightToeBase",
+   "bvh_foot_min_y_cm": -1.35,
+   "seam": null,
+   "hip_sway": 1.0,
+   "hip_sway_deviation": null,
+   "hip_sway_leg_fix_deg": null,
+   "notes": "yaw ramps 0->93 deg over 0-40 then holds",
+   "file": "red_turn_l.dae",
+   "validated": true
+  },
+  "turn_r": {
+   "source": "turn_right_90.bvh",
+   "bvh_frames": [
+    0,
+    60
+   ],
+   "reverse": false,
+   "stretch": 1.0,
+   "pingpong": false,
+   "frame_count": 60,
+   "fps": 30.0,
+   "length_s": 1.96667,
+   "loop": false,
+   "gait_speed_bvh_cms": 0.0,
+   "gait_speed_mps": 0.0,
+   "hips_height_m": {
+    "min": 0.9326,
+    "max": 0.9497,
+    "mean": 0.9427,
+    "first": 0.9426,
+    "last": 0.9456
+   },
+   "hips_height_bvh_cm": {
+    "first": 98.71,
+    "last": 99.03
+   },
+   "root_motion": {
+    "xz_drift_removed_cm": [
+     -18.39,
+     -8.09
+    ],
+    "yaw_removed_deg": -93.93,
+    "y_clamped_to_stand": false,
+    "airborne": "keep"
+   },
+   "floor_lock": {
+    "enabled": true,
+    "target_floor_m": 0.0394,
+    "hips_shift_m": {
+     "min": -0.0038,
+     "max": 0.0064
+    }
+   },
+   "foot_min_y_m": 0.0351,
+   "foot_min_joint": "LeftToeBase",
+   "bvh_foot_min_y_cm": -0.51,
+   "seam": null,
+   "hip_sway": 1.0,
+   "hip_sway_deviation": null,
+   "hip_sway_leg_fix_deg": null,
+   "notes": "slower ramp than turn_l (-95 deg by f60)",
+   "file": "red_turn_r.dae",
+   "validated": true
+  }
+ }
+}

@@ -6,13 +6,18 @@
 #include "StdAfx.h"
 #include "NetworkManager.h"
 #include "BodySync.h"
+#include "VoiceChat.h" /* v16: proximity voice chat */
 #include "system/String.h"
 #include "Init.h"
 #include "MapHandler.h"
 #include "GameEntity.h" /* iGameEntity for the one-of-each item sweep */
 #include "GameEnemy.h"   /* Phase 6: shared-enemy streaming */
 #include "CharacterMove.h"
-#include "GameScripts.h" /* v9: NetApplyScriptEvent */
+#include "GameScripts.h" /* v9: NetApplyScriptEvent; v14: gbNetScriptPlayerContext */
+#include "GameSwingDoor.h" /* v14 world snapshot: door locks */
+#include "GameLamp.h"      /* v14 world snapshot: lamp lit */
+#include "Inventory.h"     /* v14 world snapshot: party item names */
+#include "resources/FileSearcher.h" /* v15: ItemDrop/MapChange file names must resolve */
 
 /* v9: the engine's script-var writes fire this (see engine ScriptFuncs.cpp) */
 namespace hpl { extern void (*gpScriptVarNetCallback)(int alOp, const char* asName, int alVal); }
@@ -27,6 +32,9 @@ static void ScriptVarNetThunk(int alOp, const char* asName, int alVal)
 #include "MainMenu.h" 
 #include "Player.h"
 #include "PlayerHelper.h"
+#include "PlayerHands.h"  /* v21: held items */
+#include "FadeHandler.h"   /* v20: snapshot presentation hand-back */
+#include "EffectHandler.h"
 #include "input/ActionKeyboard.h"
 #include "scene/Camera3D.h"
 #include "scene/World3D.h"
@@ -38,6 +46,227 @@ static void ScriptVarNetThunk(int alOp, const char* asName, int alVal)
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <ctime>
+#include <ctime> /* v15: nonce seed */
+#include <algorithm> /* character discovery: std::sort */
+
+//======================================================================
+// Shared by the real and the stub build.
+//======================================================================
+
+namespace
+{
+/** Wire id of the local preview ghost (ghost_preview=1) — above any real
+    guest id, never sent, never in m_mapGhosts. */
+const uint8_t kPreviewGhostId = 250;
+
+/** m/s -> cNetPlayerState::mVelFwd/mVelRight (1/kNetPlayerVelScale m/s, saturating). */
+int8_t EncodeNetVel(float afMetersPerSec)
+{
+	float f = afMetersPerSec * kNetPlayerVelScale;
+	if (f > 127.0f) f = 127.0f;
+	else if (f < -127.0f) f = -127.0f;
+	const int l = (f >= 0.0f) ? (int)(f + 0.5f) : -(int)(-f + 0.5f);
+	return (int8_t)l;
+}
+
+/** v21: what the local player holds in first-person hand slot 0 (left)
+    or 1 (right), as a wire id. A model on its way out (unequip) already
+    counts as empty-handed. */
+uint8_t LocalHeldItem(cInit *apInit, int alSlot)
+{
+	if (apInit == NULL || apInit->mpPlayerHands == NULL)
+		return eNetHeldItem_None;
+	iHudModel *pModel = apInit->mpPlayerHands->GetCurrentModel(alSlot);
+	if (pModel == NULL || pModel->GetState() == eHudModelState_Unequip)
+		return eNetHeldItem_None;
+	return cGhostPlayer::HeldItemFromHudName(pModel->msName, alSlot);
+}
+}
+
+bool cNetworkManager::BuildLocalSnapshot(cNetPlayerState *apOut) const
+{
+	if (!apOut || !mpInit || !mpInit->mpPlayer)
+		return false;
+	cCamera3D *cam = mpInit->mpPlayer->GetCamera();
+	if (!cam)
+		return false;
+	iCharacterBody *pBody = mpInit->mpPlayer->GetCharacterBody();
+
+	memset(apOut, 0, sizeof(*apOut));
+	const cVector3f p = cam->GetPosition();
+	apOut->mType = eNetPacketType_PlayerState;
+	apOut->mPlayerID = mlLocalPlayerId;
+	apOut->mfPosX = p.x;
+	/* v11: FEET height, not the camera's — the camera carries the head-bob
+	   (cPlayerHeadMove) and the ghost mesh origin is at its feet. */
+	apOut->mfPosY = pBody ? pBody->GetFeetPosition().y : p.y;
+	apOut->mfPosZ = p.z;
+	/* The camera yaw is never wrapped by the engine (yaw limits are off), so
+	   after enough turns in one direction it exceeds any sane bound; wrap
+	   both angles to [-pi, pi) on the wire. */
+	apOut->mfPitch = cMath::Wrap(cam->GetPitch(), -kPif, kPif);
+	apOut->mfYaw = cMath::Wrap(cam->GetYaw(), -kPif, kPif);
+	cPlayerFlashLight *fl = mpInit->mpPlayer->GetFlashLight();
+	apOut->mbFlashlightOn = (uint8_t)(fl && fl->IsActive() && !fl->IsDisabled());
+	apOut->mHeldLeft = LocalHeldItem(mpInit, 0);  /* v21 */
+	apOut->mHeldRight = LocalHeldItem(mpInit, 1);
+	/* Engine -> wire stance mapping, explicit per state so an engine enum
+	   reorder cannot silently change the protocol (the wire values are frozen
+	   — see eNetMoveState). Unknown states go out as Run. */
+	const ePlayerMoveState eMove = mpInit->mpPlayer->GetMoveState();
+	switch (eMove)
+	{
+	case ePlayerMoveState_Walk:   apOut->mMoveState = eNetMoveState_Walk;   break;
+	case ePlayerMoveState_Run:    apOut->mMoveState = eNetMoveState_Run;    break;
+	case ePlayerMoveState_Still:  apOut->mMoveState = eNetMoveState_Still;  break;
+	case ePlayerMoveState_Jump:   apOut->mMoveState = eNetMoveState_Jump;   break;
+	case ePlayerMoveState_Crouch: apOut->mMoveState = eNetMoveState_Crouch; break;
+	default:                      apOut->mMoveState = eNetMoveState_Run;    break;
+	}
+
+	/* v11 flags: ground contact from the character body; crouch/run survive
+	   a jump because the jump state remembers what it was entered from. */
+	bool bCrouch = (eMove == ePlayerMoveState_Crouch);
+	bool bRun = (eMove == ePlayerMoveState_Run);
+	if (eMove == ePlayerMoveState_Jump)
+	{
+		iPlayerMoveState *pJump = mpInit->mpPlayer->GetMoveStateData(ePlayerMoveState_Jump);
+		if (pJump)
+		{
+			bCrouch = (pJump->mPrevMoveState == ePlayerMoveState_Crouch);
+			bRun = (pJump->mPrevMoveState == ePlayerMoveState_Run);
+		}
+	}
+	uint8_t lFlags = 0;
+	if (pBody == NULL || pBody->IsOnGround())
+		lFlags |= eNetPlayerFlag_OnGround;
+	if (bCrouch)
+		lFlags |= eNetPlayerFlag_Crouch;
+	if (bRun)
+		lFlags |= eNetPlayerFlag_RunKey;
+	if (eMove == ePlayerMoveState_Jump)
+		lFlags |= eNetPlayerFlag_Jump;
+	/* v12 party health: 0-100 rounded; the Dead bit covers the one-frame
+	   gap between health reaching 0 and the death sequence starting, and a
+	   scripted death (IsDead() is what cPlayer::Damage keys off). */
+	float fHealth = mpInit->mpPlayer->GetHealth();
+	if (fHealth < 0.0f) fHealth = 0.0f;
+	else if (fHealth > 100.0f) fHealth = 100.0f;
+	apOut->mHealth = (uint8_t)(fHealth + 0.5f);
+	if (apOut->mHealth == 0 && fHealth > 0.0f)
+		apOut->mHealth = 1; /* 0 means DEAD to every receiver; 0.3 hp is alive */
+	if (mpInit->mpPlayer->IsDead() || fHealth <= 0.0f)
+	{
+		lFlags |= eNetPlayerFlag_Dead;
+		apOut->mHealth = 0;
+	}
+	apOut->mFlags = lFlags;
+
+	/* v11 velocity: the body's true world velocity over the last physics
+	   step, projected on the view frame (forward = (-sin y, 0, -cos y),
+	   right = (cos y, 0, -sin y) — cCamera3D::UpdateMoveMatrix). */
+	if (pBody)
+	{
+		float fStep = mpInit->mpGame ? mpInit->mpGame->GetStepSize() : 0.0f;
+		if (fStep <= 0.0f)
+			fStep = 1.0f / 60.0f;
+		const cVector3f v = pBody->GetVelocity(fStep);
+		const float fSinY = sinf(apOut->mfYaw);
+		const float fCosY = cosf(apOut->mfYaw);
+		apOut->mVelFwd = EncodeNetVel(-v.x * fSinY - v.z * fCosY);
+		apOut->mVelRight = EncodeNetVel(v.x * fCosY - v.z * fSinY);
+	}
+	return mlLocalPlayerId != 0;
+}
+
+cGhostPlayer *cNetworkManager::CreateGhost(uint8_t alId, size_t alMeshIdx)
+{
+	if (!mpWorld)
+		return NULL;
+	hpl::tString sMesh;
+	if (mvGhostMeshPaths.empty() == false)
+		sMesh = mvGhostMeshPaths[alMeshIdx % mvGhostMeshPaths.size()];
+
+	/* v11: the wire carries the sender's FEET and the exported meshes have
+	   their origin at the feet, so the mesh lands on the wire position with
+	   NO offset. The sender's camera sits feetY + Height/2 + CameraHeightAdd
+	   + 0.71 above that (Player.cpp:376,968 plus the empirical +0.71 that four
+	   rounds of eyeball-grounding against verified-grounded clips measured
+	   in the pre-v11 camera-relative days) — that eye height is what the
+	   enemy senses and the lights get. */
+	float fCamAdd = 0.0f, fStandH = 1.9f, fCrouchH = 1.0f, fWidth = 0.5f;
+	if (mpInit && mpInit->mpGameConfig)
+	{
+		fWidth = mpInit->mpGameConfig->GetFloat("Player", "Width", 0.5f);
+		fCamAdd = mpInit->mpGameConfig->GetFloat("Player", "CameraHeightAdd", 0);
+		fStandH = mpInit->mpGameConfig->GetFloat("Player", "Height", 1.9f);
+		fCrouchH = mpInit->mpGameConfig->GetFloat("Player", "CrouchHeight", 1.0f);
+	}
+	const float kCamFeetCorrection = 0.71f;
+	const float fEyeStand = fStandH * 0.5f + fCamAdd + kCamFeetCorrection;
+	const float fEyeCrouch = fCrouchH * 0.5f + fCamAdd + kCamFeetCorrection;
+
+	/* multiplayer.cfg overrides are offsets from the FEET now (any value <
+	   9000 wins). A pre-v11 cfg still holds camera-relative values like
+	   -1.45 — anything below -0.9 m can only be one of those, so convert it
+	   (camera - eye height = feet) instead of sinking the mesh. */
+	float fStandOffset = (mfGhostMeshBodyYOffset > 9000.0f) ? 0.0f : mfGhostMeshBodyYOffset;
+	bool bCrouchGiven = (mfGhostMeshBodyYOffsetCrouch <= 9000.0f);
+	float fCrouchOffset = bCrouchGiven ? mfGhostMeshBodyYOffsetCrouch : 0.0f;
+	if (mvGhostMeshPaths.empty() == false && mvGhostBodyYList.empty() == false)
+	{
+		const size_t lMeshIdx = alMeshIdx % mvGhostMeshPaths.size();
+		fStandOffset = mvGhostBodyYList[lMeshIdx % mvGhostBodyYList.size()];
+		bCrouchGiven = (mvGhostBodyYCrouchList.empty() == false);
+		if (bCrouchGiven)
+			fCrouchOffset = mvGhostBodyYCrouchList[lMeshIdx % mvGhostBodyYCrouchList.size()];
+	}
+	/* Convert each GIVEN value with its own eye height first; an unset
+	   crouch value then inherits the CONVERTED stand offset (copying the raw
+	   camera-relative stand value and converting it with the crouch eye
+	   height sank the crouched ghost ~0.35 m). */
+	bool bLegacy = false;
+	if (fStandOffset < -0.9f) { fStandOffset += fEyeStand; bLegacy = true; }
+	if (bCrouchGiven)
+	{
+		if (fCrouchOffset < -0.9f) { fCrouchOffset += fEyeCrouch; bLegacy = true; }
+	}
+	else
+		fCrouchOffset = fStandOffset;
+	if (bLegacy)
+		Log(" multiplayer: ghost_body_y* look camera-relative (pre-v11); v11 offsets are from the FEET — using %.2f/%.2f, set 0 or remove the keys\n",
+			fStandOffset, fCrouchOffset);
+
+	cGhostPlayer *pGhost = hplNew(cGhostPlayer, (mpWorld, alId, sMesh, fStandOffset, fCrouchOffset,
+		fEyeStand, fEyeCrouch, &mGhostTuning));
+	/* the same body size as the real player (Player.cpp) */
+	if (pGhost)
+		pGhost->CreateCollider(cVector3f(fWidth, fStandH, fWidth), fCrouchH);
+	return pGhost;
+}
+
+void cNetworkManager::DestroyPreviewGhost(bool abOrphan)
+{
+	if (mpPreviewGhost == NULL)
+		return;
+	if (abOrphan)
+		mpPreviewGhost->OrphanWorld();
+	hplDelete(mpPreviewGhost);
+	mpPreviewGhost = NULL;
+}
+
+//======================================================================
+// Both builds: master-server address (no sockets involved).
+
+hpl::tString cNetworkManager::GetMasterServer() const
+{
+	if (!msMasterServer.empty())
+		return msMasterServer;
+	if (mbPublic)
+		return kNetMasterDefaultHost;
+	return "";
+}
 
 //======================================================================
 
@@ -45,9 +274,10 @@ static void ScriptVarNetThunk(int alOp, const char* asName, int alVal)
 
 struct cNetworkManager::Impl {};
 
-const float cNetworkManager::kSendPeriodSeconds = 1.0f / 30.0f; /* v10:
+const float cNetworkManager::kSendPeriodSeconds = kNetSendPeriodSeconds; /* v10:
     20 -> 30 Hz — noticeably smoother object/enemy motion; ~18 KB/s peak
-    is still nothing for any internet link */
+    is still nothing for any internet link. v11: the receiver clocks ghost
+    interpolation off seq * period, so the value lives in NetworkPackets.h */
 const float cNetworkManager::kDiscoveryWindowSeconds = 1.5f;
 
 cNetworkManager::cNetworkManager(cInit *apInit)
@@ -64,6 +294,9 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbApplyingRemoteMapChange(false)
 	  , mbLocalMapChangeArmed(false)
 	  , mbHavePendingMapChange(false)
+	  , mbPendingMapChangeDeferred(false)
+	  , mbBeaconAfterTransition(false)
+	  , mfLocalMapChangeArmedAge(0)
 	  , mfSendAccum(0)
 	  , mpWorld(NULL)
 	  , mlLocalPlayerId(0)
@@ -71,16 +304,71 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mlNextGuestId(2)
 	  , mlDefaultPort(7777)
 	  , mbActionsRegistered(false)
+	  , mbCfgAutoHost(false) /* v17 */
 	  , mpImpl(new Impl())
 	  , mvGhostMeshPaths()
 	  , mfGhostMeshBodyYOffset(9999.0f)  /* AUTO: derived from game.cfg Player Height/CameraHeightAdd */
 	  , mfGhostMeshBodyYOffsetCrouch(9999.0f) /* AUTO: derived from CrouchHeight/CameraHeightAdd */
+	  , mvGhostBodyYList()
+	  , mvGhostBodyYCrouchList()
+	  , mGhostTuning()
+	  , mbGhostPreview(false)
+	  , mbFriendlyFire(true)
+	  , mbSharedLoot(true)
+	  , mlGhostPreviewModel(0)
+	  , mpPreviewGhost(NULL)
+	  , mlPreviewSeq(0)
+	  , mfPreviewSendAccum(0)
+	  , mfPreviewSpawnDelay(0.75f)
+	  , mvPreviewCenter(0, 0, 0)
+	  , mfPreviewFacingYaw(0)
+	  , mfPreviewCircleAngle(0)
+	  , mlPreviewClipIdx(-1)
+	  , mbPreviewCrouch(false)
+	  , mlPreviewTreadmill(0)
 	  , mvDiscovered()
+	  , mlHostNonce(0)
 	  , mbDiscoveryActive(false)
 	  , mfDiscoveryTimeLeft(0)
-	  , msServerName("Penumbra Server")
+	  , msServerName("") /* v13: empty = "<player_name>'s game" in the pong */
 	  , mlMaxPlayers(4)
+	  , msMasterServer("")
+	  , mbPublic(false)
+	  , mbPublicExplicit(false)
+	  , mvInternet()
+	  , mbInternetActive(false)
+	  , mfInternetTimeLeft(0)
+	  , msInternetFailReason("")
+	  , mfMasterRegisterAccum(0)
+	  , mfMasterResolveAge(0)
+	  , mbMasterRegistered(false)
 	  , mpBodySync(new cBodySync())
+	  , mbCoopRespawn(true) /* v12: multiplayer.cfg coop_respawn */
+	  , msPlayerName()      /* v13: multiplayer.cfg player_name */
+	  , m_mapPlayerNames()
+	  , mvPartyEvents()
+	  , m_setJoinAnnounced()
+	  , mfSinceJoinSeconds(0)
+	  , m_mapPlayerSlots()  /* v17: character slots */
+	  , mlSlotWarned(0)
+	  , mvSnapChunks()      /* v14: world snapshot */
+	  , mlSnapId(0)
+	  , mlSnapGen(0)
+	  , mbSnapBuffering(false)
+	  , mfSnapAge(0)
+	  , mlSnapIdOut(0)
+	  , msServerPassword()  /* v15: multiplayer.cfg server_password ("" = open) */
+	  , msJoinPassword()    /* v15: multiplayer.cfg join_password */
+	  , mbAuthSent(false)
+	  , mlGuestViolationsLogged(0)
+	  , mvFreeGuestIds()
+	  , mpVoice(NULL)       /* v16: voice chat (created in Startup) */
+	  , mfMicTestKeepAlive(0.0f)
+	  , mbVoiceEnabled(true)
+	  , mbVoiceOpenMic(false)
+	  , mfVoiceVolume(1.0f)
+	  , mfVoiceGateDb(-45.0f)
+	  , msVoiceCaptureDevice()
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -92,8 +380,11 @@ cNetworkManager::~cNetworkManager()
 {
 	hpl::gpScriptVarNetCallback = NULL;
 	gpNetMgrForScript = NULL;
-	Disconnect();
+	Disconnect(); /* v16: also shuts the voice chat down (AL context still alive: cGame dies later) */
 	ClearGhostsInternal();
+	if (mpVoice)
+		hplDelete(mpVoice);
+	mpVoice = NULL;
 	delete mpBodySync;
 	mpBodySync = NULL;
 	delete mpImpl;
@@ -122,6 +413,21 @@ void cNetworkManager::StopDiscovery()
 {
 }
 
+void cNetworkManager::RefreshInternetServers()
+{
+	msInternetFailReason = "rebuild with PENUMBRA_MULTIPLAYER";
+	Log(" Multiplayer: rebuild with PENUMBRA_MULTIPLAYER + vcpkg enet.\n");
+}
+
+void cNetworkManager::StopInternetRefresh()
+{
+}
+
+void cNetworkManager::SetPublic(bool abPublic)
+{
+	mbPublic = abPublic;
+}
+
 void cNetworkManager::Disconnect()
 {
 	mbHosting = false;
@@ -132,49 +438,26 @@ void cNetworkManager::Disconnect()
 	msDeferredJoinAddress = "";
 }
 
-void cNetworkManager::Update(float /*afTimeStep*/)
+void cNetworkManager::Update(float afTimeStep)
 {
+	UpdatePartyEvents(afTimeStep); /* v13: the feed ages out even here */
 }
 
 void cNetworkManager::ClearGhostsInternal()
 {
 	m_mapGhostSeq.clear(); /* new session, new counters */
+	m_mapGhostMoveState.clear();
+	m_mapGhostHealth.clear();
+	m_mapPlayerNames.clear(); /* v13: names + "joined" bookkeeping are per session */
+	m_setJoinAnnounced.clear();
+	m_mapPlayerSlots.clear(); /* v17: slots are per session (HostGame re-seeds id 1 = slot 0) */
+	mlSlotWarned = 0;
+	if (mpVoice)
+		mpVoice->DropAllPlayers(); /* v16: every remote decoder + AL source */
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
-}
-
-bool cNetworkManager::BuildLocalSnapshot(cNetPlayerState *apOut) const
-{
-	if (!apOut || !mpInit || !mpInit->mpPlayer)
-		return false;
-	cCamera3D *cam = mpInit->mpPlayer->GetCamera();
-	if (!cam)
-		return false;
-
-	cVector3f p = cam->GetPosition();
-	apOut->mType = eNetPacketType_PlayerState;
-	apOut->mPlayerID = mlLocalPlayerId;
-	apOut->mfPosX = p.x;
-	apOut->mfPosY = p.y;
-	apOut->mfPosZ = p.z;
-	apOut->mfPitch = cam->GetPitch();
-	apOut->mfYaw = cam->GetYaw();
-	cPlayerFlashLight *fl = mpInit->mpPlayer->GetFlashLight();
-	apOut->mbFlashlightOn = (uint8_t)(fl && fl->IsActive() && !fl->IsDisabled());
-	/* Engine -> wire stance mapping, explicit per state so an engine enum
-	   reorder cannot silently change the protocol (the wire values are frozen
-	   — see eNetMoveState). Unknown states go out as Run. */
-	switch (mpInit->mpPlayer->GetMoveState())
-	{
-	case ePlayerMoveState_Walk:   apOut->mMoveState = eNetMoveState_Walk;   break;
-	case ePlayerMoveState_Run:    apOut->mMoveState = eNetMoveState_Run;    break;
-	case ePlayerMoveState_Still:  apOut->mMoveState = eNetMoveState_Still;  break;
-	case ePlayerMoveState_Jump:   apOut->mMoveState = eNetMoveState_Jump;   break;
-	case ePlayerMoveState_Crouch: apOut->mMoveState = eNetMoveState_Crouch; break;
-	default:                      apOut->mMoveState = eNetMoveState_Run;    break;
-	}
-	return mlLocalPlayerId != 0;
+	DestroyPreviewGhost(false);
 }
 
 void cNetworkManager::EmitLocalSnapshots()
@@ -188,6 +471,12 @@ void cNetworkManager::DispatchIncoming(const void *, size_t)
 void cNetworkManager::DropRemotePlayer(uint8_t id)
 {
 	m_mapGhostSeq.erase(id); /* a rejoiner restarts its counter */
+	m_mapGhostMoveState.erase(id);
+	m_mapGhostHealth.erase(id); /* v12: gone = not alive for the respawn rule */
+	ForgetPlayerName(id);       /* v13: "<name> left" + name table entry */
+	m_mapPlayerSlots.erase(id); /* v17: host = the character slot is free again */
+	if (mpVoice)
+		mpVoice->DropPlayer(id); /* v16: decoder + AL source freed */
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
 	if (it != m_mapGhosts.end())
 	{
@@ -233,13 +522,20 @@ void cNetworkManager::NetOnItemPicked(const hpl::tString &) {}
 void cNetworkManager::NetOnItemDropped(const hpl::tString &, const hpl::tString &,
 	const hpl::cVector3f &, const hpl::cVector3f &) {}
 int cNetworkManager::GetConnectedGuestCount() const { return 0; }
+void cNetworkManager::GetGhostHitBodies(std::vector<std::pair<uint8_t, hpl::iPhysicsBody *> > &avOut) { avOut.clear(); }
+void cNetworkManager::NetOnMeleeHitPlayer(uint8_t, float, const hpl::cVector3f &) {}
 bool cNetworkManager::IsEnemyPuppetMode() const { return false; }
 void cNetworkManager::GetGhostCamPositions(std::vector<std::pair<uint8_t, hpl::cVector3f> > &avOut) { avOut.clear(); }
+bool cNetworkManager::GetGhostSense(uint8_t, hpl::cVector3f *, uint8_t *) const { return false; }
 void cNetworkManager::SendPlayerDamage(uint8_t, float) {}
 void cNetworkManager::NetOnEnemyDamaged(const hpl::tString &, float, int) {}
 bool cNetworkManager::PartyHasItem(const hpl::tString &) const { return false; }
 void cNetworkManager::NetOnScriptEvent(int, const hpl::tString &, int) {}
 void cNetworkManager::NetOnEntityDamaged(const hpl::tString &, float, int) {}
+/* v12 party health: nobody is ever connected in the stub build. */
+bool cNetworkManager::GetGhostHealth(uint8_t, float *) const { return false; }
+void cNetworkManager::GetPartyStatus(std::vector<cNetPartyMember> &avOut) const { avOut.clear(); }
+bool cNetworkManager::IsSessionLive() const { return false; }
 
 #else /* PENUMBRA_MULTIPLAYER */
 
@@ -265,6 +561,15 @@ struct cNetworkManager::Impl
 	SOCKET mDiscoveryBrowseSock;
 	bool mbBrowseHoldsNetRef; /* StartDiscovery can run with no ENet host alive */
 
+	/* Master server address (internet browser). Resolved ONCE per distinct
+	   cfg string by ResolveMasterAddress — blocking DNS belongs in a button
+	   click / HostGame, never in Update. */
+	sockaddr_in mMasterAddr;
+	bool mbMasterResolved;
+	hpl::tString msMasterResolvedFor; /* the host:port mMasterAddr stands for */
+	bool mbMasterWarned;              /* log the "cannot resolve" line once */
+	double mfMasterResolveFailedAt;   /* wall seconds of the last failed lookup, 0 = none */
+
 	/* Rung 3, guest side: pending forwarded intent, flushed at the send tick.
 	   Begin/End go out immediately (reliable); these are the streams. */
 	uint32_t mlHeldHash;   /* forwarded grab in progress (0 = none) */
@@ -276,12 +581,70 @@ struct cNetworkManager::Impl
 	bool mbPushStop;
 	bool mbPushAny;
 
+	/* v15: per-connection guard record, HOST side, keyed by ENet peer slot
+	   (created at CONNECT, erased at DISCONNECT / by the sweep). A peer has
+	   no wire id until mbAuthed; a refused one is only waiting for its
+	   disconnect to complete and everything it sends is dropped. */
+	struct cPeerGuard
+	{
+		uint8_t mNonce[16];
+		bool mbAuthed;
+		bool mbRefused;
+		float mfAge;            /* seconds since CONNECT (kNetAuthTimeoutSeconds) */
+		unsigned mlStrikes;
+		float mfStrikeDecay;    /* seconds since the last decay tick */
+		float mfRateWindow;     /* seconds into the current 1 s window */
+		unsigned mlReliableInWindow;
+		bool mbRateStruck;      /* one strike per window */
+		uint64_t mlLoggedTypes; /* log-once mask, bit = packet type */
+		bool mbHavePos;         /* newest validated PlayerState position */
+		hpl::cVector3f mvLastPos;
+		/* v18 character requests: at most one applied per
+		   kNetCharRequestCooldown; a request inside the cooldown replaces
+		   the pending one (UpdatePeerGuards applies the newest), so a
+		   click-happy (or hostile) guest cannot make the host re-send the
+		   name table hundreds of times a second, and the LAST pick wins. */
+		float mfCharCooldown;
+		bool mbCharPending;
+		hpl::tString msCharPending;
+		bool mbCharRefusedLogged; /* "request ignored" is logged once per connection */
+
+		cPeerGuard()
+			: mbAuthed(false), mbRefused(false), mfAge(0), mlStrikes(0), mfStrikeDecay(0),
+			  mfRateWindow(0), mlReliableInWindow(0), mbRateStruck(false), mlLoggedTypes(0),
+			  mbHavePos(false), mvLastPos(0, 0, 0),
+			  mfCharCooldown(0), mbCharPending(false), msCharPending(), mbCharRefusedLogged(false)
+		{
+			memset(mNonce, 0, sizeof(mNonce));
+		}
+	};
+	std::map<const ENetPeer *, cPeerGuard> m_mapGuards;
+	uint32_t mlNonceCounter;
+
+	/* v15: discovery reflector limiter — the kPongBuckets most recent
+	   source addresses, kMaxPongPerSource pongs each per 1 s window, and a
+	   global cap per window (aged in PollDiscovery). */
+	enum { kPongBuckets = 16, kMaxPongPerSource = 5, kMaxPongPerSecond = 60 };
+	struct cPongBucket
+	{
+		uint32_t mlAddr;
+		float mfWindowLeft;
+		unsigned mlCount;
+	};
+	cPongBucket mPong[kPongBuckets];
+	float mfPongGlobalWindow;
+	unsigned mlPongGlobalCount;
+
 	Impl()
 		: mpHost(NULL)
 		  , mpServerPeer(NULL)
 		  , mDiscoveryListenSock(INVALID_SOCKET)
 		  , mDiscoveryBrowseSock(INVALID_SOCKET)
 		  , mbBrowseHoldsNetRef(false)
+		  , mbMasterResolved(false)
+		  , msMasterResolvedFor("")
+		  , mfMasterResolveFailedAt(0.0)
+		  , mbMasterWarned(false)
 		  , mlHeldHash(0)
 		  , mvGrabTarget(0, 0, 0)
 		  , mbHaveGrabTarget(false)
@@ -290,7 +653,13 @@ struct cNetworkManager::Impl
 		  , mvPushPoint(0, 0, 0)
 		  , mbPushStop(false)
 		  , mbPushAny(false)
+		  , m_mapGuards()
+		  , mlNonceCounter(0)
+		  , mfPongGlobalWindow(0)
+		  , mlPongGlobalCount(0)
 	{
+		memset(mPong, 0, sizeof(mPong));
+		memset(&mMasterAddr, 0, sizeof(mMasterAddr));
 	}
 
 	void ResetIntent()
@@ -304,9 +673,10 @@ struct cNetworkManager::Impl
 	}
 };
 
-const float cNetworkManager::kSendPeriodSeconds = 1.0f / 30.0f; /* v10:
+const float cNetworkManager::kSendPeriodSeconds = kNetSendPeriodSeconds; /* v10:
     20 -> 30 Hz — noticeably smoother object/enemy motion; ~18 KB/s peak
-    is still nothing for any internet link */
+    is still nothing for any internet link. v11: the receiver clocks ghost
+    interpolation off seq * period, so the value lives in NetworkPackets.h */
 const float cNetworkManager::kDiscoveryWindowSeconds = 1.5f;
 
 namespace
@@ -434,13 +804,111 @@ static void ParseCsvFloats(const char *src, std::vector<float> &out)
 	}
 }
 
-static const hpl::tString &GhostMeshPathForId(const std::vector<hpl::tString> &paths,
-											  uint8_t id)
+//-----------------------------------------------------------------------
+// Character slots (four-player lobbies).
+
+#define kGhostModelDir (gsGhostModelDir.c_str()) /* Init.cpp: absolute in the tech demo co-op install */
+
+/* ASCII-only lowercase: the discovered order (and so which player gets which
+   character) must be the same on every machine, whatever the C locale. */
+static tString GhostAsciiLower(const tString &asIn)
 {
-	static const hpl::tString sEmptyGhostMesh;
-	if (paths.empty() || id == 0)
-		return sEmptyGhostMesh;
-	return paths[(size_t)(id - 1) % paths.size()];
+	tString s = asIn;
+	for (size_t i = 0; i < s.size(); ++i)
+		if (s[i] >= 'A' && s[i] <= 'Z')
+			s[i] = (char)(s[i] - 'A' + 'a');
+	return s;
+}
+
+/* Case-insensitive, byte-wise; exact bytes break ties so the order is total. */
+static bool GhostModelLess(const tString &a, const tString &b)
+{
+	const tString la = GhostAsciiLower(a), lb = GhostAsciiLower(b);
+	if (la != lb)
+		return la < lb;
+	return a < b;
+}
+
+/** Every <name>.dae in asDir whose <name> has no '_' and that has at least
+    one <name>_<clip>.dae sibling (idle, walk, ...), sorted case-insensitively.
+    Enumeration goes through the engine's own FindFilesInDir (_wfindfirst on
+    Windows, opendir on POSIX — impl/platform/*.cpp), the same call
+    AddResourceDir indexes the folder with. Both match the mask
+    case-insensitively; the extension is re-checked here anyway. */
+static void DiscoverGhostCharacters(hpl::cResources *apRes, const tString &asDir,
+	std::vector<tString> &avOut)
+{
+	avOut.clear();
+	if (apRes == NULL || apRes->GetLowLevel() == NULL)
+		return;
+	tWStringList lstFiles;
+	apRes->GetLowLevel()->FindFilesInDir(lstFiles, cString::To16Char(asDir), _W("*.dae"));
+
+	std::vector<tString> vDae;   /* original file names */
+	std::set<tString> setStems;  /* lowercase stems, for the sibling test */
+	for (tWStringListIt it = lstFiles.begin(); it != lstFiles.end(); ++it)
+	{
+		const tString sFile = cString::To8Char(*it);
+		const tString sLow = GhostAsciiLower(sFile);
+		if (sLow.size() <= 4 || sLow.compare(sLow.size() - 4, 4, ".dae") != 0)
+			continue;
+		vDae.push_back(sFile);
+		setStems.insert(sLow.substr(0, sLow.size() - 4));
+	}
+
+	for (size_t i = 0; i < vDae.size(); ++i)
+	{
+		const tString sLow = GhostAsciiLower(vDae[i]);
+		const tString sStem = sLow.substr(0, sLow.size() - 4);
+		if (sStem.find('_') != tString::npos)
+			continue; /* a clip (malik_idle) or not a character name */
+		const tString sPrefix = sStem + "_";
+		std::set<tString>::const_iterator sib = setStems.lower_bound(sPrefix);
+		if (sib == setStems.end() || sib->compare(0, sPrefix.size(), sPrefix) != 0)
+			continue; /* a lone mesh with no clips is a prop, not a character */
+		avOut.push_back(vDae[i]);
+	}
+	std::sort(avOut.begin(), avOut.end(), GhostModelLess);
+	/* Malik.dae + malik.dae (only possible on a case-sensitive file system)
+	   would be the same resource for the case-insensitive file searcher:
+	   keep the first. */
+	std::vector<tString> vUnique;
+	for (size_t i = 0; i < avOut.size(); ++i)
+		if (vUnique.empty() || GhostAsciiLower(vUnique.back()) != GhostAsciiLower(avOut[i]))
+			vUnique.push_back(avOut[i]);
+	avOut.swap(vUnique);
+}
+
+/** Does the mesh manager find this name? Same lookup as
+    cMeshManager::CreateMesh: the file searcher, with every supported mesh
+    extension tried when the name has none. */
+static bool GhostModelResolves(hpl::cResources *apRes, const tString &asName)
+{
+	if (apRes == NULL || apRes->GetFileSearcher() == NULL)
+		return false;
+	hpl::cFileSearcher *pSearcher = apRes->GetFileSearcher();
+	if (cString::GetFileExt(asName) != "")
+		return pSearcher->GetFilePath(asName) != "";
+	tStringVec *pTypes = apRes->GetMeshLoaderHandler() ?
+		apRes->GetMeshLoaderHandler()->GetSupportedTypes() : NULL;
+	if (pTypes == NULL)
+		return false;
+	for (size_t i = 0; i < pTypes->size(); ++i)
+		if (pSearcher->GetFilePath(cString::SetFileExt(asName, (*pTypes)[i])) != "")
+			return true;
+	return false;
+}
+
+static tString GhostModelListText(const std::vector<tString> &avList)
+{
+	tString s;
+	for (size_t i = 0; i < avList.size(); ++i)
+	{
+		if (i)
+			s += ", ";
+		s += avList[i];
+	}
+	return s;
 }
 
 /** Reliable = channel 0 (control), else channel 1 unsequenced (streams). */
@@ -474,8 +942,8 @@ static void BlastLeaves(ENetHost *host, uint8_t who, ENetPeer *skip)
 	for (size_t i = 0; i < host->peerCount; ++i)
 	{
 		ENetPeer *rp = &host->peers[i];
-		if (rp == skip || rp->state != ENET_PEER_STATE_CONNECTED)
-			continue;
+		if (rp == skip || rp->state != ENET_PEER_STATE_CONNECTED || PeerGetId(rp) == 0)
+			continue; /* v15: id 0 = still answering the challenge, gets nothing */
 		ENetPacket *pkg = enet_packet_create(&lv, sizeof(lv), ENET_PACKET_FLAG_RELIABLE);
 		if (pkg)
 			enet_peer_send(rp, 0, pkg);
@@ -519,6 +987,23 @@ static void CopyPacketString(char *dst, size_t dstSz, const char *src)
 	strncpy(dst, src ? src : "", dstSz);
 	dst[dstSz - 1] = '\0';
 }
+
+/** v15: "a.b.c.d:port" of an ENet peer, for log lines. */
+static void FormatPeerAddr(const ENetPeer *apPeer, char *out, size_t outSz)
+{
+	if (!out || outSz == 0)
+		return;
+	if (!apPeer)
+	{
+		out[0] = '\0';
+		return;
+	}
+	const unsigned char *b = (const unsigned char *)&apPeer->address.host;
+	_snprintf(out, outSz, "%u.%u.%u.%u:%u",
+			  (unsigned)b[0], (unsigned)b[1], (unsigned)b[2], (unsigned)b[3],
+			  (unsigned)apPeer->address.port);
+	out[outSz - 1] = '\0';
+}
 }
 
 //-----------------------------------------------------------------------
@@ -537,6 +1022,9 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mbApplyingRemoteMapChange(false)
 	  , mbLocalMapChangeArmed(false)
 	  , mbHavePendingMapChange(false)
+	  , mbPendingMapChangeDeferred(false)
+	  , mbBeaconAfterTransition(false)
+	  , mfLocalMapChangeArmedAge(0)
 	  , mfSendAccum(0)
 	  , mpWorld(NULL)
 	  , mlLocalPlayerId(0)
@@ -544,16 +1032,71 @@ cNetworkManager::cNetworkManager(cInit *apInit)
 	  , mlNextGuestId(2)
 	  , mlDefaultPort(7777)
 	  , mbActionsRegistered(false)
+	  , mbCfgAutoHost(false) /* v17 */
 	  , mpImpl(new Impl())
 	  , mvGhostMeshPaths()
 	  , mfGhostMeshBodyYOffset(9999.0f)  /* AUTO: derived from game.cfg Player Height/CameraHeightAdd */
 	  , mfGhostMeshBodyYOffsetCrouch(9999.0f) /* AUTO: derived from CrouchHeight/CameraHeightAdd */
+	  , mvGhostBodyYList()
+	  , mvGhostBodyYCrouchList()
+	  , mGhostTuning()
+	  , mbGhostPreview(false)
+	  , mbFriendlyFire(true)
+	  , mbSharedLoot(true)
+	  , mlGhostPreviewModel(0)
+	  , mpPreviewGhost(NULL)
+	  , mlPreviewSeq(0)
+	  , mfPreviewSendAccum(0)
+	  , mfPreviewSpawnDelay(0.75f)
+	  , mvPreviewCenter(0, 0, 0)
+	  , mfPreviewFacingYaw(0)
+	  , mfPreviewCircleAngle(0)
+	  , mlPreviewClipIdx(-1)
+	  , mbPreviewCrouch(false)
+	  , mlPreviewTreadmill(0)
 	  , mvDiscovered()
+	  , mlHostNonce(0)
 	  , mbDiscoveryActive(false)
 	  , mfDiscoveryTimeLeft(0)
-	  , msServerName("Penumbra Server")
+	  , msServerName("") /* v13: empty = "<player_name>'s game" in the pong */
 	  , mlMaxPlayers(4)
+	  , msMasterServer("")
+	  , mbPublic(false)
+	  , mbPublicExplicit(false)
+	  , mvInternet()
+	  , mbInternetActive(false)
+	  , mfInternetTimeLeft(0)
+	  , msInternetFailReason("")
+	  , mfMasterRegisterAccum(0)
+	  , mfMasterResolveAge(0)
+	  , mbMasterRegistered(false)
 	  , mpBodySync(new cBodySync())
+	  , mbCoopRespawn(true) /* v12: multiplayer.cfg coop_respawn */
+	  , msPlayerName()      /* v13: multiplayer.cfg player_name */
+	  , m_mapPlayerNames()
+	  , mvPartyEvents()
+	  , m_setJoinAnnounced()
+	  , mfSinceJoinSeconds(0)
+	  , m_mapPlayerSlots()  /* v17: character slots */
+	  , mlSlotWarned(0)
+	  , mvSnapChunks()      /* v14: world snapshot */
+	  , mlSnapId(0)
+	  , mlSnapGen(0)
+	  , mbSnapBuffering(false)
+	  , mfSnapAge(0)
+	  , mlSnapIdOut(0)
+	  , msServerPassword()  /* v15: multiplayer.cfg server_password ("" = open) */
+	  , msJoinPassword()    /* v15: multiplayer.cfg join_password */
+	  , mbAuthSent(false)
+	  , mlGuestViolationsLogged(0)
+	  , mvFreeGuestIds()
+	  , mpVoice(NULL)       /* v16: voice chat (created in Startup) */
+	  , mfMicTestKeepAlive(0.0f)
+	  , mbVoiceEnabled(true)
+	  , mbVoiceOpenMic(false)
+	  , mfVoiceVolume(1.0f)
+	  , mfVoiceGateDb(-45.0f)
+	  , msVoiceCaptureDevice()
 {
 	/* v9: listen to the engine's script-var writes for replication (the
 	   stub build registers too — its NetOnScriptEvent is a no-op) */
@@ -565,8 +1108,11 @@ cNetworkManager::~cNetworkManager()
 {
 	hpl::gpScriptVarNetCallback = NULL;
 	gpNetMgrForScript = NULL;
-	Disconnect();
+	Disconnect(); /* v16: also shuts the voice chat down (AL context still alive: cGame dies later) */
 	ClearGhostsInternal();
+	if (mpVoice)
+		hplDelete(mpVoice);
+	mpVoice = NULL;
 	delete mpBodySync;
 	mpBodySync = NULL;
 	delete mpImpl;
@@ -584,7 +1130,15 @@ void cNetworkManager::RegisterInputActions()
 	inp->AddAction(hplNew(cActionKeyboard, ("MultiplayerHost", inp, eKey_F11)));
 	inp->AddAction(hplNew(cActionKeyboard, ("MultiplayerJoinLocal", inp, eKey_F10)));
 	inp->AddAction(hplNew(cActionKeyboard, ("MultiplayerDiscover", inp, eKey_F9)));
-	Log(" multiplayer: F11=toggle HOST :%u — F10=JOIN 127.0.0.1:%u — F9=LAN discovery — menu Multiplayer · multiplayer.cfg\n",
+	/* Ghost preview keys (only polled with ghost_preview=1). F1/F4/F5/F12 are
+	   the game's, F9-F11 ours; F2/F6/F7/F8 are free. */
+	inp->AddAction(hplNew(cActionKeyboard, ("GhostPreviewNext", inp, eKey_F6)));
+	inp->AddAction(hplNew(cActionKeyboard, ("GhostPreviewPrev", inp, eKey_F7)));
+	inp->AddAction(hplNew(cActionKeyboard, ("GhostPreviewCrouch", inp, eKey_F8)));
+	inp->AddAction(hplNew(cActionKeyboard, ("GhostPreviewTreadmill", inp, eKey_F2)));
+	/* v16: push-to-talk. V is unbound in the vanilla key map. */
+	inp->AddAction(hplNew(cActionKeyboard, ("VoiceTalk", inp, eKey_v)));
+	Log(" multiplayer: F11=toggle HOST :%u — F10=JOIN 127.0.0.1:%u — F9=LAN discovery — V=push-to-talk — menu Multiplayer · multiplayer.cfg\n",
 		(unsigned)mlDefaultPort, (unsigned)mlDefaultPort);
 }
 
@@ -599,12 +1153,23 @@ void cNetworkManager::RegisterInputActions()
    ghost_body_y=-1.65
    Optional single mesh replaces the list:
    ghost_model=mine_barrel.dae
+   Internet server browser (README 'Public servers'):
+   master_server=1.2.3.4:7779    (host:port of a master_server.py; implies public=1)
+   public=0                      (1 = register with the master while hosting)
+   server_password=secret        (guests must know it; listed with [pw])
+   join_password=secret          (presented on join; the browser prompts too)
 
-   Peer PlayerID picks mesh as index (id-1) modulo list length — id 1 => first .dae, id 2 => second.
+   v17: the host assigns each player a character slot (host = 0, guests the lowest
+   free one); a ghost uses mesh index slot modulo list length, one of each per lobby.
+   Without ghost_models/ghost_model every multiplayer/models/<name>.dae with no
+   '_' in <name> and at least one <name>_<clip>.dae sibling is a character,
+   sorted case-insensitively (ResolveGhostModels, run from Startup).
+   v18: character=red (file base name, spaces kept, "" = no preference) is
+   the guest's wanted character, asked for after the join (README 'Characters').
 */
 void cNetworkManager::TryLoadMultiplayerCfg()
 {
-	FILE *fp = fopen("multiplayer.cfg", "r");
+	FILE *fp = fopen(gsMultiplayerCfg.c_str(), "r");
 	if (!fp)
 		return;
 
@@ -618,22 +1183,44 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 		/* server_name may contain spaces, which %255s would cut — take the raw
 		   remainder of the line instead of going through sscanf. */
 		char rawKey[64];
-		if (sscanf(buf, " %63[^=]", rawKey) == 1 && strcmp(rawKey, "server_name") == 0)
+		rawKey[0] = '\0';
+		const bool bHaveKey = (sscanf(buf, " %63[^=]", rawKey) == 1);
+		const bool bServerName = bHaveKey && strcmp(rawKey, "server_name") == 0;
+		const bool bPlayerName = bHaveKey && strcmp(rawKey, "player_name") == 0; /* v13 */
+		const bool bServerPw = bHaveKey && strcmp(rawKey, "server_password") == 0; /* v15 */
+		const bool bJoinPw = bHaveKey && strcmp(rawKey, "join_password") == 0;     /* v15 */
+		const bool bCharacter = bHaveKey && strcmp(rawKey, "character") == 0;      /* v18 */
+		const bool bVoiceDev = bHaveKey && strcmp(rawKey, "voice_capture_device") == 0; /* names have spaces */
+		if (bServerName || bPlayerName || bServerPw || bJoinPw || bCharacter || bVoiceDev)
 		{
 			char *eq = strchr(buf, '=');
-			if (eq && eq[1])
+			size_t ln = 0;
+			char *nm = buf;
+			if (eq)
 			{
-				char *nm = eq + 1;
+				nm = eq + 1;
 				while (*nm == ' ' || *nm == '\t')
 					++nm;
-				size_t ln = strlen(nm);
+				ln = strlen(nm);
 				while (ln > 0 && (nm[ln - 1] == '\n' || nm[ln - 1] == '\r' ||
 								  nm[ln - 1] == ' ' || nm[ln - 1] == '\t'))
 					--ln;
+			}
+			if (bPlayerName)
+				msPlayerName = SanitizePlayerName(hpl::tString(nm, ln)); /* "" = ask in the menu */
+			else if (bServerPw)
+				SetServerPassword(hpl::tString(nm, ln)); /* v15: "" = open server */
+			else if (bJoinPw)
+				SetJoinPassword(hpl::tString(nm, ln));   /* v15: sent on JoinGame */
+			else if (bCharacter)
+				msCharacterPref = SanitizeCharacterName(hpl::tString(nm, ln)); /* v18: "" = no preference */
+			else if (bVoiceDev)
+				msVoiceCaptureDevice = hpl::tString(nm, ln); /* "" = system default */
+			else
+			{
 				if (ln > 31)
 					ln = 31; /* wire field is char[32] */
-				if (ln > 0)
-					msServerName = hpl::tString(nm, ln);
+				msServerName = hpl::tString(nm, ln); /* "" = "<player_name>'s game" */
 			}
 			continue;
 		}
@@ -666,6 +1253,59 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 			ParseCsvFloats(val, mvGhostBodyYList);
 		else if (strcmp(key, "ghost_body_ys_crouch") == 0)
 			ParseCsvFloats(val, mvGhostBodyYCrouchList);
+		else if (strcmp(key, "shared_loot") == 0)
+			mbSharedLoot = (atoi(val) != 0); /* v23: host-enforced */
+		else if (strcmp(key, "friendly_fire") == 0)
+			mbFriendlyFire = (atoi(val) != 0); /* v22: host-enforced */
+		else if (strcmp(key, "ghost_preview") == 0)
+			mbGhostPreview = (atoi(val) != 0);
+		else if (strcmp(key, "ghost_preview_model") == 0)
+		{
+			const int m = atoi(val);
+			mlGhostPreviewModel = (m < 0) ? 0 : m;
+		}
+		else if (strcmp(key, "ghost_anim_trace") == 0)
+			mGhostTuning.mbAnimTrace = (atoi(val) != 0);
+		else if (strcmp(key, "ghost_interp_ms") == 0)
+		{
+			float ms = static_cast<float>(atof(val));
+			if (ms < 0.0f) ms = 0.0f;
+			else if (ms > 250.0f) ms = 250.0f;
+			mGhostTuning.mfInterpDelaySec = ms / 1000.0f;
+		}
+		else if (strcmp(key, "ghost_turn_rate") == 0)
+		{
+			float deg = static_cast<float>(atof(val));
+			if (deg < 30.0f) deg = 30.0f;
+			else if (deg > 3600.0f) deg = 3600.0f;
+			mGhostTuning.mfTurnRateRadPerSec = deg * (kPif / 180.0f);
+		}
+		else if (strncmp(key, "ghost_gait_", 11) == 0)
+		{
+			/* ghost_gait_<clip>=m/s at playback speed 1.0. The six slot names
+			   (walk, run, crouch_walk, walk_back, strafe_walk, strafe_run) set
+			   the clip(s) of that slot; an exact clip name (strafe_walk_l)
+			   overrides one clip. */
+			const char *name = key + 11;
+			const float g = static_cast<float>(atof(val));
+			if (name[0] && g > 0.05f && g < 10.0f)
+			{
+				if (strcmp(name, "strafe_walk") == 0)
+				{
+					mGhostTuning.m_mapGaitOverrides["strafe_walk_l"] = g;
+					mGhostTuning.m_mapGaitOverrides["strafe_walk_r"] = g;
+				}
+				else if (strcmp(name, "strafe_run") == 0)
+				{
+					mGhostTuning.m_mapGaitOverrides["strafe_run_l"] = g;
+					mGhostTuning.m_mapGaitOverrides["strafe_run_r"] = g;
+				}
+				else
+					mGhostTuning.m_mapGaitOverrides[hpl::tString(name)] = g;
+			}
+		}
+		else if (strcmp(key, "coop_respawn") == 0)
+			mbCoopRespawn = (atoi(val) != 0); /* v12: 0 = vanilla death menu online too */
 		else if (strcmp(key, "max_players") == 0)
 		{
 			int mp = atoi(val);
@@ -675,37 +1315,222 @@ void cNetworkManager::TryLoadMultiplayerCfg()
 				mp = 31;
 			mlMaxPlayers = (uint8_t)mp;
 		}
+		/* Internet server browser (master server) — README 'Public servers'. */
+		else if (strcmp(key, "master_server") == 0)
+		{
+			msMasterServer = val;
+			if (!mbPublicExplicit)
+				mbPublic = true; /* naming a master is opting in, unless public=0 says otherwise */
+		}
+		else if (strcmp(key, "public") == 0)
+		{
+			mbPublic = atoi(val) != 0;
+			mbPublicExplicit = true;
+		}
+		/* server_password= / join_password= are raw-line keys handled above (v15) */
+		/* v16 voice chat */
+		else if (strcmp(key, "voice_enabled") == 0)
+			mbVoiceEnabled = (atoi(val) != 0);
+		else if (strcmp(key, "voice_open_mic") == 0)
+			mbVoiceOpenMic = (atoi(val) != 0);
+		else if (strcmp(key, "voice_volume") == 0)
+		{
+			float v = static_cast<float>(atof(val));
+			if (v < 0.0f) v = 0.0f;
+			else if (v > 2.0f) v = 2.0f;
+			mfVoiceVolume = v;
+		}
+		else if (strcmp(key, "voice_gate_db") == 0)
+			mfVoiceGateDb = static_cast<float>(atof(val)); /* cVoiceChat clamps -70..-10 */
 	}
 	fclose(fp);
 
 	if (wantHost)
 	{
+		/* v17: hosted at the END of Startup, once ResolveGhostModels has
+		   the final character list (= the player cap, see HostGame) */
 		msDeferredJoinAddress = "";
-		HostGame(mlDefaultPort);
+		mbCfgAutoHost = true;
 	}
+}
+
+/* Character order for EVERY list (v19: ghost_models= included). Slot 0 is
+   the HOST, and the host always plays Philip (file phillip.dae), the game's
+   main character; guests then get the next free character in this order as
+   they join. Characters not listed here follow in their previous order
+   (sorted for auto-discovery, cfg order for ghost_models=); names missing
+   from the list are skipped. v18: guests may pick another free character
+   (character= / the menu's 'Character' line); the display names live in
+   GetCharacterDisplayName. v19: an old ghost_models=malik.dae,phillip.dae
+   made the host Malik — the fixed order now wins over the cfg's. */
+static const char *const kGhostCharacterOrder[] = { "phillip", "fisherman", "red", "malik" };
+
+/* Reorders avPaths into kGhostCharacterOrder; a per-mesh list of the SAME
+   length (ghost_body_ys written entry-for-entry) is permuted with it, a
+   shorter one keeps its modulo meaning. Returns true when anything moved. */
+static bool OrderGhostCharacters(std::vector<tString> &avPaths, std::vector<float> *apStand = NULL,
+	std::vector<float> *apCrouch = NULL)
+{
+	std::vector<size_t> vOrder;
+	std::vector<bool> vUsed(avPaths.size(), false);
+	for (size_t o = 0; o < sizeof(kGhostCharacterOrder) / sizeof(kGhostCharacterOrder[0]); ++o)
+	{
+		for (size_t i = 0; i < avPaths.size(); ++i)
+		{
+			if (vUsed[i])
+				continue;
+			tString sBase = cString::ToLowerCase(cString::SetFileExt(cString::GetFileName(avPaths[i]), ""));
+			if (sBase == kGhostCharacterOrder[o])
+			{
+				vOrder.push_back(i);
+				vUsed[i] = true;
+				break;
+			}
+		}
+	}
+	for (size_t i = 0; i < avPaths.size(); ++i) /* the rest keep their order */
+		if (!vUsed[i])
+			vOrder.push_back(i);
+
+	bool bMoved = false;
+	for (size_t i = 0; i < vOrder.size(); ++i)
+		bMoved = bMoved || (vOrder[i] != i);
+	if (!bMoved)
+		return false;
+	const size_t n = avPaths.size();
+	std::vector<tString> vOut;
+	std::vector<float> vStand, vCrouch;
+	const bool bStand = apStand && apStand->size() == n;
+	const bool bCrouch = apCrouch && apCrouch->size() == n;
+	for (size_t i = 0; i < n; ++i)
+	{
+		vOut.push_back(avPaths[vOrder[i]]);
+		if (bStand)
+			vStand.push_back((*apStand)[vOrder[i]]);
+		if (bCrouch)
+			vCrouch.push_back((*apCrouch)[vOrder[i]]);
+	}
+	avPaths.swap(vOut);
+	if (bStand)
+		apStand->swap(vStand);
+	if (bCrouch)
+		apCrouch->swap(vCrouch);
+	return true;
+}
+
+void cNetworkManager::ResolveGhostModels()
+{
+	hpl::cResources *pRes = (mpInit && mpInit->mpGame) ? mpInit->mpGame->GetResources() : NULL;
+	const char *szSource = "multiplayer.cfg ghost_models";
+
+	if (mvGhostMeshPaths.empty() == false)
+	{
+		/* cfg order, minus what does not exist yet — a cfg naming four
+		   characters works before all four are exported. A per-mesh
+		   grounding list written entry-for-entry against the cfg list loses
+		   the same entries so it stays aligned; a shorter one keeps its
+		   modulo meaning. */
+		const size_t lCfgCount = mvGhostMeshPaths.size();
+		const bool bTrimStand = (mvGhostBodyYList.size() == lCfgCount);
+		const bool bTrimCrouch = (mvGhostBodyYCrouchList.size() == lCfgCount);
+		std::vector<tString> vKeep;
+		std::vector<float> vStand, vCrouch;
+		for (size_t i = 0; i < lCfgCount; ++i)
+		{
+			if (pRes && !GhostModelResolves(pRes, mvGhostMeshPaths[i]))
+			{
+				Log(" multiplayer: ghost_models entry %u '%s' not found - skipped\n",
+					(unsigned)i, mvGhostMeshPaths[i].c_str());
+				continue;
+			}
+			vKeep.push_back(mvGhostMeshPaths[i]);
+			if (bTrimStand)
+				vStand.push_back(mvGhostBodyYList[i]);
+			if (bTrimCrouch)
+				vCrouch.push_back(mvGhostBodyYCrouchList[i]);
+		}
+		if (vKeep.size() != lCfgCount)
+		{
+			if (bTrimStand)
+				mvGhostBodyYList.swap(vStand);
+			if (bTrimCrouch)
+				mvGhostBodyYCrouchList.swap(vCrouch);
+		}
+		mvGhostMeshPaths.swap(vKeep);
+		if (OrderGhostCharacters(mvGhostMeshPaths, &mvGhostBodyYList, &mvGhostBodyYCrouchList))
+			Log(" multiplayer: ghost_models reordered to the fixed character order "
+				"(phillip = the host first) - every machine must agree on who is who\n");
+		if (mvGhostMeshPaths.empty())
+			Log(" multiplayer: no ghost_models entry resolves - looking in %s instead\n", kGhostModelDir);
+	}
+
+	if (mvGhostMeshPaths.empty())
+	{
+		/* No cfg list (the default): every character in the folder, so a new
+		   character is added by dropping <name>.dae + its <name>_*.dae clips
+		   there. ghost_body_ys then index this (priority-ordered) list. */
+		DiscoverGhostCharacters(pRes, kGhostModelDir, mvGhostMeshPaths);
+		szSource = "auto-discovered in multiplayer/models";
+		OrderGhostCharacters(mvGhostMeshPaths);
+	}
+
+	if (mvGhostMeshPaths.empty())
+	{
+		/* Nothing found either (folder missing / not installed): the shipped
+		   pair, as before — a missing mesh leaves the marker light only. */
+		mvGhostMeshPaths.push_back("phillip.dae"); /* v17: host = Philip (kGhostCharacterOrder) */
+		mvGhostMeshPaths.push_back("malik.dae");
+		szSource = "built-in default";
+	}
+
+	Log(" multiplayer: %u character(s) (%s): %s — the host gives every player a different one (slot mod %u)\n",
+		(unsigned)mvGhostMeshPaths.size(), szSource,
+		GhostModelListText(mvGhostMeshPaths).c_str(), (unsigned)mvGhostMeshPaths.size());
+	if (mvGhostMeshPaths.size() < 4)
+		Log(" multiplayer: fewer than 4 characters - a lobby we host holds at most %u player(s) (one per character)\n",
+			(unsigned)GetCharacterCount());
 }
 
 void cNetworkManager::Startup()
 {
 	RegisterInputActions();
 	TryLoadMultiplayerCfg();
-	/* No cfg (fresh install from the zip): default to the SHIPPED models —
-	   otherwise remote players have no mesh at all and render as nothing but
-	   their marker light. Offsets stay AUTO: the 2026-07-18 exports have
-	   their origin exactly at the feet. */
-	if (mvGhostMeshPaths.empty())
-	{
-		mvGhostMeshPaths.push_back("malik.dae");
-		mvGhostMeshPaths.push_back("phillip.dae");
-	}
-	/* Relative to cwd (folder with overture.exe). Drop survivor1.dae / survivor2.dae here — see multiplayer.cfg.example. */
+	/* Relative to cwd (folder with overture.exe). Character meshes + their
+	   <name>_<clip>.dae clips live here — see multiplayer.cfg.example. */
 	if (mpInit && mpInit->mpGame && mpInit->mpGame->GetResources())
-		mpInit->mpGame->GetResources()->AddResourceDir("multiplayer/models");
+		mpInit->mpGame->GetResources()->AddResourceDir(gsGhostModelDir);
+	/* Characters: the cfg list (entries that resolve), else every character
+	   found in multiplayer/models, else the shipped pair. Offsets stay AUTO:
+	   the exports have their origin exactly at the feet. */
+	ResolveGhostModels();
 	/* Remote grabs use the same feel constants as the local grab state. */
 	if (mpInit && mpInit->mpGameConfig)
 		mpBodySync->SetGrabTuning(
 			mpInit->mpGameConfig->GetFloat("Interaction_Grab", "MaxPidForce", 80.0f),
 			mpInit->mpGameConfig->GetFloat("Interaction_Grab", "MaxThrowImpulse", 13.0f));
+	/* v16: the voice object is cheap (no Opus/AL until a session is live —
+	   UpdateVoice). voice_enabled=0 or a build without opus: no object. */
+	if (mpVoice == NULL && mbVoiceEnabled && cVoiceChat::IsCompiledIn())
+	{
+		mpVoice = hplNew(cVoiceChat, ());
+		mpVoice->SetEnabled(true);
+		mpVoice->SetOpenMic(mbVoiceOpenMic);
+		mpVoice->SetVolume(mfVoiceVolume);
+		mpVoice->SetOpenMicThresholdDb(mfVoiceGateDb);
+		mpVoice->SetCaptureDevice(msVoiceCaptureDevice);
+		Log(" multiplayer: voice chat on (hold V to talk%s, voice_volume=%.2f)\n",
+			mbVoiceOpenMic ? " — voice_open_mic=1: level-gated open mic" : "", mfVoiceVolume);
+	}
+	else if (cVoiceChat::IsCompiledIn())
+		Log(" multiplayer: voice chat off (voice_enabled=0)\n");
+	else
+		Log(" multiplayer: voice chat NOT in this build (compiled without PENUMBRA_VOICE / opus)\n");
+	/* v17: cfg host=1, now that the character list (the player cap) is final */
+	if (mbCfgAutoHost)
+	{
+		mbCfgAutoHost = false;
+		HostGame(mlDefaultPort);
+	}
 }
 
 //-----------------------------------------------------------------------
@@ -975,14 +1800,29 @@ void cNetworkManager::HandleBodyIntent(uint8_t alAuthor, const void *apData, siz
 void cNetworkManager::ClearGhostsInternal()
 {
 	m_mapGhostSeq.clear(); /* new session, new counters */
+	m_mapGhostMoveState.clear();
+	m_mapGhostHealth.clear();
+	m_mapPlayerNames.clear(); /* v13: names + "joined" bookkeeping are per session */
+	m_setJoinAnnounced.clear();
+	m_mapPlayerSlots.clear(); /* v17: slots are per session (HostGame re-seeds id 1 = slot 0) */
+	mlSlotWarned = 0;
+	if (mpVoice)
+		mpVoice->DropAllPlayers(); /* v16: every remote decoder + AL source */
 	for (std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
 		hplDelete(it->second);
 	m_mapGhosts.clear();
+	DestroyPreviewGhost(false); /* respawns on the next Update if still enabled */
 }
 
 void cNetworkManager::DropRemotePlayer(uint8_t id)
 {
 	m_mapGhostSeq.erase(id); /* a rejoiner restarts its counter */
+	m_mapGhostMoveState.erase(id);
+	m_mapGhostHealth.erase(id); /* v12: gone = not alive for the respawn rule */
+	ForgetPlayerName(id);       /* v13: "<name> left" + name table entry */
+	m_mapPlayerSlots.erase(id); /* v17: host = the character slot is free again */
+	if (mpVoice)
+		mpVoice->DropPlayer(id); /* v16: decoder + AL source freed */
 	std::map<uint8_t, cGhostPlayer *>::iterator it = m_mapGhosts.find(id);
 	if (it != m_mapGhosts.end())
 	{
@@ -997,78 +1837,13 @@ void cNetworkManager::EnsureGhost(uint8_t id)
 		return;
 	if (m_mapGhosts.find(id) != m_mapGhosts.end())
 		return;
-	const hpl::tString &mesh = GhostMeshPathForId(mvGhostMeshPaths, id);
-	/* Feet-on-ground by construction: the player camera sits at
-	 *   feetY + bodySize.y/2 + CameraHeightAdd            (Player.cpp:376,968)
-	 * with bodySize.y = Player/Height standing, Player/CrouchHeight crouched
-	 * (Player.cpp:71-80,989). The ghost mesh origin is at its feet, so
-	 * cameraY - (H/2 + add) grounds it exactly, using the SAME game.cfg
-	 * values that position the player. multiplayer.cfg keys stay as
-	 * explicit overrides (any value < 9000 wins). */
-	const float fCamAdd  = mpInit->mpGameConfig->GetFloat("Player", "CameraHeightAdd", 0);
-	const float fStandH  = mpInit->mpGameConfig->GetFloat("Player", "Height", 1.9f);
-	const float fCrouchH = mpInit->mpGameConfig->GetFloat("Player", "CrouchHeight", 1.0f);
-	/* EMPIRICAL +0.71: the camera rides ~0.71 m HIGHER above the feet than
-	   the H/2+add guess. Measured by four rounds of user eyeball-tuning
-	   ("auto" -0.74 -> -1.45 grounded) against clip files that verify as
-	   perfectly grounded (FK toes at 0.000 m) — so the discrepancy is in
-	   this formula, not the models. Crouch agrees: -(0.475-0.085)-0.71 =
-	   -1.10, the user-approved crouch value. (A further -5 cm was tried and
-	   REVERTED: in-game the mesh visibly sank shin-deep — 0.71 is the value
-	   that matches the verified-grounded clips.) */
-	const float kCamFeetCorrection = 0.71f;
-	float fStandOffset = (mfGhostMeshBodyYOffset > 9000.0f)
-		? -(fStandH * 0.5f + fCamAdd + kCamFeetCorrection)
-		: mfGhostMeshBodyYOffset;
-	float fCrouchOffset = (mfGhostMeshBodyYOffsetCrouch > 9000.0f)
-		? -(fCrouchH * 0.5f + fCamAdd + kCamFeetCorrection)
-		: mfGhostMeshBodyYOffsetCrouch;
-	/* Per-mesh overrides: different rigs ground at different heights. Indexed
-	   like the mesh list; a stand list alone keeps the stand->crouch delta. */
-	if (mvGhostMeshPaths.empty() == false && mvGhostBodyYList.empty() == false)
-	{
-		const size_t lMeshIdx = (size_t)(id - 1) % mvGhostMeshPaths.size();
-		const float fPerMesh = mvGhostBodyYList[lMeshIdx % mvGhostBodyYList.size()];
-		fCrouchOffset += fPerMesh - fStandOffset;
-		fStandOffset = fPerMesh;
-		if (mvGhostBodyYCrouchList.empty() == false)
-			fCrouchOffset = mvGhostBodyYCrouchList[lMeshIdx % mvGhostBodyYCrouchList.size()];
-	}
-	m_mapGhosts[id] =
-		hplNew(cGhostPlayer, (mpWorld, id, mesh, fStandOffset, fCrouchOffset));
-}
-
-bool cNetworkManager::BuildLocalSnapshot(cNetPlayerState *apOut) const
-{
-	if (!apOut || !mpInit || !mpInit->mpPlayer)
-		return false;
-	cCamera3D *cam = mpInit->mpPlayer->GetCamera();
-	if (!cam)
-		return false;
-
-	cVector3f p = cam->GetPosition();
-	apOut->mType = eNetPacketType_PlayerState;
-	apOut->mPlayerID = mlLocalPlayerId;
-	apOut->mfPosX = p.x;
-	apOut->mfPosY = p.y;
-	apOut->mfPosZ = p.z;
-	apOut->mfPitch = cam->GetPitch();
-	apOut->mfYaw = cam->GetYaw();
-	cPlayerFlashLight *fl = mpInit->mpPlayer->GetFlashLight();
-	apOut->mbFlashlightOn = (uint8_t)(fl && fl->IsActive() && !fl->IsDisabled());
-	/* Engine -> wire stance mapping, explicit per state so an engine enum
-	   reorder cannot silently change the protocol (the wire values are frozen
-	   — see eNetMoveState). Unknown states go out as Run. */
-	switch (mpInit->mpPlayer->GetMoveState())
-	{
-	case ePlayerMoveState_Walk:   apOut->mMoveState = eNetMoveState_Walk;   break;
-	case ePlayerMoveState_Run:    apOut->mMoveState = eNetMoveState_Run;    break;
-	case ePlayerMoveState_Still:  apOut->mMoveState = eNetMoveState_Still;  break;
-	case ePlayerMoveState_Jump:   apOut->mMoveState = eNetMoveState_Jump;   break;
-	case ePlayerMoveState_Crouch: apOut->mMoveState = eNetMoveState_Crouch; break;
-	default:                      apOut->mMoveState = eNetMoveState_Run;    break;
-	}
-	return mlLocalPlayerId != 0;
+	/* v17: the host-assigned character slot picks the mesh (slot mod list
+	   length — the sorted list is the same on every machine); until the
+	   host's table told us the slot, (id-1) mod length, and
+	   OnPlayerSlotReceived rebuilds the ghost if that guess was wrong. */
+	cGhostPlayer *pGhost = CreateGhost(id, GhostMeshIndexFor(id));
+	if (pGhost)
+		m_mapGhosts[id] = pGhost;
 }
 
 void cNetworkManager::DispatchIncoming(const void *data, size_t len)
@@ -1076,6 +1851,20 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 	if (!data || len < sizeof(cNetPlayerJoin))
 		return;
 	uint8_t t = *(const uint8_t *)data;
+
+	if (t == eNetPacketType_Challenge)
+	{
+		/* v15, guest side: the host's FIRST packet — answer it (once) */
+		if (!mbHosting && len >= sizeof(cNetChallenge))
+		{
+			cNetChallenge ch;
+			memcpy(&ch, data, sizeof(ch));
+			SendAuthResponse(ch);
+		}
+		return;
+	}
+	if (t == eNetPacketType_Auth)
+		return; /* v15: host-only, consumed in Service before any dispatch */
 
 	if (t == eNetPacketType_VersionAck && len >= sizeof(cNetVersionAck))
 	{
@@ -1111,6 +1900,26 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		mlLocalPlayerId = pj->mPlayerID;
 		mbHadJoinPacket = true;
 		Log(" multiplayer: local PlayerID=%u\n", (unsigned)mlLocalPlayerId);
+		mfSinceJoinSeconds = 0; /* v13: the table that follows is the existing party */
+		SendLocalName();        /* v13: we know our id now — tell the host who we are */
+		SendCharacterRequest(); /* v18: ...and whom we want to play (no-op without character=) */
+		return;
+	}
+
+	if (t == eNetPacketType_PlayerName)
+	{
+		/* v13, guest side: one entry of the host's table. (The host takes a
+		   guest's name in Service with the PEER's id, never from here.) */
+		if (!mbHosting && len >= sizeof(cNetPlayerName))
+		{
+			const cNetPlayerName *pn = (const cNetPlayerName *)data;
+			size_t lChar = 0; /* v19: bounded, the field need not end in NUL */
+			while (lChar < sizeof(pn->msCharacter) && pn->msCharacter[lChar] != '\0')
+				++lChar;
+			OnPlayerSlotReceived(pn->mPlayerID, pn->mCharacter, /* v17, ours included */
+				SanitizeCharacterName(hpl::tString(pn->msCharacter, lChar)));
+			OnPlayerNameReceived(pn->mPlayerID, pn->msName, sizeof(pn->msName));
+		}
 		return;
 	}
 
@@ -1118,6 +1927,20 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 	{
 		const cNetPlayerLeave *lv = (const cNetPlayerLeave *)data;
 		DropRemotePlayer(lv->mPlayerID);
+		return;
+	}
+
+	if (t == eNetPacketType_Voice)
+	{
+		/* v16: guest side = the host's own voice (id 1) or a relayed guest
+		   (author stamped by the host); host side = arrives via RelayVoice
+		   with the peer id stamped. cVoiceChat validates the frame table. */
+		if (mpVoice && len >= sizeof(cNetVoice))
+		{
+			cNetVoice hdr;
+			memcpy(&hdr, data, sizeof(hdr));
+			mpVoice->OnVoicePacket(hdr.mPlayerID, data, len);
+		}
 		return;
 	}
 
@@ -1134,8 +1957,27 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		{
 			cNetBodyCensus census;
 			memcpy(&census, data, sizeof(census));
+			const bool bNewGen = !mpBodySync->HasRemoteCensus() ||
+				mpBodySync->GetRemoteMapGen() != census.mMapGen;
 			mpBodySync->OnCensusReceived(census);
+			if (bNewGen)
+				mbEnemySeqInKnown = false; /* v14 (5c): host reloaded — its enemy seq restarted */
+			/* v14 hook 2: we already stand in a world (census taken) and the
+			   host just (re)announced its own — reconnect while in-game, or
+			   a host save/load on the same map. Ask for the world state. */
+			if (mpBodySync->HasCensus())
+				SendMapReady();
 		}
+		return;
+	}
+
+	if (t == eNetPacketType_MapReady)
+		return; /* v14: host-only, answered in Service (needs the peer) */
+
+	if (t == eNetPacketType_WorldSnapshot)
+	{
+		if (!mbHosting)
+			HandleSnapshotChunk(data, len);
 		return;
 	}
 
@@ -1204,6 +2046,19 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		return;
 	}
 
+	if (t == eNetPacketType_PlayerHit)
+	{
+		/* guests only: the host already applied or routed it (HostRoutePlayerHit) */
+		if (!mbHosting && len >= sizeof(cNetPlayerHit))
+		{
+			cNetPlayerHit hit;
+			memcpy(&hit, data, sizeof(hit));
+			if (hit.mTargetID == mlLocalPlayerId)
+				ApplyPlayerHit(hit);
+		}
+		return;
+	}
+
 	if (t == eNetPacketType_PlayerDamage)
 	{
 		if (!mbHosting && len >= sizeof(cNetPlayerDamage) && mpInit && mpInit->mpPlayer)
@@ -1240,6 +2095,9 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 			if (ip.msItemName[0] != 0)
 				m_setPartyItems.insert(tString(ip.msItemName)); /* the party has it */
 			ApplyTakenItems(); /* now if we are on that map; else on its load */
+			ip.msFile[sizeof(ip.msFile) - 1] = 0;
+			if (ip.mbGive && ip.msItemName[0] != 0 && ip.msFile[0] != 0)
+				GiveSharedItem(tString(ip.msItemName), tString(ip.msFile), -1); /* v23 */
 		}
 		return;
 	}
@@ -1277,6 +2135,24 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 			if (se.mOp == eNetScriptOp_RemoveItem)
 				m_setPartyItems.erase(tString(se.msName)); /* consumed for everyone */
 			NetApplyScriptEvent((int)se.mOp, tString(se.msName), (int)se.mlVal);
+			/* v14 (5b): the host is the single authority for Add ops — after
+			   applying a guest's delta, broadcast the absolute value so the
+			   author and every other guest land on the same number. */
+			if (mbHosting && mpInit && mpInit->mpGame &&
+				(se.mOp == eNetScriptOp_LocalVarAdd || se.mOp == eNetScriptOp_GlobalVarAdd))
+			{
+				cScene *pScene = mpInit->mpGame->GetScene();
+				cScriptVar *pVar = pScene ? ((se.mOp == eNetScriptOp_LocalVarAdd) ?
+					pScene->GetLocalVar(tString(se.msName)) : pScene->GetGlobalVar(tString(se.msName))) : NULL;
+				if (pVar)
+				{
+					cNetScriptEvent setPkt = se;
+					setPkt.mOp = (se.mOp == eNetScriptOp_LocalVarAdd) ?
+						(uint8_t)eNetScriptOp_LocalVarSet : (uint8_t)eNetScriptOp_GlobalVarSet;
+					setPkt.mlVal = (int32_t)pVar->mlVal;
+					SendReliableEvent(&setPkt, sizeof(setPkt));
+				}
+			}
 		}
 		return;
 	}
@@ -1295,10 +2171,21 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 			return;
 		m_mapGhostSeq[st->mPlayerID] = st->mSeq;
 	}
+	/* v12: mirrored health per id (both roles) — kept outside the ghost
+	   entity so it survives our own map change (ghosts are rebuilt). */
+	{
+		const uint8_t lHealth =
+			(st->mFlags & eNetPlayerFlag_Dead) ? (uint8_t)0 :
+			((st->mHealth > 100) ? (uint8_t)100 : st->mHealth);
+		NotePartyHealth(st->mPlayerID, lHealth); /* v13: "died" / "respawned" feed lines */
+		m_mapGhostHealth[st->mPlayerID] = lHealth;
+	}
 	EnsureGhost(st->mPlayerID);
 	std::map<uint8_t, cGhostPlayer *>::iterator gi = m_mapGhosts.find(st->mPlayerID);
 	if (gi != m_mapGhosts.end())
 		gi->second->ApplyState(*st);
+	if (mbHosting)
+		m_mapGhostMoveState[st->mPlayerID] = st->mMoveState; /* enemy senses: stealth + hearing (GetGhostSense) */
 
 	/* Spawn-at-friend: the first HOST state after the census verifies (same
 	   map, same identities) teleports the joining guest to the host's side.
@@ -1320,8 +2207,9 @@ void cNetworkManager::DispatchIncoming(const void *data, size_t len)
 		mpInit->mpPlayer->GetCharacterBody())
 	{
 		mbSpawnedAtHost = true;
-		/* wire pos is the host CAMERA; feet = cam - stand eye height */
-		cVector3f vFeet(st->mfPosX, st->mfPosY - 1.50f + 0.25f, st->mfPosZ);
+		/* v11: wire Y is the host's FEET already (a hair up so the capsule
+		   never starts intersecting the floor) */
+		cVector3f vFeet(st->mfPosX, st->mfPosY + 0.05f, st->mfPosZ);
 		iCharacterBody *pBody = mpInit->mpPlayer->GetCharacterBody();
 		const cVector3f vCur = pBody->GetFeetPosition();
 		const cVector3f vD = vFeet - vCur;
@@ -1350,7 +2238,7 @@ void cNetworkManager::EmitLocalSnapshots()
 		for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 		{
 			ENetPeer *pd = &mpImpl->mpHost->peers[i];
-			if (pd->state != ENET_PEER_STATE_CONNECTED)
+			if (!PeerLive(pd)) /* v15: accepted peers only */
 				continue;
 			ENetPacket *pkt = enet_packet_create(&st, sizeof(st), ENET_PACKET_FLAG_UNSEQUENCED);
 			if (pkt)
@@ -1381,7 +2269,7 @@ void cNetworkManager::EmitObjectStates()
 	bool bAnyPeer = false;
 	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 	{
-		if (mpImpl->mpHost->peers[i].state == ENET_PEER_STATE_CONNECTED)
+		if (PeerLive(&mpImpl->mpHost->peers[i])) /* v15: accepted peers only */
 		{
 			bAnyPeer = true;
 			break;
@@ -1400,7 +2288,7 @@ void cNetworkManager::EmitObjectStates()
 	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 	{
 		ENetPeer *pd = &mpImpl->mpHost->peers[i];
-		if (pd->state != ENET_PEER_STATE_CONNECTED)
+		if (!PeerLive(pd))
 			continue;
 		if (lMovingLen > 0)
 			SendStructToPeer(pd, aMoving, lMovingLen, false); /* next tick replaces a loss */
@@ -1420,7 +2308,7 @@ void cNetworkManager::SendCensus(ENetPeer *apOnlyTo)
 	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 	{
 		ENetPeer *pd = &mpImpl->mpHost->peers[i];
-		if (pd->state != ENET_PEER_STATE_CONNECTED)
+		if (!PeerLive(pd)) /* v15: accepted peers only */
 			continue;
 		if (apOnlyTo && pd != apOnlyTo)
 			continue;
@@ -1444,54 +2332,53 @@ void cNetworkManager::Service(int timeoutMs)
 		case ENET_EVENT_TYPE_CONNECT:
 			if (mbHosting)
 			{
+				char sWho[64];
+				FormatPeerAddr(ev.peer, sWho, sizeof(sWho));
+				mpImpl->m_mapGuards.erase(ev.peer); /* v15: a reused slot starts clean */
+				PeerSetId(ev.peer, 0);
 				if (ev.data != kNetConnectData)
 				{
 					/* old exe (sends 0) or foreign client — refuse BEFORE any
 					   state flows; half-compatible is the worst outcome */
-					Log(" multiplayer: REFUSED incompatible peer (connect data 0x%08X, want 0x%08X)\n",
-						(unsigned)ev.data, (unsigned)kNetConnectData);
+					Log(" multiplayer: REFUSED incompatible peer %s (connect data 0x%08X, want 0x%08X)\n",
+						sWho, (unsigned)ev.data, (unsigned)kNetConnectData);
 					enet_peer_disconnect(ev.peer, kNetDisconnectBadVersion);
 					break;
 				}
-				if (mlNextGuestId == 0)
+				/* v15: max_players at CONNECT. Every connected slot counts —
+				   accepted or still answering the challenge — so a burst of
+				   half-open joins cannot exceed the cap either. ev.peer is
+				   already CONNECTED here, hence the "- 1". v17: the cap is
+				   min(max_players, characters) — one character each, so a
+				   free character slot always exists for whoever gets in. */
 				{
-					Log(" multiplayer: guest id overflow\n");
-					break;
-				}
-				uint8_t aid = mlNextGuestId++;
-				PeerSetId(ev.peer, aid);
-				{
-					/* FIRST reliable packet: proves we speak their protocol
-					   (their join-handler refuses old hosts that skip this) */
-					cNetVersionAck ack;
-					ack.mType = eNetPacketType_VersionAck;
-					ack.mlVersion = kNetProtocolVersion;
-					SendStructToPeer(ev.peer, &ack, sizeof(ack), true);
-				}
-				SendPlayerJoin(ev.peer, aid);
-				SendCensus(ev.peer); /* late joiner gets the map-load census now */
-				SendMapBeacon(ev.peer); /* ...and where the party is, so a guest
-				    sitting in the menu launches straight into our map */
-				/* ...and one reliable full snapshot, so a mid-game joiner
-				   starts from the host's exact current poses instead of the
-				   map defaults (rung 2). Chunked to stay under MTU. */
-				{
-					unsigned char aSnapBuf[cBodySync::kMaxBatchBytes];
-					uint32_t lCursor = 0;
-					int lChunks = 0;
-					size_t lLen;
-					while ((lLen = mpBodySync->BuildSnapshotChunk(aSnapBuf, &lCursor)) != 0)
+					const int lOthers = CountConnectedPeers(false) - 1;
+					const unsigned lCap = (unsigned)GetMaxPlayers();
+					if (lOthers >= (int)lCap - 1 ||
+						(mvFreeGuestIds.empty() && mlNextGuestId >= kPreviewGhostId))
 					{
-						ENetPacket *sp = enet_packet_create(aSnapBuf, lLen, ENET_PACKET_FLAG_RELIABLE);
-						if (sp)
-							enet_peer_send(ev.peer, 0, sp);
-						++lChunks;
+						Log(" multiplayer: REFUSED peer %s - server full (%d/%u guests, cap %u = min(max_players %u, %u characters))\n",
+							sWho, lOthers, lCap - 1u, lCap, (unsigned)mlMaxPlayers, (unsigned)GetCharacterCount());
+						enet_peer_disconnect(ev.peer, kNetDisconnectFull);
+						break;
 					}
-					if (lChunks > 0)
-						Log(" multiplayer: full body snapshot -> peer id=%u (%d chunk(s))\n",
-							(unsigned)aid, lChunks);
 				}
-				Log(" multiplayer: peer connected id=%u\n", (unsigned)aid);
+				/* v15: challenge FIRST. The peer gets no id, no VersionAck, no
+				   PlayerJoin, no census/beacon/name table and nothing from the
+				   send loops until its cNetAuth is accepted (HostAcceptPeer);
+				   anything else it sends meanwhile is dropped, and silence
+				   is a disconnect after kNetAuthTimeoutSeconds. */
+				{
+					Impl::cPeerGuard &guard = mpImpl->m_mapGuards[ev.peer];
+					guard = Impl::cPeerGuard();
+					MakeNonce(ev.peer, guard.mNonce);
+					cNetChallenge ch;
+					ch.mType = eNetPacketType_Challenge;
+					memcpy(ch.mNonce, guard.mNonce, sizeof(ch.mNonce));
+					SendStructToPeer(ev.peer, &ch, sizeof(ch), true);
+				}
+				Log(" multiplayer: peer %s connected - challenge sent, waiting for auth%s\n",
+					sWho, msServerPassword.empty() ? " (open server)" : " (password)");
 			}
 			else if (ev.peer == mpImpl->mpServerPeer)
 			{
@@ -1508,9 +2395,27 @@ void cNetworkManager::Service(int timeoutMs)
 					msJoinFailReason = "Host REFUSED: version mismatch - you both need the same zip.";
 					Log(" multiplayer: host refused us - version mismatch\n");
 				}
+				else if (ev.data == kNetDisconnectBadAuth) /* v15 */
+				{
+					msJoinFailReason = mbAuthSent ?
+						"Host REFUSED: wrong password." :
+						"Host REFUSED: no password answer in time - check your connection.";
+					Log(" multiplayer: host refused us - bad auth (answer sent: %d)\n", mbAuthSent ? 1 : 0);
+				}
+				else if (ev.data == kNetDisconnectFull) /* v15 */
+				{
+					msJoinFailReason = "Host REFUSED: the server is full (one player per character).";
+					Log(" multiplayer: host refused us - server full\n");
+				}
+				else if (ev.data == kNetDisconnectKicked) /* v15 */
+				{
+					msJoinFailReason = "Host dropped us: too many bad packets (see hpl.log on the host).";
+					Log(" multiplayer: host kicked us - protocol violations\n");
+				}
 				Log(" multiplayer: host disconnected\n");
 				mbClientConnected = false;
 				mbHadJoinPacket = false;
+				mbAuthSent = false; /* v15: a reconnect gets a new challenge */
 				mlLocalPlayerId = 0;
 				mpImpl->mpServerPeer = NULL;
 				ClearGhostsInternal();
@@ -1519,16 +2424,15 @@ void cNetworkManager::Service(int timeoutMs)
 			{
 				uint8_t gone = PeerGetId(ev.peer);
 				if (gone)
+					HostForgetGuest(ev.peer, gone); /* v17: + its character slot */
+				else
 				{
-					BlastLeaves(mpImpl->mpHost, gone, ev.peer);
-					DropRemotePlayer(gone);
-					/* rung 3: a vanished guest drops whatever it held */
-					int lFreed = mpBodySync->ReleaseAllHeldBy(gone);
-					if (lFreed > 0)
-						Log(" multiplayer: guest %u left holding %d object(s) — released\n",
-							(unsigned)gone, lFreed);
+					char sWho[64];
+					FormatPeerAddr(ev.peer, sWho, sizeof(sWho));
+					Log(" multiplayer: unaccepted peer %s gone\n", sWho);
 				}
 				PeerSetId(ev.peer, 0);
+				mpImpl->m_mapGuards.erase(ev.peer); /* v15: per-peer state dies with the slot */
 			}
 			break;
 
@@ -1538,17 +2442,68 @@ void cNetworkManager::Service(int timeoutMs)
 			if (!pk || pk->dataLength == 0)
 				break;
 
+			const uint8_t lFirst = *(const uint8_t *)pk->data;
 			if (mbHosting)
 			{
-				uint8_t author = PeerGetId(ev.peer);
-				const uint8_t lFirst = *(const uint8_t *)pk->data;
+				/* v15 gate, in this order: a known, not-refused peer ->
+				   authenticated (until then only cNetAuth is looked at) ->
+				   reliable rate limit -> role table -> payload validation,
+				   which clamps IN PLACE so the relays below forward the
+				   sanitised bytes. Every failure is a strike (NoteViolation);
+				   kNetMaxStrikes = kNetDisconnectKicked. */
+				std::map<const ENetPeer *, Impl::cPeerGuard>::iterator gi = mpImpl->m_mapGuards.find(ev.peer);
+				Impl::cPeerGuard *pGuard = (gi != mpImpl->m_mapGuards.end()) ? &gi->second : NULL;
+				if (pGuard == NULL || pGuard->mbRefused)
+				{
+					enet_packet_destroy(pk); /* refused at CONNECT / kicked / unknown slot */
+					break;
+				}
+				if (!pGuard->mbAuthed)
+				{
+					if (lFirst == eNetPacketType_Auth && (size_t)pk->dataLength >= sizeof(cNetAuth))
+					{
+						cNetAuth auth;
+						memcpy(&auth, pk->data, sizeof(auth));
+						HostAcceptPeer(ev.peer, auth);
+					}
+					else
+						NoteViolation(ev.peer, lFirst, "packet before authentication");
+					enet_packet_destroy(pk);
+					break;
+				}
+				if (ev.channelID == 0)
+				{
+					++pGuard->mlReliableInWindow;
+					if (pGuard->mlReliableInWindow > kNetMaxReliablePerSec)
+					{
+						if (!pGuard->mbRateStruck)
+						{
+							pGuard->mbRateStruck = true;
+							NoteViolation(ev.peer, lFirst, "reliable packet flood");
+						}
+						enet_packet_destroy(pk);
+						break;
+					}
+				}
+				if (!IsAllowedFrom(lFirst, false))
+				{
+					NoteViolation(ev.peer, lFirst, "type not allowed from a guest");
+					enet_packet_destroy(pk);
+					break;
+				}
+				if (!ValidateGuestPacket(ev.peer, pk->data, (size_t)pk->dataLength))
+				{
+					NoteViolation(ev.peer, lFirst, "malformed or out-of-bounds payload");
+					enet_packet_destroy(pk);
+					break;
+				}
+				const uint8_t author = PeerGetId(ev.peer); /* >= 2: accepted above */
 				if (lFirst >= eNetPacketType_BodyGrabBegin && lFirst <= eNetPacketType_BodyPush)
 				{
 					/* rung 3 intent needs to know WHICH guest sent it */
 					HandleBodyIntent(author, pk->data, (size_t)pk->dataLength);
 				}
-				else if ((size_t)pk->dataLength >= sizeof(cNetPlayerState) &&
-					lFirst == eNetPacketType_PlayerState && author >= 2)
+				else if (lFirst == eNetPacketType_PlayerState && author >= 2)
 				{
 					cNetPlayerState relay;
 					memcpy(&relay, pk->data, sizeof(relay));
@@ -1556,7 +2511,7 @@ void cNetworkManager::Service(int timeoutMs)
 					for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 					{
 						ENetPeer *dst = &mpImpl->mpHost->peers[i];
-						if (dst == ev.peer || dst->state != ENET_PEER_STATE_CONNECTED)
+						if (dst == ev.peer || !PeerLive(dst)) /* v15: accepted peers only */
 							continue;
 						ENetPacket *rp =
 							enet_packet_create(&relay, sizeof(relay), ENET_PACKET_FLAG_UNSEQUENCED);
@@ -1565,26 +2520,113 @@ void cNetworkManager::Service(int timeoutMs)
 					}
 					DispatchIncoming(&relay, sizeof(relay));
 				}
+				else if (author >= 2 && lFirst == eNetPacketType_PlayerName &&
+					(size_t)pk->dataLength >= sizeof(cNetPlayerName))
+				{
+					/* v13: a guest's name — trusted by PEER id, not by the
+					   id byte in the packet; then the whole table goes out */
+					const cNetPlayerName *pn = (const cNetPlayerName *)pk->data;
+					OnPlayerNameReceived(author, pn->msName, sizeof(pn->msName));
+					SendNameTable(NULL);
+				}
+				else if (author >= 2 && lFirst == eNetPacketType_CharacterRequest)
+				{
+					/* v18: guest-only type (IsAllowedFrom), validated above;
+					   the peer id is the requester, never a packet byte */
+					HostHandleCharacterRequest(ev.peer, author, pk->data, (size_t)pk->dataLength);
+				}
+				else if (author >= 2 && lFirst == eNetPacketType_PlayerHit)
+				{
+					/* v22: friendly fire — the host decides and routes */
+					HostRoutePlayerHit(author, pk->data, (size_t)pk->dataLength);
+				}
+				else if (author >= 2 && lFirst == eNetPacketType_MapReady)
+				{
+					/* v14: needs the peer to answer with the snapshot */
+					HandleMapReady(ev.peer, pk->data, (size_t)pk->dataLength);
+				}
+				else if (author >= 2 && lFirst == eNetPacketType_Voice)
+				{
+					/* v16: author stamped from the PEER (never trusted from
+					   the packet), relayed unsequenced to the other guests */
+					RelayVoice(ev.peer, author, pk->data, (size_t)pk->dataLength);
+				}
+				else if (author >= 2 && lFirst == eNetPacketType_MapChange && IsHostMapBusy())
+				{
+					/* Host wins: we are armed, following, fading or not
+					   settled on a world yet. Neither applied nor relayed,
+					   so every MapChange a guest receives is where the HOST
+					   goes; the requester, still mid-transition, defers the
+					   host's announcement/beacon and follows it on landing. */
+					Log(" multiplayer: guest %u level transition refused - host is mid-transition (beacon follows once settled)\n",
+						(unsigned)author);
+					mbBeaconAfterTransition = true;
+				}
 				else if (author >= 2 && (lFirst == eNetPacketType_MapChange ||
 					lFirst == eNetPacketType_ItemPickup ||
 					lFirst == eNetPacketType_ItemDrop ||
 					lFirst == eNetPacketType_ScriptEvent ||
 					lFirst == eNetPacketType_EntityDamage))
 				{
-					for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+					/* v14 (5b): a guest's var ADD is not relayed blindly — the
+					   host applies it and broadcasts the resulting absolute
+					   Set (DispatchIncoming), so every machine converges. */
+					bool bRelay = true;
+					if (lFirst == eNetPacketType_ScriptEvent &&
+						(size_t)pk->dataLength >= sizeof(cNetScriptEvent))
+					{
+						cNetScriptEvent peek;
+						memcpy(&peek, pk->data, sizeof(peek));
+						if (peek.mOp == eNetScriptOp_LocalVarAdd || peek.mOp == eNetScriptOp_GlobalVarAdd)
+							bRelay = false;
+					}
+					/* v23: a guest's pickup carries OUR shared-loot rule onward */
+					const void *pOut = pk->data;
+					size_t lOut = (size_t)pk->dataLength;
+					cNetItemPickup ipStamped;
+					if (lFirst == eNetPacketType_ItemPickup && lOut >= sizeof(cNetItemPickup))
+					{
+						memcpy(&ipStamped, pk->data, sizeof(ipStamped));
+						ipStamped.mbGive = mbSharedLoot ? 1 : 0;
+						pOut = &ipStamped;
+						lOut = sizeof(ipStamped);
+					}
+					for (size_t i = 0; bRelay && i < mpImpl->mpHost->peerCount; ++i)
 					{
 						ENetPeer *dst = &mpImpl->mpHost->peers[i];
-						if (dst == ev.peer || dst->state != ENET_PEER_STATE_CONNECTED)
+						if (dst == ev.peer || !PeerLive(dst)) /* v15: accepted peers only */
 							continue;
-						SendStructToPeer(dst, pk->data, (size_t)pk->dataLength, true);
+						SendStructToPeer(dst, pOut, lOut, true);
 					}
-					DispatchIncoming(pk->data, (size_t)pk->dataLength);
+					DispatchIncoming(pOut, lOut);
 				}
 				else
 					DispatchIncoming(pk->data, (size_t)pk->dataLength);
 			}
 			else
-				DispatchIncoming(pk->data, (size_t)pk->dataLength);
+			{
+				/* v15 guest side: the host is the game's authority, but its
+				   packets still pass the role table and the shape/bounds
+				   checks (ValidateEventPacket clamps in place) — a hostile
+				   host cannot make us load "..\\x.dae" or spawn from a path.
+				   Log once per type per connection, no strikes: we simply
+				   drop what we do not understand. */
+				bool bOk = IsAllowedFrom(lFirst, true);
+				if (bOk)
+					bOk = ValidateEventPacket(pk->data, (size_t)pk->dataLength, true);
+				if (bOk)
+					DispatchIncoming(pk->data, (size_t)pk->dataLength);
+				else
+				{
+					const unsigned lBit = lFirst < 64 ? lFirst : 63;
+					if ((mlGuestViolationsLogged & (1ull << lBit)) == 0)
+					{
+						mlGuestViolationsLogged |= (1ull << lBit);
+						Log(" multiplayer: dropped host packet type %u (%u B) - not allowed or malformed (logged once)\n",
+							(unsigned)lFirst, (unsigned)pk->dataLength);
+					}
+				}
+			}
 
 			enet_packet_destroy(pk);
 			break;
@@ -1619,16 +2661,43 @@ void cNetworkManager::HostGame(uint16_t alPort)
 	mbHosting = true;
 	mlLocalPlayerId = 1;
 	mbHavePendingMapChange = false;
+	mbPendingMapChangeDeferred = false;
+	mbBeaconAfterTransition = false;
 	mbLocalMapChangeArmed = false;
+	mfLocalMapChangeArmedAge = 0;
 	m_setTakenItems.clear(); /* one-of-each bookkeeping is per session */
 	m_setPartyItems.clear();
 	mlNextGuestId = 2;
+	mvFreeGuestIds.clear(); /* v15: fresh id space */
+	m_mapPlayerSlots.clear(); /* v17: fresh slot table (Disconnect cleared it too) */
+	m_mapPlayerSlots[mlLocalPlayerId] = 0; /* the host is always character slot 0 */
+	mlSlotWarned = 0;
+	ResetPeerGuards();
 	mbHadJoinPacket = true;
 	mlListenPort = alPort;
+	/* v20: a fresh id per hosting session. Only has to differ between the
+	   hosts one browser can see, so time/clock/address mixing is plenty. */
+	mlHostNonce = ((uint32_t)time(NULL) * 2654435761u) ^ (uint32_t)clock() ^
+		(uint32_t)(uintptr_t)this ^ ((uint32_t)alPort << 16);
+	if (mlHostNonce == 0)
+		mlHostNonce = 1;
 	mbClientConnected = false;
 	Log(" multiplayer: HOST udp/%u\n", (unsigned)alPort);
+	Log(" multiplayer: player cap %u = min(max_players %u, %u character(s)) - every player a different character\n",
+		(unsigned)GetMaxPlayers(), (unsigned)mlMaxPlayers, (unsigned)GetCharacterCount());
+	if (GetMaxPlayers() < 2)
+		Log(" multiplayer: WARNING only one character (ghost_model= / ghost_models=) - nobody can join; "
+			"list more characters or remove the key\n");
 
 	OpenHostDiscovery();
+
+	/* Internet listing: resolve the master NOW (blocking DNS is acceptable
+	   here — a button click or the cfg auto-host, never a frame) and beacon
+	   at once; Update repeats every kNetMasterRegisterSeconds. */
+	mbMasterRegistered = false;
+	mfMasterRegisterAccum = 0;
+	if (mbPublic && ResolveMasterAddress())
+		SendMasterRegister();
 }
 
 hpl::tString cNetworkManager::GetClipboardTextAscii()
@@ -1669,7 +2738,7 @@ void cNetworkManager::SendReliableEvent(const void *apData, size_t alLen)
 		for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
 		{
 			ENetPeer *pd = &mpImpl->mpHost->peers[i];
-			if (pd->state == ENET_PEER_STATE_CONNECTED)
+			if (PeerLive(pd)) /* v15: nothing reaches a peer before its auth */
 				SendStructToPeer(pd, apData, alLen, true);
 		}
 	}
@@ -1684,11 +2753,7 @@ int cNetworkManager::GetConnectedGuestCount() const
 {
 	if (!mbHosting || !mpImpl || !mpImpl->mpHost)
 		return 0;
-	int n = 0;
-	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
-		if (mpImpl->mpHost->peers[i].state == ENET_PEER_STATE_CONNECTED)
-			++n;
-	return n;
+	return CountConnectedPeers(true); /* v15: accepted guests only */
 }
 
 /** Host: "the party is on THIS map" — sent to everyone on our census frame
@@ -1722,6 +2787,11 @@ bool cNetworkManager::PartyHasItem(const hpl::tString &asName) const
 
 void cNetworkManager::NetOnScriptEvent(int alOp, const hpl::tString &asName, int alVal)
 {
+	/* v14 (5a): an item consumed by a script running HERE leaves the party
+	   set too (a friend's key we used) — before any early return, or a
+	   HasItem() gate stays open forever. Empty offline, so a no-op there. */
+	if (alOp == eNetScriptOp_RemoveItem)
+		m_setPartyItems.erase(asName);
 	if (gbNetScriptApplying)
 		return; /* this mutation IS a replication — do not echo it */
 	if (!mpImpl || !mpImpl->mpHost)
@@ -1734,6 +2804,31 @@ void cNetworkManager::NetOnScriptEvent(int alOp, const hpl::tString &asName, int
 	pkt.mOp = (uint8_t)alOp;
 	strncpy(pkt.msName, asName.c_str(), sizeof(pkt.msName) - 1);
 	pkt.mlVal = alVal;
+
+	/* v14 (5b): Add ops. Both machines run the same symmetric scripts
+	   (OnStart/OnLoad/OnUpdate/timers), so relaying every local +1 doubled
+	   the counter. The HOST is the authority: it broadcasts the absolute
+	   value (a Set) instead of the delta. A GUEST applied its +1 locally
+	   already; it forwards the delta only when the script ran because of
+	   something only it did (player context) — for a symmetric script the
+	   host runs the same code and its Set arrives shortly. */
+	if (alOp == eNetScriptOp_LocalVarAdd || alOp == eNetScriptOp_GlobalVarAdd)
+	{
+		if (mbHosting)
+		{
+			cScene *pScene = (mpInit && mpInit->mpGame) ? mpInit->mpGame->GetScene() : NULL;
+			cScriptVar *pVar = pScene ? ((alOp == eNetScriptOp_LocalVarAdd) ?
+				pScene->GetLocalVar(asName) : pScene->GetGlobalVar(asName)) : NULL;
+			if (pVar) /* the engine fires the callback AFTER the add (v14) */
+			{
+				pkt.mOp = (alOp == eNetScriptOp_LocalVarAdd) ?
+					(uint8_t)eNetScriptOp_LocalVarSet : (uint8_t)eNetScriptOp_GlobalVarSet;
+				pkt.mlVal = (int32_t)pVar->mlVal;
+			}
+		}
+		else if (!gbNetScriptPlayerContext)
+			return; /* symmetric script: the host's Set(abs) is on its way */
+	}
 	SendReliableEvent(&pkt, sizeof(pkt));
 }
 
@@ -1749,6 +2844,132 @@ void cNetworkManager::NetOnEntityDamaged(const hpl::tString &asName, float afDam
 	pkt.mfDamage = afDamage;
 	pkt.mlStrength = (int8_t)alStrength;
 	SendReliableEvent(&pkt, sizeof(pkt));
+}
+
+void cNetworkManager::GiveSharedItem(const hpl::tString &asName, const hpl::tString &asFile, int alCount)
+{
+	if (!mpInit || !mpInit->mpInventory || asName.empty() || asFile.empty())
+		return;
+	cInventory *pInv = mpInit->mpInventory;
+	cInventoryItem *pHave = pInv->GetItem(asName);
+	if (pHave && pHave->HasCount() == false)
+		return; /* a unique item we already hold: no duplicate */
+	if (pHave && alCount > 0)
+	{
+		pHave->SetCount(alCount); /* snapshot: match the host's amount */
+		return;
+	}
+
+	/* AddItemFromFile runs the item type's pick-up (battery power, journal
+	   note, ...) and the LEVEL's pick-up callback here too — the picker's
+	   machine ran the same callback and already replicated its effects, so
+	   ours stay local (no second broadcast). None of Overture's pick-up
+	   callbacks counts (AddVar) or gives items, so running it twice is safe. */
+	gbNetScriptApplying = true;
+	pInv->AddItemFromFile(asName, asFile, -1);
+	gbNetScriptApplying = false;
+
+	cInventoryItem *pItem = pInv->GetItem(asName);
+	if (pItem && alCount > 0 && pItem->HasCount())
+		pItem->SetCount(alCount);
+	if (pItem && mpInit->mpEffectHandler)
+		mpInit->mpEffectHandler->GetSubTitle()->Add(pItem->GetGameName(), 2.0f, true);
+	Log(" multiplayer: shared loot - got '%s' (%s)\n", asName.c_str(), asFile.c_str());
+}
+
+void cNetworkManager::GetGhostHitBodies(std::vector<std::pair<uint8_t, hpl::iPhysicsBody *> > &avOut)
+{
+	avOut.clear();
+	for (tGhostMap::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
+	{
+		iPhysicsBody *pBody = it->second ? it->second->GetHitBody() : NULL;
+		if (pBody)
+			avOut.push_back(std::make_pair(it->first, pBody));
+	}
+	/* offline check: the preview ghost can be hit too (logged, not sent) */
+	if (mpPreviewGhost)
+	{
+		iPhysicsBody *pBody = mpPreviewGhost->GetHitBody();
+		if (pBody)
+			avOut.push_back(std::make_pair(kPreviewGhostId, pBody));
+	}
+}
+
+void cNetworkManager::NetOnMeleeHitPlayer(uint8_t alTargetId, float afDamage, const hpl::cVector3f &avFrom)
+{
+	if (alTargetId == kPreviewGhostId)
+	{
+		Log(" multiplayer: melee hit the preview ghost for %.1f damage (friendly fire %s)\n",
+			afDamage, mbFriendlyFire ? "on" : "off");
+		return;
+	}
+	if (!mpImpl || !mpImpl->mpHost || alTargetId == 0 || alTargetId == mlLocalPlayerId)
+		return;
+
+	cNetPlayerHit hit;
+	memset(&hit, 0, sizeof(hit));
+	hit.mType = eNetPacketType_PlayerHit;
+	hit.mTargetID = alTargetId;
+	hit.mAttackerID = mlLocalPlayerId;
+	hit.mfDamage = afDamage;
+	hit.mfFromX = avFrom.x; hit.mfFromY = avFrom.y; hit.mfFromZ = avFrom.z;
+
+	if (mbHosting)
+	{
+		if (!mbFriendlyFire)
+			return; /* our own rule applies to our own swings too */
+		for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+		{
+			ENetPeer *pd = &mpImpl->mpHost->peers[i];
+			if (PeerLive(pd) && PeerGetId(pd) == alTargetId)
+			{
+				SendStructToPeer(pd, &hit, sizeof(hit), true);
+				break;
+			}
+		}
+	}
+	else if (mbClientConnected && mbHadJoinPacket && mpImpl->mpServerPeer)
+		SendStructToPeer(mpImpl->mpServerPeer, &hit, sizeof(hit), true);
+}
+
+/** Host: a guest's melee hit. Never trusts the packet's attacker byte. */
+void cNetworkManager::HostRoutePlayerHit(uint8_t alAuthor, const void *apData, size_t alLen)
+{
+	if (alLen < sizeof(cNetPlayerHit))
+		return;
+	cNetPlayerHit hit;
+	memcpy(&hit, apData, sizeof(hit));
+	hit.mAttackerID = alAuthor;
+	if (!mbFriendlyFire || hit.mTargetID == alAuthor || hit.mTargetID == 0)
+		return;
+	if (hit.mTargetID == mlLocalPlayerId)
+	{
+		ApplyPlayerHit(hit);
+		return;
+	}
+	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+	{
+		ENetPeer *pd = &mpImpl->mpHost->peers[i];
+		if (PeerLive(pd) && PeerGetId(pd) == hit.mTargetID)
+		{
+			SendStructToPeer(pd, &hit, sizeof(hit), true);
+			break;
+		}
+	}
+}
+
+/** The victim's machine: health lives here, so the damage lands here —
+    blood splash, and the hurt direction points at the attacker. */
+void cNetworkManager::ApplyPlayerHit(const cNetPlayerHit &aHit)
+{
+	if (!mpInit || !mpInit->mpPlayer || mpInit->mpPlayer->IsDead())
+		return;
+	cPlayer *pPlayer = mpInit->mpPlayer;
+	pPlayer->mbDamageFromPos = true;
+	pPlayer->mvDamagePos = cVector3f(aHit.mfFromX, aHit.mfFromY, aHit.mfFromZ);
+	pPlayer->Damage(aHit.mfDamage, ePlayerDamageType_BloodSplash);
+	pPlayer->mbDamageFromPos = false;
+	Log(" multiplayer: player %u hit us for %.1f (melee)\n", (unsigned)aHit.mAttackerID, aHit.mfDamage);
 }
 
 bool cNetworkManager::IsEnemyPuppetMode() const
@@ -1803,55 +3024,76 @@ void cNetworkManager::NetOnEnemyDamaged(const hpl::tString &asName, float afDama
 /** Host, at the send tick: every enemy's pose + vitals + commanded clip.
     Whole roster each tick — Penumbra maps carry a handful of enemies, so a
     full batch is ~30 B each and always under MTU. */
+/** One enemy's wire state (the roster stream and the v14 snapshot share
+    it). False = no character body yet, nothing to say. */
+static bool FillEnemyState(iGameEnemy *apEnemy, cNetEnemyState *apOut)
+{
+	if (apEnemy == NULL || apOut == NULL || apEnemy->GetMover() == NULL)
+		return false;
+	iCharacterBody *pBody = apEnemy->GetMover()->GetCharBody();
+	if (pBody == NULL)
+		return false;
+	apOut->mlNameHash = NetHashName(apEnemy->GetName().c_str());
+	const cVector3f v = pBody->GetFeetPosition();
+	apOut->mfPosX = v.x; apOut->mfPosY = v.y; apOut->mfPosZ = v.z;
+	apOut->mfYaw = pBody->GetYaw();
+	apOut->mfHealth = apEnemy->GetHealth();
+	apOut->mlAnimHash = apEnemy->GetNetAnimHash();
+	apOut->mFlags = (uint8_t)((apEnemy->GetNetAnimLoop() ? 1 : 0) |
+		(apEnemy->IsActive() ? 2 : 0));
+	return true;
+}
+
 void cNetworkManager::EmitEnemyStates()
 {
 	if (!mbHosting || !mpImpl || !mpImpl->mpHost || !mpInit || !mpInit->mpMapHandler)
 		return;
 
-	unsigned char aBuf[sizeof(cNetEnemyBatch) + 8 * sizeof(cNetEnemyState)];
+	/* v14 (5c): the roster is streamed in chunks of kMaxEnemiesPerBatch —
+	   the old fixed 8-entry buffer silently left enemy 9+ un-puppeted
+	   (running LOCAL AI on the guest). Each chunk carries its own seq; the
+	   guest only drops a chunk that is older than the newest it applied. */
+	unsigned char aBuf[sizeof(cNetEnemyBatch) + kMaxEnemiesPerBatch * sizeof(cNetEnemyState)];
 	int lCount = 0;
 	tGameEnemyIterator it = mpInit->mpMapHandler->GetGameEnemyIterator();
-	while (it.HasNext() && lCount < 8)
+	for (;;)
 	{
-		iGameEnemy *pEnemy = it.Next();
-		if (pEnemy == NULL || pEnemy->GetMover() == NULL)
-			continue;
-		iCharacterBody *pBody = pEnemy->GetMover()->GetCharBody();
-		if (pBody == NULL)
-			continue;
+		iGameEnemy *pEnemy = it.HasNext() ? it.Next() : NULL;
+		if (pEnemy)
+		{
+			cNetEnemyState st;
+			if (FillEnemyState(pEnemy, &st))
+			{
+				memcpy(aBuf + sizeof(cNetEnemyBatch) + (size_t)lCount * sizeof(cNetEnemyState),
+					&st, sizeof(st));
+				++lCount;
+			}
+		}
 
-		cNetEnemyState st;
-		st.mlNameHash = NetHashName(pEnemy->GetName().c_str());
-		const cVector3f v = pBody->GetFeetPosition();
-		st.mfPosX = v.x; st.mfPosY = v.y; st.mfPosZ = v.z;
-		st.mfYaw = pBody->GetYaw();
-		st.mfHealth = pEnemy->GetHealth();
-		st.mlAnimHash = pEnemy->GetNetAnimHash();
-		st.mFlags = (uint8_t)((pEnemy->GetNetAnimLoop() ? 1 : 0) |
-			(pEnemy->IsActive() ? 2 : 0));
-		memcpy(aBuf + sizeof(cNetEnemyBatch) + (size_t)lCount * sizeof(cNetEnemyState),
-			&st, sizeof(st));
-		++lCount;
-	}
-	if (lCount == 0)
-		return;
+		const bool bLast = !it.HasNext();
+		if (lCount > 0 && (lCount >= (int)kMaxEnemiesPerBatch || bLast))
+		{
+			cNetEnemyBatch hdr;
+			hdr.mType = eNetPacketType_EnemyState;
+			hdr.mCount = (uint8_t)lCount;
+			hdr.mMapGen = mpBodySync->GetMapGen(); /* v14: stale-map guard, was 0 */
+			hdr.mSeq = ++mlEnemySeqOut;
+			memcpy(aBuf, &hdr, sizeof(hdr));
+			const size_t lLen = sizeof(hdr) + (size_t)lCount * sizeof(cNetEnemyState);
 
-	cNetEnemyBatch hdr;
-	hdr.mType = eNetPacketType_EnemyState;
-	hdr.mCount = (uint8_t)lCount;
-	hdr.mMapGen = 0; /* reserved — unknown hashes are already inert */
-	hdr.mSeq = ++mlEnemySeqOut;
-	memcpy(aBuf, &hdr, sizeof(hdr));
-	const size_t lLen = sizeof(hdr) + (size_t)lCount * sizeof(cNetEnemyState);
-
-	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
-	{
-		ENetPeer *pd = &mpImpl->mpHost->peers[i];
-		if (pd->state != ENET_PEER_STATE_CONNECTED)
-			continue;
-		ENetPacket *pkt = enet_packet_create(aBuf, lLen, ENET_PACKET_FLAG_UNSEQUENCED);
-		if (pkt)
-			enet_peer_send(pd, 1, pkt);
+			for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+			{
+				ENetPeer *pd = &mpImpl->mpHost->peers[i];
+				if (!PeerLive(pd)) /* v15: accepted peers only */
+					continue;
+				ENetPacket *pkt = enet_packet_create(aBuf, lLen, ENET_PACKET_FLAG_UNSEQUENCED);
+				if (pkt)
+					enet_peer_send(pd, 1, pkt);
+			}
+			lCount = 0;
+		}
+		if (bLast)
+			break;
 	}
 }
 
@@ -1864,6 +3106,11 @@ void cNetworkManager::ApplyEnemyBatch(const void *apData, size_t alLen)
 	if (!apData || alLen < sizeof(cNetEnemyBatch))
 		return;
 	const cNetEnemyBatch *pHdr = (const cNetEnemyBatch *)apData;
+	/* v14 (5c): a batch from a generation we did not pair with (in flight
+	   across a level change, or the host's previous load) must not touch
+	   these enemies — same guard as the body batches. */
+	if (!mpBodySync->IsRemoteGen(pHdr->mMapGen))
+		return;
 	if (mbEnemySeqInKnown && (int16_t)(pHdr->mSeq - mlEnemySeqIn) <= 0)
 		return; /* reordered stale batch */
 	mlEnemySeqIn = pHdr->mSeq;
@@ -1877,22 +3124,26 @@ void cNetworkManager::ApplyEnemyBatch(const void *apData, size_t alLen)
 		lCount = lWhole;
 	const unsigned char *pRaw = (const unsigned char *)apData;
 
+	/* v14 (5c): one hash -> enemy index per batch instead of a roster scan
+	   per entry (40 entries x N enemies at 30 Hz added up). */
+	std::map<uint32_t, iGameEnemy *> mapEnemies;
+	{
+		tGameEnemyIterator eit = mpInit->mpMapHandler->GetGameEnemyIterator();
+		while (eit.HasNext())
+		{
+			iGameEnemy *pE = eit.Next();
+			if (pE)
+				mapEnemies.insert(std::make_pair(NetHashName(pE->GetName().c_str()), pE));
+		}
+	}
+
 	for (size_t i = 0; i < lCount; ++i)
 	{
 		cNetEnemyState st;
 		memcpy(&st, pRaw + sizeof(cNetEnemyBatch) + i * sizeof(cNetEnemyState), sizeof(st));
 
-		iGameEnemy *pEnemy = NULL;
-		tGameEnemyIterator eit = mpInit->mpMapHandler->GetGameEnemyIterator();
-		while (eit.HasNext())
-		{
-			iGameEnemy *pE = eit.Next();
-			if (pE && NetHashName(pE->GetName().c_str()) == st.mlNameHash)
-			{
-				pEnemy = pE;
-				break;
-			}
-		}
+		std::map<uint32_t, iGameEnemy *>::iterator ei = mapEnemies.find(st.mlNameHash);
+		iGameEnemy *pEnemy = (ei != mapEnemies.end()) ? ei->second : NULL;
 		if (pEnemy == NULL)
 			continue; /* different map or a despawned enemy */
 		if (pEnemy->GetHealth() <= 0)
@@ -1900,7 +3151,11 @@ void cNetworkManager::ApplyEnemyBatch(const void *apData, size_t alLen)
 
 		if (st.mfHealth <= 0)
 		{
-			/* host says it died: run the LOCAL death for ragdoll/sounds */
+			/* host says it died: run the LOCAL death for ragdoll/sounds —
+			   but never its death SCRIPT (v14 5b): the host ran that, and
+			   its effects arrive as script events; running it here too
+			   doubled every AddLocalVar in a kill-counter puzzle. */
+			pEnemy->SetOnDeathCallback("");
 			pEnemy->SetNetPuppet(false);
 			pEnemy->Damage(100000.0f, 100);
 			continue;
@@ -1952,7 +3207,16 @@ void cNetworkManager::NetOnLocalMapChange(const hpl::tString &asMap, const hpl::
 		return;
 	if (!mpImpl || !mpImpl->mpHost)
 		return;
-	mbLocalMapChangeArmed = true; /* our own transition wins until it lands */
+	/* A ChangeMap onto the map we already stand on only moves us to another
+	   start: cMapHandler::Load skips the world load, so no census frame would
+	   ever unarm us and every later follow would be deferred forever. Such a
+	   call never arms, and it cancels an earlier arm (its fade retargeted
+	   the pending transition to this map). */
+	const bool bSameMap = mpInit && mpInit->mpMapHandler &&
+		cString::ToLowerCase(cString::SetFileExt(asMap, "")) ==
+		cString::ToLowerCase(cString::SetFileExt(mpInit->mpMapHandler->GetCurrentMapName(), ""));
+	mbLocalMapChangeArmed = !bSameMap; /* our own transition wins until it lands */
+	mfLocalMapChangeArmedAge = 0;
 	cNetMapChange pkt;
 	memset(&pkt, 0, sizeof(pkt));
 	pkt.mType = eNetPacketType_MapChange;
@@ -1971,7 +3235,24 @@ void cNetworkManager::NetOnItemPicked(const hpl::tString &asEntityName)
 	pkt.mType = eNetPacketType_ItemPickup;
 	pkt.mlQualHash = QualifiedItemHash(asEntityName);
 	strncpy(pkt.msItemName, asEntityName.c_str(), sizeof(pkt.msItemName) - 1);
+	/* v23 shared loot: the item's .ent travels so receivers can have it too;
+	   a guest's mbGive is ignored — the host re-stamps it with its rule */
+	if (mpInit && mpInit->mpMapHandler)
+	{
+		iGameEntity *pEnt = mpInit->mpMapHandler->GetGameEntity(asEntityName, false);
+		if (pEnt)
+		{
+			const tString sFile = cString::GetFileName(pEnt->GetFileName());
+			if (sFile.size() < sizeof(pkt.msFile))
+				strncpy(pkt.msFile, sFile.c_str(), sizeof(pkt.msFile) - 1);
+		}
+	}
+	pkt.mbGive = (mbHosting && mbSharedLoot) ? 1 : 0;
 	SendReliableEvent(&pkt, sizeof(pkt));
+	/* v14 (5a): our OWN picks belong in the taken set too — it is what the
+	   world snapshot serialises for a joiner (only received pickups were
+	   recorded before). The entity is being destroyed here anyway. */
+	m_setTakenItems.insert(pkt.mlQualHash);
 }
 
 void cNetworkManager::NetOnItemDropped(const hpl::tString &asName, const hpl::tString &asFile,
@@ -2072,13 +3353,67 @@ void cNetworkManager::ApplyTakenItems()
 	}
 }
 
+bool cNetworkManager::IsHostMapBusy() const
+{
+	if (mbLocalMapChangeArmed || mbHavePendingMapChange)
+		return true;
+	if (!mpInit || !mpInit->mpMapHandler)
+		return true;
+	if (mpInit->mpMapHandler->IsChangingMap() || mpInit->mpMapHandler->GetCurrentMapName().empty())
+		return true;
+	/* world loaded but its census (and with it our beacon) not out yet */
+	return mpBodySync == NULL || !mpBodySync->HasCensus();
+}
+
 void cNetworkManager::ApplyPendingMapChange()
 {
 	if (!mbHavePendingMapChange || !mpInit || !mpInit->mpMapHandler)
 		return;
-	mbHavePendingMapChange = false;
-	if (mbLocalMapChangeArmed) /* we are mid-transition ourselves; ours wins */
+	if (mbLocalMapChangeArmed)
+	{
+		/* We are mid-transition ourselves. With 3-4 players two doors at
+		   once are likely, so the request is not thrown away:
+		   - host: host wins. Guest requests are normally refused before
+		     they get here (IsHostMapBusy in Service); one queued in the same
+		     frame we armed is dropped and the census-frame beacon tells
+		     everybody where we went.
+		   - guest: every MapChange we receive is the host's destination
+		     (the host refuses guest requests while it is busy and never
+		     relays a refused one), so keep the newest and re-evaluate on
+		     our census frame: same map = discard, else follow. Following
+		     never re-announces (mbApplyingRemoteMapChange), so this cannot
+		     loop. */
+		if (mbHosting)
+		{
+			Log(" multiplayer: guest level transition to '%s' ignored - host is mid-transition (host wins)\n",
+				msPendingMap.c_str());
+			mbHavePendingMapChange = false;
+			mbBeaconAfterTransition = true;
+		}
+		else if (!mbPendingMapChangeDeferred)
+		{
+			Log(" multiplayer: party transition to '%s' deferred until our own transition lands\n",
+				msPendingMap.c_str());
+			mbPendingMapChangeDeferred = true;
+		}
 		return;
+	}
+	mbHavePendingMapChange = false;
+	if (mbPendingMapChangeDeferred)
+	{
+		mbPendingMapChangeDeferred = false;
+		const tString sHere = cString::ToLowerCase(
+			cString::SetFileExt(mpInit->mpMapHandler->GetCurrentMapName(), ""));
+		const tString sThere = cString::ToLowerCase(cString::SetFileExt(msPendingMap, ""));
+		if (sHere == sThere)
+		{
+			Log(" multiplayer: deferred party transition to '%s' discarded - we landed there ourselves\n",
+				msPendingMap.c_str());
+			return;
+		}
+		Log(" multiplayer: our transition landed on '%s' but the host is heading to '%s' - following\n",
+			mpInit->mpMapHandler->GetCurrentMapName().c_str(), msPendingMap.c_str());
+	}
 
 	/* Parked in the main menu with no world (joined from the lobby): perform
 	   the same launch the join screen's manual button does, straight into the
@@ -2171,9 +3506,14 @@ void cNetworkManager::JoinGame(const char *aszHostPort)
 	mbHadJoinPacket = false;
 	mbSpawnedAtHost = false; /* fresh session: walk to the host once */
 	mbGotVersionAck = false;
+	mbAuthSent = false;          /* v15: answer the next challenge */
+	mlGuestViolationsLogged = 0; /* v15: log-once per connection */
 	msJoinFailReason = "";
 	mbHavePendingMapChange = false;
+	mbPendingMapChangeDeferred = false;
+	mbBeaconAfterTransition = false;
 	mbLocalMapChangeArmed = false;
+	mfLocalMapChangeArmedAge = 0;
 	m_setTakenItems.clear(); /* one-of-each bookkeeping is per session */
 	m_setPartyItems.clear();
 	mlLocalPlayerId = 0;
@@ -2183,8 +3523,13 @@ void cNetworkManager::JoinGame(const char *aszHostPort)
 void cNetworkManager::Disconnect()
 {
 	ClearGhostsInternal();
+	if (mbHosting)
+		SendMasterUnregister(); /* before the discovery socket goes away */
+	if (mpVoice)
+		mpVoice->Shutdown(); /* v16: mic closed, encoder/decoders/sources freed */
 	CloseHostDiscovery();
 	StopDiscovery(); /* keeps results; frees the browse socket + its net ref */
+	StopInternetRefresh();
 
 	if (mpImpl && mpImpl->mpHost)
 	{
@@ -2217,9 +3562,13 @@ void cNetworkManager::Disconnect()
 	mbHadJoinPacket = false;
 	mlLocalPlayerId = 0;
 	mlNextGuestId = 2;
-	msDeferredJoinAddress = "";
+	mvFreeGuestIds.clear(); /* v15 */
+	mbAuthSent = false;
 	if (mpImpl)
+	{
+		ResetPeerGuards();      /* v15: the peer slots died with the host */
 		mpImpl->ResetIntent(); /* a dead session forwards nothing */
+	}
 	if (mpBodySync)
 		mpBodySync->ClearGuestHeld();
 }
@@ -2228,6 +3577,8 @@ void cNetworkManager::Update(float afTimeStep)
 {
 	if (!mpInit || !mpInit->mpGame)
 		return;
+
+	UpdatePartyEvents(afTimeStep); /* v13: feed line ages + join grace timer */
 
 	/* Track the CURRENT world only — never a stale one. Keeping the old
 	   pointer across a map change/unload meant EnsureGhost built ghosts in a
@@ -2248,7 +3599,14 @@ void cNetworkManager::Update(float afTimeStep)
 			}
 			m_mapGhosts.clear();
 		}
+		DestroyPreviewGhost(true); /* same dead world; respawns after a short delay */
+		mfPreviewSpawnDelay = 0.75f;
 		mpWorld = w;
+		/* v14: the new world pairs afresh — accept the next enemy batch
+		   regardless of seq, and forget a snapshot meant for the old world
+		   (our next MapReady requests a new one). */
+		mbEnemySeqInKnown = false;
+		ResetSnapshotBuffer();
 	}
 
 	/* Phase 5: cBodySync tracks the world itself (per-world state dies with
@@ -2257,19 +3615,79 @@ void cNetworkManager::Update(float afTimeStep)
 	   every connected peer (a guest self-verifies against the host's inside). */
 	ApplyPendingMapChange(); /* party follow runs at this safe point */
 
+	/* Failsafe: armed, no fade running and still no census after 5 s means
+	   the transition never produced a new world (failed load, a same-map
+	   retarget the arm check could not see) — unarm, or every follow would
+	   be deferred for the rest of the session. */
+	if (mbLocalMapChangeArmed && mpInit->mpMapHandler && !mpInit->mpMapHandler->IsChangingMap())
+	{
+		mfLocalMapChangeArmedAge += afTimeStep;
+		if (mfLocalMapChangeArmedAge > 5.0f)
+		{
+			Log(" multiplayer: own level transition never landed on a new world - unarmed\n");
+			mbLocalMapChangeArmed = false;
+			mfLocalMapChangeArmedAge = 0;
+		}
+	}
+	else
+		mfLocalMapChangeArmedAge = 0;
+
 	if (mpBodySync->Update(mpWorld))
 	{
 		if (mbHosting)
 		{
 			SendCensus(NULL);
 			SendMapBeacon(NULL); /* save loads/new games never call ChangeMap */
+			mbBeaconAfterTransition = false; /* that was it */
 		}
 		/* The new map is up: our own transition (if any) has landed, and any
 		   items a friend pocketed while we were elsewhere vanish before the
 		   fade-in shows them. */
 		mbLocalMapChangeArmed = false;
+		mfLocalMapChangeArmedAge = 0;
 		ApplyTakenItems();
+		/* A party transition that arrived while ours was in flight is
+		   re-evaluated now (same map = discarded, else we follow the host).
+		   Following starts a fade to another world: do not ask the host for
+		   the state of this one, the next census frame asks for that one. */
+		bool bLeavingAgain = false;
+		if (mbHavePendingMapChange && mbPendingMapChangeDeferred)
+		{
+			ApplyPendingMapChange();
+			bLeavingAgain = mpInit->mpMapHandler && mpInit->mpMapHandler->IsChangingMap();
+		}
+		/* v14 hook 1: our census for a NEW world is in and the host's is
+		   already known (menu launch via beacon, a followed MapChange, our
+		   own save reload) — ask the host for this world's state. Runs one
+		   frame after the load, i.e. after OnStart/OnLoad/PreUpdate, which
+		   is exactly what the host's state must overwrite. */
+		if (!mbHosting && !bLeavingAgain && mpBodySync->HasRemoteCensus())
+			SendMapReady();
 	}
+	else if (mbHosting && mbBeaconAfterTransition && !IsHostMapBusy())
+	{
+		/* a refused guest request while we were busy without a new world
+		   (same-map retarget, a fade that ended where it started) */
+		mbBeaconAfterTransition = false;
+		SendMapBeacon(NULL);
+	}
+
+	/* v14: a snapshot whose End never comes (host died mid-send) must not
+	   sit in memory forever, nor apply minutes later. */
+	if (mbSnapBuffering)
+	{
+		mfSnapAge += afTimeStep;
+		if (mfSnapAge > 10.0f)
+		{
+			Log(" multiplayer: world snapshot id=%u timed out (%u chunk(s) buffered) - dropped\n",
+				(unsigned)mlSnapId, (unsigned)mvSnapChunks.size());
+			ResetSnapshotBuffer();
+		}
+	}
+
+	/* v15: auth timeouts, rate windows, strike decay, dead-slot sweep. */
+	if (mbHosting)
+		UpdatePeerGuards(afTimeStep);
 
 	/* Rung 3: drive the guests' grab springs in the authoritative sim. */
 	if (mbHosting)
@@ -2319,6 +3737,28 @@ void cNetworkManager::Update(float afTimeStep)
 
 	PollDiscovery(afTimeStep);
 
+	/* Public host: keep the master's entry alive (it expires after
+	   kNetMasterExpirySeconds). No DNS here — the address was resolved in
+	   HostGame / SetPublic; an unresolved master simply never beacons. */
+	if (mbHosting && mbPublic)
+	{
+		mfMasterRegisterAccum += afTimeStep;
+		if (mfMasterRegisterAccum >= kNetMasterRegisterSeconds)
+		{
+			mfMasterRegisterAccum = 0;
+			/* re-resolve now and then (dynamic-DNS masters); this is once per
+			   20 s beacon at most, never per frame, and a failed lookup is
+			   remembered for a minute inside ResolveMasterAddress */
+			mfMasterResolveAge += kNetMasterRegisterSeconds;
+			if (mfMasterResolveAge >= 600.0f || !mpImpl->mbMasterResolved)
+			{
+				mfMasterResolveAge = 0;
+				ResolveMasterAddress();
+			}
+			SendMasterRegister();
+		}
+	}
+
 	Service(0);
 	const bool ticking = mbHosting || (mbClientConnected && mbHadJoinPacket && !mbHosting);
 	mfSendAccum += afTimeStep;
@@ -2336,7 +3776,193 @@ void cNetworkManager::Update(float afTimeStep)
 	}
 	Service(0);
 
+	/* v11: every ghost interpolates/animates once per tick, AFTER the last
+	   Service(0) so this tick's states are already in the buffers. */
+	UpdateGhosts(afTimeStep);
+
+	/* v16: voice after the ghosts moved (sources follow the drawn heads);
+	   its outbox goes out right away, not at the 30 Hz tick — 40 ms of
+	   audio per packet already paces it. */
+	UpdateVoice(afTimeStep);
+
 	mpBodySync->LogStatsTick(afTimeStep);
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::UpdateGhosts(float afTimeStep)
+{
+	for (tGhostMap::iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
+	{
+		if (it->second)
+			it->second->Update(afTimeStep);
+	}
+	UpdatePreviewGhost(afTimeStep);
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::UpdatePreviewGhost(float afTimeStep)
+{
+	if (mbGhostPreview == false || !mpInit || !mpInit->mpGame)
+		return;
+	cPlayer *pPlayer = mpInit->mpPlayer;
+	iCharacterBody *pBody = pPlayer ? pPlayer->GetCharacterBody() : NULL;
+	cCamera3D *pCam = pPlayer ? pPlayer->GetCamera() : NULL;
+	if (!mpWorld || !pBody || !pCam)
+		return;
+
+	if (mpPreviewGhost == NULL)
+	{
+		/* a fresh world: give the map its first frames so the player stands
+		   at the real start before we measure "2 m ahead" */
+		mfPreviewSpawnDelay -= afTimeStep;
+		if (mfPreviewSpawnDelay > 0.0f)
+			return;
+
+		const float fYaw = pCam->GetYaw();
+		const cVector3f vFwd(-sinf(fYaw), 0.0f, -cosf(fYaw));
+		mvPreviewCenter = pBody->GetFeetPosition() + vFwd * 2.0f;
+		mfPreviewFacingYaw = fYaw + kPif; /* faces the player */
+		mfPreviewCircleAngle = 0.0f;
+		mlPreviewSeq = 0;
+		mfPreviewSendAccum = 0.0f;
+
+		mpPreviewGhost = CreateGhost(kPreviewGhostId, (size_t)mlGhostPreviewModel);
+		if (mpPreviewGhost == NULL)
+		{
+			mbGhostPreview = false;
+			Log(" multiplayer: ghost preview could not create a ghost — disabled\n");
+			return;
+		}
+		Log(" multiplayer: ghost preview spawned 2 m ahead (mesh #%d) — F6/F7 cycle clips, F8 crouch, F2 treadmill off/walk/run; ghost_anim_trace=1 logs the selector\n",
+			mlGhostPreviewModel);
+		if (mlPreviewClipIdx >= 0)
+			mpPreviewGhost->DebugPlayClip(cGhostPlayer::GetClipName(mlPreviewClipIdx));
+	}
+
+	/* keys */
+	hpl::cInput *inp = mpInit->mpGame->GetInput();
+	if (inp)
+	{
+		const int lClipNum = cGhostPlayer::GetClipCount();
+		int lDir = 0;
+		if (inp->BecameTriggerd("GhostPreviewNext"))
+			lDir = 1;
+		else if (inp->BecameTriggerd("GhostPreviewPrev"))
+			lDir = -1;
+		if (lDir != 0 && lClipNum > 0)
+		{
+			/* step to the next LOADED clip (a clip whose file failed is skipped) */
+			int lIdx = mlPreviewClipIdx;
+			bool bSet = false;
+			for (int lTry = 0; lTry < lClipNum && bSet == false; ++lTry)
+			{
+				lIdx = ((lIdx + lDir) % lClipNum + lClipNum) % lClipNum;
+				bSet = mpPreviewGhost->DebugPlayClip(cGhostPlayer::GetClipName(lIdx));
+			}
+			if (bSet)
+			{
+				mlPreviewClipIdx = lIdx;
+				if (mlPreviewTreadmill != 0)
+					mlPreviewTreadmill = 0; /* a forced clip stands still */
+				Log(" multiplayer: ghost preview clip '%s' (%d/%d)\n",
+					cGhostPlayer::GetClipName(lIdx), lIdx + 1, lClipNum);
+			}
+			else
+				Log(" multiplayer: ghost preview: no clips loaded on this mesh\n");
+		}
+		if (inp->BecameTriggerd("GhostPreviewCrouch"))
+		{
+			mbPreviewCrouch = !mbPreviewCrouch;
+			Log(" multiplayer: ghost preview stance: %s\n", mbPreviewCrouch ? "crouch" : "stand");
+		}
+		if (inp->BecameTriggerd("GhostPreviewTreadmill"))
+		{
+			mlPreviewTreadmill = (mlPreviewTreadmill + 1) % 3;
+			if (mlPreviewTreadmill != 0)
+			{
+				mlPreviewClipIdx = -1; /* the real selector picks the clips */
+				mpPreviewGhost->DebugPlayClip("");
+			}
+			Log(" multiplayer: ghost preview treadmill: %s\n",
+				mlPreviewTreadmill == 0 ? "off" : (mlPreviewTreadmill == 1 ? "walk (1 m circle)" : "run (1 m circle)"));
+		}
+	}
+
+	/* Synthetic sender at the real send rate, through the real receive path:
+	   seq clock, interpolation delay, selector, gait scaling — all exercised. */
+	mfPreviewSendAccum += afTimeStep;
+	while (mfPreviewSendAccum >= kSendPeriodSeconds)
+	{
+		mfPreviewSendAccum -= kSendPeriodSeconds;
+
+		cVector3f vPos = mvPreviewCenter;
+		float fYaw = mfPreviewFacingYaw;
+		float fSpeed = 0.0f;
+		uint8_t lFlags = eNetPlayerFlag_OnGround;
+		uint8_t lMoveState = eNetMoveState_Walk;
+		if (mbPreviewCrouch)
+		{
+			lFlags |= eNetPlayerFlag_Crouch;
+			lMoveState = eNetMoveState_Crouch;
+		}
+		if (mlPreviewTreadmill != 0)
+		{
+			/* true player speeds from game.cfg via the player's own move
+			   states (Movement_Walk/Run/Crouch ForwardSpeed) */
+			const ePlayerMoveState eState = mbPreviewCrouch ? ePlayerMoveState_Crouch
+				: (mlPreviewTreadmill == 2 ? ePlayerMoveState_Run : ePlayerMoveState_Walk);
+			iPlayerMoveState *pMove = pPlayer->GetMoveStateData(eState);
+			fSpeed = pMove ? pMove->mfForwardSpeed : 0.0f;
+			if (fSpeed <= 0.05f)
+				fSpeed = mbPreviewCrouch ? 0.9f : (mlPreviewTreadmill == 2 ? 3.0f : 1.5f);
+			if (mlPreviewTreadmill == 2 && mbPreviewCrouch == false)
+			{
+				lFlags |= eNetPlayerFlag_RunKey;
+				lMoveState = eNetMoveState_Run;
+			}
+
+			const float kRadius = 1.0f;
+			mfPreviewCircleAngle += (fSpeed / kRadius) * kSendPeriodSeconds;
+			if (mfPreviewCircleAngle > 2.0f * kPif)
+				mfPreviewCircleAngle -= 2.0f * kPif;
+			const float a = mfPreviewCircleAngle;
+			vPos = mvPreviewCenter + cVector3f(cosf(a) * kRadius, 0.0f, sinf(a) * kRadius);
+			/* facing = direction of travel (the circle's tangent) in the
+			   camera yaw convention forward = (-sin y, 0, -cos y) */
+			const float fDx = -sinf(a), fDz = cosf(a);
+			fYaw = atan2f(-fDx, -fDz);
+		}
+
+		cNetPlayerState st;
+		memset(&st, 0, sizeof(st));
+		st.mType = eNetPacketType_PlayerState;
+		st.mPlayerID = kPreviewGhostId;
+		st.mSeq = ++mlPreviewSeq;
+		st.mfPosX = vPos.x;
+		st.mfPosY = vPos.y;
+		st.mfPosZ = vPos.z;
+		st.mfPitch = 0.0f;
+		st.mfYaw = fYaw;
+		/* v21: the preview mirrors what the local player holds (and the
+		   flashlight), so held-item props can be checked with no second
+		   machine: equip the hammer, switch the flashlight on. */
+		{
+			cPlayerFlashLight *pFl = mpInit->mpPlayer ? mpInit->mpPlayer->GetFlashLight() : NULL;
+			st.mbFlashlightOn = (uint8_t)(pFl && pFl->IsActive() && !pFl->IsDisabled());
+		}
+		st.mHeldLeft = LocalHeldItem(mpInit, 0);
+		st.mHeldRight = LocalHeldItem(mpInit, 1);
+		st.mMoveState = lMoveState;
+		st.mVelFwd = EncodeNetVel(fSpeed);
+		st.mVelRight = 0;
+		st.mFlags = lFlags;
+		st.mHealth = 100; /* v12: the preview is never "dead" */
+		mpPreviewGhost->ApplyState(st);
+	}
+
+	mpPreviewGhost->Update(afTimeStep);
 }
 
 /** Same GetAdaptersInfo walk the discovery pinger does, but for HUMANS: the
@@ -2437,25 +4063,27 @@ void cNetworkManager::CloseHostDiscovery()
 		CloseUdpSocket(mpImpl->mDiscoveryListenSock);
 }
 
-void cNetworkManager::StartDiscovery()
+/** The browser-side socket is shared by the LAN scan and the master List so
+    the two can overlap (Internet tab refresh while a LAN scan is running):
+    PollDiscovery tells the replies apart by their type byte. It stays open
+    while EITHER window is active and holds one ENet/WSA ref meanwhile. */
+bool cNetworkManager::OpenBrowseSocket()
 {
 	if (!mpImpl)
-		return;
-
-	/* Refresh semantics: drop the previous scan (socket + results) and re-ping. */
-	StopDiscovery();
-	mvDiscovered.clear();
+		return false;
+	if (mpImpl->mDiscoveryBrowseSock != INVALID_SOCKET)
+		return true;
 
 	if (!NetAcquire()) /* WSAStartup may not be up yet — browsing can start from the menu */
-		return;
+		return false;
 	mpImpl->mbBrowseHoldsNetRef = true;
 
 	SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (s == INVALID_SOCKET)
 	{
 		Log(" multiplayer: discovery browse socket failed (err %d)\n", WSAGetLastError());
-		StopDiscovery();
-		return;
+		CloseBrowseSocketIfIdle();
+		return false;
 	}
 
 	BOOL yes = TRUE;
@@ -2471,12 +4099,40 @@ void cNetworkManager::StartDiscovery()
 	{
 		Log(" multiplayer: discovery browse bind failed (err %d)\n", WSAGetLastError());
 		closesocket(s);
-		StopDiscovery();
-		return;
+		CloseBrowseSocketIfIdle();
+		return false;
 	}
 
 	TameUdpSocket(s);
 	mpImpl->mDiscoveryBrowseSock = s;
+	return true;
+}
+
+void cNetworkManager::CloseBrowseSocketIfIdle()
+{
+	if (!mpImpl)
+		return;
+	if (mbDiscoveryActive || mbInternetActive)
+		return; /* the other window still needs it */
+	CloseUdpSocket(mpImpl->mDiscoveryBrowseSock);
+	if (mpImpl->mbBrowseHoldsNetRef)
+	{
+		mpImpl->mbBrowseHoldsNetRef = false;
+		NetRelease();
+	}
+}
+
+void cNetworkManager::StartDiscovery()
+{
+	if (!mpImpl)
+		return;
+
+	/* Refresh semantics: drop the previous scan's results and re-ping. */
+	StopDiscovery();
+	mvDiscovered.clear();
+
+	if (!OpenBrowseSocket())
+		return;
 	mbDiscoveryActive = true;
 	mfDiscoveryTimeLeft = kDiscoveryWindowSeconds;
 
@@ -2487,13 +4143,290 @@ void cNetworkManager::StopDiscovery()
 {
 	mbDiscoveryActive = false;
 	mfDiscoveryTimeLeft = 0;
+	CloseBrowseSocketIfIdle();
+}
+
+//-----------------------------------------------------------------------
+// Internet browser: master server List / Entries + host Register beacons.
+// Wire structs: NetworkPackets.h 'MASTER SERVER protocol'.
+//-----------------------------------------------------------------------
+
+/** Turns cfg `master_server=host:port` into mpImpl->mMasterAddr. Blocking
+    (DNS) — callers are HostGame, SetPublic and RefreshInternetServers, all
+    user actions; the result is cached until the cfg string changes.
+    Resolution goes through enet_address_set_host (the same resolver the
+    direct-IP join uses; ENet needs to be initialised, which every caller
+    guarantees). ENetAddress::host is already in network byte order. */
+bool cNetworkManager::ResolveMasterAddress()
+{
+	if (!mpImpl)
+		return false;
+
+	const hpl::tString sMaster = GetMasterServer();
+	if (sMaster.empty())
+	{
+		mpImpl->mbMasterResolved = false;
+		mpImpl->msMasterResolvedFor = "";
+		return false;
+	}
+	/* a lookup that just failed is not retried for a minute (HostGame /
+	   Refresh clicks would otherwise block on DNS every time) */
+	if (mpImpl->mfMasterResolveFailedAt > 0.0 &&
+		(double)GetApplicationTime() / 1000.0 - mpImpl->mfMasterResolveFailedAt < 60.0 &&
+		mpImpl->msMasterResolvedFor == sMaster)
+		return false;
+	if (mpImpl->mbMasterResolved && mpImpl->msMasterResolvedFor == sMaster)
+		return true;
+
+	mpImpl->mbMasterResolved = false;
+	mpImpl->msMasterResolvedFor = sMaster;
+
+	/* "host" alone means kNetMasterDefaultPort; "host:port" must carry a
+	   real port (SplitHostPort would silently fall back to the GAME port). */
+	char hbuf[260];
+	uint16_t port = kNetMasterDefaultPort;
+	const char *pColon = strrchr(sMaster.c_str(), ':');
+	if (pColon)
+	{
+		const int pv = atoi(pColon + 1);
+		if (pv <= 0 || pv > 65535)
+		{
+			Log(" multiplayer: bad master_server '%s' (want host:port)\n", sMaster.c_str());
+			return false;
+		}
+		port = (uint16_t)pv;
+	}
+	if (!SplitHostPort(sMaster.c_str(), hbuf, sizeof(hbuf), port))
+	{
+		Log(" multiplayer: bad master_server '%s' (want host:port)\n", sMaster.c_str());
+		return false;
+	}
+
+	ENetAddress ea;
+	memset(&ea, 0, sizeof(ea));
+	if (enet_address_set_host(&ea, hbuf) != 0 || ea.host == 0)
+	{
+		mpImpl->mfMasterResolveFailedAt = (double)GetApplicationTime() / 1000.0;
+		mpImpl->msMasterResolvedFor = sMaster;
+		mpImpl->mbMasterResolved = false;
+		if (!mpImpl->mbMasterWarned)
+		{
+			mpImpl->mbMasterWarned = true;
+			Log(" multiplayer: master server '%s' does not resolve — set master_server=host:port in multiplayer.cfg (README 'Public servers')\n",
+				sMaster.c_str());
+		}
+		return false;
+	}
+
+	memset(&mpImpl->mMasterAddr, 0, sizeof(mpImpl->mMasterAddr));
+	mpImpl->mMasterAddr.sin_family = AF_INET;
+	mpImpl->mMasterAddr.sin_addr.s_addr = ea.host; /* network order, as ENet keeps it */
+	mpImpl->mMasterAddr.sin_port = htons(port);
+	mpImpl->mbMasterResolved = true;
+	mpImpl->mbMasterWarned = false;
+	mpImpl->mfMasterResolveFailedAt = 0.0;
+
+	char where[64];
+	FormatAddrPort(mpImpl->mMasterAddr, port, where, sizeof(where));
+	Log(" multiplayer: master server '%s' -> %s\n", sMaster.c_str(), where);
+	return true;
+}
+
+/** Host -> master beacon, from the host discovery socket (the one bound to
+    kNetDiscoveryPort; if that bind failed there is nothing to send from and
+    the server is simply not listed — same as not LAN-discoverable). */
+void cNetworkManager::SendMasterRegister()
+{
+	if (!mpImpl || !mbHosting || !mbPublic || !mpImpl->mbMasterResolved)
+		return;
+	if (mpImpl->mDiscoveryListenSock == INVALID_SOCKET)
+		return;
+
+	cNetMasterRegister reg;
+	memset(&reg, 0, sizeof(reg));
+	reg.mType = eNetMasterPacketType_Register;
+	reg.mlMagic = kNetMasterMagic;
+	reg.mlMasterVer = kNetMasterProtocolVersion;
+	reg.mlGamePort = mlListenPort;
+	reg.mlPlayerCount = (uint8_t)(CountConnectedPeers(true) + 1); /* accepted guests + me */
+	reg.mlMaxPlayers = GetMaxPlayers(); /* v17: effective cap (one per character) */
+	reg.mFlags = HasServerPassword() ? kNetMasterFlag_Password : 0; /* v15 auth: the real setting */
+	reg.mlProtocolVer = kNetProtocolVersion;
+	{
+		/* same advertised name as the LAN pong: server_name, else "<player_name>'s game" */
+		hpl::tString sAdvertised = msServerName;
+		if (sAdvertised.empty())
+			sAdvertised = msPlayerName.empty() ? hpl::tString("Penumbra Server") : msPlayerName + "'s game";
+		CopyPacketString(reg.msServerName, sizeof(reg.msServerName), sAdvertised.c_str());
+	}
+	const char *mapName = "";
+	if (mpInit && mpInit->mpMapHandler)
+		mapName = mpInit->mpMapHandler->GetCurrentMapName().c_str();
+	CopyPacketString(reg.msMapName, sizeof(reg.msMapName), mapName);
+
+	if (sendto(mpImpl->mDiscoveryListenSock, (const char *)&reg, sizeof(reg), 0,
+			   (const sockaddr *)&mpImpl->mMasterAddr, sizeof(mpImpl->mMasterAddr)) == SOCKET_ERROR)
+	{
+		Log(" multiplayer: master register FAILED (err %d)\n", WSAGetLastError());
+		return;
+	}
+	if (!mbMasterRegistered) /* fire-and-forget: the master never acks a beacon */
+		Log(" multiplayer: master register beacon -> %s as '%s' game port %u (forward udp/%u on your router)\n",
+			GetMasterServer().c_str(), reg.msServerName, (unsigned)reg.mlGamePort, (unsigned)reg.mlGamePort);
+	mbMasterRegistered = true;
+}
+
+void cNetworkManager::SendMasterUnregister()
+{
+	if (!mpImpl || !mbMasterRegistered || !mpImpl->mbMasterResolved)
+		return;
+	mbMasterRegistered = false;
+	if (mpImpl->mDiscoveryListenSock == INVALID_SOCKET)
+		return;
+
+	cNetMasterUnregister un;
+	memset(&un, 0, sizeof(un));
+	un.mType = eNetMasterPacketType_Unregister;
+	un.mlMagic = kNetMasterMagic;
+	un.mlMasterVer = kNetMasterProtocolVersion;
+	un.mlGamePort = mlListenPort;
+	sendto(mpImpl->mDiscoveryListenSock, (const char *)&un, sizeof(un), 0,
+		   (const sockaddr *)&mpImpl->mMasterAddr, sizeof(mpImpl->mMasterAddr));
+	Log(" multiplayer: unregistered from the master\n");
+}
+
+void cNetworkManager::SetPublic(bool abPublic)
+{
+	if (mbPublic == abPublic)
+		return;
+	mbPublic = abPublic;
+	if (!mbHosting)
+		return;
+	if (mbPublic)
+	{
+		mfMasterRegisterAccum = 0;
+		if (ResolveMasterAddress()) /* button click: blocking DNS is fine */
+			SendMasterRegister();
+	}
+	else
+		SendMasterUnregister();
+}
+
+void cNetworkManager::RefreshInternetServers()
+{
 	if (!mpImpl)
 		return;
-	CloseUdpSocket(mpImpl->mDiscoveryBrowseSock);
-	if (mpImpl->mbBrowseHoldsNetRef)
+
+	StopInternetRefresh();
+	mvInternet.clear();
+	msInternetFailReason = "";
+
+	if (GetMasterServer().empty())
 	{
-		mpImpl->mbBrowseHoldsNetRef = false;
-		NetRelease();
+		msInternetFailReason = "No master server configured (multiplayer.cfg master_server=host:port)";
+		Log(" multiplayer: internet refresh — %s\n", msInternetFailReason.c_str());
+		return;
+	}
+	if (!OpenBrowseSocket())
+	{
+		msInternetFailReason = "Could not open a UDP socket";
+		return;
+	}
+	if (!ResolveMasterAddress()) /* enet is up now (OpenBrowseSocket acquired it) */
+	{
+		msInternetFailReason = "Master server '" + GetMasterServer() + "' does not resolve";
+		CloseBrowseSocketIfIdle();
+		return;
+	}
+
+	cNetMasterList req;
+	memset(&req, 0, sizeof(req));
+	req.mType = eNetMasterPacketType_List;
+	req.mlMagic = kNetMasterMagic;
+	req.mlMasterVer = kNetMasterProtocolVersion;
+	req.mlProtocolVer = kNetProtocolVersion;
+	if (sendto(mpImpl->mDiscoveryBrowseSock, (const char *)&req, sizeof(req), 0,
+			   (const sockaddr *)&mpImpl->mMasterAddr, sizeof(mpImpl->mMasterAddr)) == SOCKET_ERROR)
+	{
+		msInternetFailReason = "Sending to the master failed";
+		Log(" multiplayer: master list request FAILED (err %d)\n", WSAGetLastError());
+		CloseBrowseSocketIfIdle();
+		return;
+	}
+
+	mbInternetActive = true;
+	mfInternetTimeLeft = kNetMasterListWindowSeconds;
+	Log(" multiplayer: master list request -> %s\n", GetMasterServer().c_str());
+}
+
+void cNetworkManager::StopInternetRefresh()
+{
+	mbInternetActive = false;
+	mfInternetTimeLeft = 0;
+	CloseBrowseSocketIfIdle();
+}
+
+/** One Entries datagram from the master (source already verified). Every
+    bound is checked against alLen, never against the header's count alone. */
+void cNetworkManager::HandleMasterEntries(const char *apBuf, int alLen)
+{
+	if (!apBuf || alLen < (int)sizeof(cNetMasterEntries))
+		return;
+	cNetMasterEntries hdr;
+	memcpy(&hdr, apBuf, sizeof(hdr));
+	if (hdr.mType != eNetMasterPacketType_Entries || hdr.mlMagic != kNetMasterMagic ||
+		hdr.mlMasterVer != kNetMasterProtocolVersion)
+		return;
+
+	size_t count = hdr.mCount;
+	const size_t avail = ((size_t)alLen - sizeof(hdr)) / sizeof(cNetMasterEntry);
+	if (count > avail)
+		count = avail; /* truncated datagram: take what really arrived */
+	if (count > kNetMasterMaxEntriesPerDatagram)
+		count = kNetMasterMaxEntriesPerDatagram;
+
+	for (size_t i = 0; i < count; ++i)
+	{
+		cNetMasterEntry e;
+		memcpy(&e, apBuf + sizeof(hdr) + i * sizeof(e), sizeof(e));
+		e.msServerName[sizeof(e.msServerName) - 1] = '\0';
+		e.msMapName[sizeof(e.msMapName) - 1] = '\0';
+
+		char addr[64];
+		_snprintf(addr, sizeof(addr), "%u.%u.%u.%u:%u",
+				  (unsigned)e.mIp4[0], (unsigned)e.mIp4[1], (unsigned)e.mIp4[2], (unsigned)e.mIp4[3],
+				  (unsigned)e.mlGamePort);
+		addr[sizeof(addr) - 1] = '\0';
+
+		bool known = false;
+		for (size_t k = 0; k < mvInternet.size(); ++k)
+			if (mvInternet[k].msAddress == addr)
+			{
+				known = true;
+				break;
+			}
+		if (known || mvInternet.size() >= 100)
+			continue;
+
+		cDiscoveredServer sv;
+		sv.msAddress = addr;
+		sv.msName = e.msServerName;
+		sv.msMap = e.msMapName;
+		sv.mlPlayerCount = e.mlPlayerCount;
+		sv.mlMaxPlayers = e.mlMaxPlayers;
+		sv.mbVersionMatch = (e.mlProtocolVer == kNetProtocolVersion);
+		sv.mbPassword = (e.mFlags & kNetMasterFlag_Password) != 0;
+		sv.mlAgeSeconds = e.mlAgeSeconds;
+		sv.mbInternet = true;
+		sv.mlHostNonce = 0; /* v20: only LAN pongs carry one */
+		mvInternet.push_back(sv);
+
+		Log(" multiplayer: internet server '%s' map='%s' %u/%u at %s age %us%s%s\n",
+			sv.msName.c_str(), sv.msMap.c_str(),
+			(unsigned)sv.mlPlayerCount, (unsigned)sv.mlMaxPlayers,
+			sv.msAddress.c_str(), (unsigned)sv.mlAgeSeconds,
+			sv.mbPassword ? " [pw]" : "",
+			sv.mbVersionMatch ? "" : " [VERSION MISMATCH]");
 	}
 }
 
@@ -2578,6 +4511,17 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 	/* --- Host: answer pings with live state ------------------------------ */
 	if (mbHosting && mpImpl->mDiscoveryListenSock != INVALID_SOCKET)
 	{
+		/* v15: age the reflector limiter windows (see DiscoveryPongAllowed) */
+		mpImpl->mfPongGlobalWindow += afTimeStep;
+		if (mpImpl->mfPongGlobalWindow >= 1.0f)
+		{
+			mpImpl->mfPongGlobalWindow = 0;
+			mpImpl->mlPongGlobalCount = 0;
+		}
+		for (int b = 0; b < Impl::kPongBuckets; ++b)
+			if (mpImpl->mPong[b].mfWindowLeft > 0)
+				mpImpl->mPong[b].mfWindowLeft -= afTimeStep;
+
 		for (;;)
 		{
 			char buf[128];
@@ -2599,20 +4543,30 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 			cNetDiscoveryPing ping;
 			memcpy(&ping, buf, sizeof(ping));
 			if (ping.mType != eNetPacketType_DiscoveryPing ||
-				ping.mlProtocolMagic != kNetProtocolMagic)
-				continue;
+				ping.mlProtocolMagic != kNetProtocolMagic ||
+				ping.mlProtocolVer != kNetProtocolVersion)
+				continue; /* v15: a reflector on the open internet answers ONLY
+				             its own protocol; a mismatched browser no longer
+				             gets a (greyed-out) row, it simply does not see us */
+			if (!DiscoveryPongAllowed((uint32_t)from.sin_addr.s_addr))
+				continue; /* v15: per-source + global pong rate limit */
 
-			/* Reply even on version mismatch — the browser shows WHY the join
-			   would fail instead of the server just not existing. */
 			cNetDiscoveryPong pong;
 			memset(&pong, 0, sizeof(pong));
 			pong.mType = eNetPacketType_DiscoveryPong;
 			pong.mlProtocolMagic = kNetProtocolMagic;
 			pong.mlProtocolVer = kNetProtocolVersion;
 			pong.mlGamePort = mlListenPort;
-			pong.mlPlayerCount = (uint8_t)(m_mapGhosts.size() + 1); /* guests + me */
-			pong.mlMaxPlayers = mlMaxPlayers;
-			CopyPacketString(pong.msServerName, sizeof(pong.msServerName), msServerName.c_str());
+			pong.mlPlayerCount = (uint8_t)(CountConnectedPeers(true) + 1); /* accepted guests + me */
+			pong.mlMaxPlayers = GetMaxPlayers(); /* v17: effective cap (one per character) */
+			pong.mlHostNonce = mlHostNonce;      /* v20: one browser row per host */
+			{
+				/* v13: no server_name -> "<player_name>'s game" (or the old default) */
+				hpl::tString sAdvertised = msServerName;
+				if (sAdvertised.empty())
+					sAdvertised = msPlayerName.empty() ? hpl::tString("Penumbra Server") : msPlayerName + "'s game";
+				CopyPacketString(pong.msServerName, sizeof(pong.msServerName), sAdvertised.c_str());
+			}
 			const char *mapName = "";
 			if (mpInit && mpInit->mpMapHandler)
 				mapName = mpInit->mpMapHandler->GetCurrentMapName().c_str();
@@ -2630,13 +4584,13 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 		}
 	}
 
-	/* --- Browser: collect pongs until the window closes ------------------- */
-	if (!mbDiscoveryActive || mpImpl->mDiscoveryBrowseSock == INVALID_SOCKET)
+	/* --- Browser: collect pongs / master entries until the windows close -- */
+	if (!(mbDiscoveryActive || mbInternetActive) || mpImpl->mDiscoveryBrowseSock == INVALID_SOCKET)
 		return;
 
 	for (;;)
 	{
-		char buf[128];
+		char buf[1024]; /* a full master Entries datagram is 778 bytes */
 		sockaddr_in from;
 		int fromLen = sizeof(from);
 		int n = recvfrom(mpImpl->mDiscoveryBrowseSock, buf, sizeof(buf), 0,
@@ -2648,6 +4602,20 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 				continue;
 			break;
 		}
+		if (n < 1)
+			continue;
+
+		/* Master reply? Only from the address we asked — anything else on
+		   this socket claiming to be the master is dropped unread. */
+		if ((uint8_t)buf[0] == eNetMasterPacketType_Entries)
+		{
+			if (mbInternetActive && mpImpl->mbMasterResolved &&
+				from.sin_addr.s_addr == mpImpl->mMasterAddr.sin_addr.s_addr &&
+				from.sin_port == mpImpl->mMasterAddr.sin_port)
+				HandleMasterEntries(buf, n);
+			continue;
+		}
+
 		if (n != (int)sizeof(cNetDiscoveryPong))
 			continue;
 		cNetDiscoveryPong pong;
@@ -2656,12 +4624,21 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 			pong.mlProtocolMagic != kNetProtocolMagic)
 			continue;
 
+		/* v20: our own game answers our own ping — a hosting window must not
+		   list itself */
+		if (mbHosting && pong.mlHostNonce != 0 && pong.mlHostNonce == mlHostNonce)
+			continue;
+
 		char addr[64];
 		FormatAddrPort(from, pong.mlGamePort, addr, sizeof(addr));
 
+		/* v20: the same host answers once per network adapter, each reply
+		   from a different address — one row per host nonce. The first
+		   reply wins: it proved that address reaches the host from here. */
 		bool known = false;
 		for (size_t i = 0; i < mvDiscovered.size(); ++i)
-			if (mvDiscovered[i].msAddress == addr)
+			if (mvDiscovered[i].msAddress == addr ||
+				(pong.mlHostNonce != 0 && mvDiscovered[i].mlHostNonce == pong.mlHostNonce))
 			{
 				known = true;
 				break;
@@ -2679,6 +4656,10 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 		sv.mlPlayerCount = pong.mlPlayerCount;
 		sv.mlMaxPlayers = pong.mlMaxPlayers;
 		sv.mbVersionMatch = (pong.mlProtocolVer == kNetProtocolVersion);
+		sv.mbPassword = false; /* LAN pongs predate the flag; the host refuses a wrong password anyway */
+		sv.mlAgeSeconds = 0;
+		sv.mbInternet = false;
+		sv.mlHostNonce = pong.mlHostNonce;
 		mvDiscovered.push_back(sv);
 
 		Log(" multiplayer: discovered '%s' map='%s' %u/%u at %s%s\n",
@@ -2687,12 +4668,2689 @@ void cNetworkManager::PollDiscovery(float afTimeStep)
 			sv.msAddress.c_str(), sv.mbVersionMatch ? "" : " [VERSION MISMATCH]");
 	}
 
-	mfDiscoveryTimeLeft -= afTimeStep;
-	if (mfDiscoveryTimeLeft <= 0)
+	if (mbDiscoveryActive)
 	{
-		Log(" multiplayer: discovery done — %u server(s)\n", (unsigned)mvDiscovered.size());
-		StopDiscovery();
+		mfDiscoveryTimeLeft -= afTimeStep;
+		if (mfDiscoveryTimeLeft <= 0)
+		{
+			Log(" multiplayer: discovery done — %u server(s)\n", (unsigned)mvDiscovered.size());
+			StopDiscovery();
+		}
 	}
+	if (mbInternetActive)
+	{
+		mfInternetTimeLeft -= afTimeStep;
+		if (mfInternetTimeLeft <= 0)
+		{
+			Log(" multiplayer: internet list done — %u server(s)\n", (unsigned)mvInternet.size());
+			StopInternetRefresh();
+		}
+	}
+}
+
+//-----------------------------------------------------------------------
+// Enemy senses (host): appended accessor — see NetworkManager.h tail.
+//-----------------------------------------------------------------------
+
+bool cNetworkManager::GetGhostSense(uint8_t alId, hpl::cVector3f *apCamPos, uint8_t *apMoveState) const
+{
+	if (!mbHosting)
+		return false; /* only the host's AI has any business asking */
+	tGhostMap::const_iterator it = m_mapGhosts.find(alId);
+	if (it == m_mapGhosts.end() || !it->second)
+		return false; /* disconnected (DropRemotePlayer) / never joined */
+	cVector3f v;
+	if (!it->second->GetLastStatePos(&v))
+		return false; /* no state yet */
+	if (apCamPos)
+		*apCamPos = v;
+	if (apMoveState)
+	{
+		std::map<uint8_t, uint8_t>::const_iterator mi = m_mapGhostMoveState.find(alId);
+		*apMoveState = (mi != m_mapGhostMoveState.end()) ? mi->second : (uint8_t)eNetMoveState_Run;
+	}
+	return true;
+}
+
+//-----------------------------------------------------------------------
+// v12 party health (both roles): appended accessors — see NetworkManager.h tail.
+//-----------------------------------------------------------------------
+
+bool cNetworkManager::GetGhostHealth(uint8_t alId, float *apHealth) const
+{
+	if (alId == 0 || alId == mlLocalPlayerId)
+		return false;
+	std::map<uint8_t, uint8_t>::const_iterator it = m_mapGhostHealth.find(alId);
+	if (it == m_mapGhostHealth.end())
+		return false; /* disconnected (DropRemotePlayer) / no state yet */
+	if (apHealth)
+		*apHealth = (float)it->second;
+	return true;
+}
+
+void cNetworkManager::GetPartyStatus(std::vector<cNetPartyMember> &avOut) const
+{
+	avOut.clear();
+	if (!mbHosting && !(mbClientConnected && mbHadJoinPacket))
+		return;
+	for (std::map<uint8_t, uint8_t>::const_iterator it = m_mapGhostHealth.begin();
+		it != m_mapGhostHealth.end(); ++it)
+	{
+		if (it->first == 0 || it->first == mlLocalPlayerId || it->first == kPreviewGhostId)
+			continue;
+		cNetPartyMember m;
+		m.mlId = it->first;
+		m.mfHealth = (float)it->second;
+		tGhostMap::const_iterator gi = m_mapGhosts.find(it->first);
+		if (gi != m_mapGhosts.end() && gi->second)
+		{
+			m.mbHasFeetPos = gi->second->GetLastFeetPos(&m.mvFeetPos);
+			m.mbHasRenderPos = gi->second->GetRenderFeetPos(&m.mvRenderFeetPos);
+		}
+		avOut.push_back(m);
+	}
+}
+
+bool cNetworkManager::IsSessionLive() const
+{
+	if (mbHosting)
+		return GetConnectedGuestCount() > 0;
+	return mbClientConnected && mbHadJoinPacket;
+}
+
+//-----------------------------------------------------------------------
+// v14 world snapshot (late join / reconnect / host save+load): appended —
+// see NetworkManager.h tail and multiplayer/README.md "World snapshot".
+//-----------------------------------------------------------------------
+
+namespace
+{
+/** RAII: gbNetScriptApplying for the whole apply, restored on every path
+    (the script hooks, NetOnScriptEvent, NetOnEntityDamaged and the engine
+    var callback all go silent, so nothing we set echoes back to the host). */
+struct cNetApplyScope
+{
+	bool mbPrev;
+	cNetApplyScope() : mbPrev(gbNetScriptApplying) { gbNetScriptApplying = true; }
+	~cNetApplyScope() { gbNetScriptApplying = mbPrev; }
+private:
+	cNetApplyScope(const cNetApplyScope &);
+	cNetApplyScope &operator=(const cNetApplyScope &);
+};
+
+/** MapReady identity: lowercase, extension-stripped map name (the same
+    normalisation QualifiedItemHash uses). */
+static uint32_t SnapMapNameHash(const tString &asMap)
+{
+	return NetHashName(cString::ToLowerCase(cString::SetFileExt(asMap, "")).c_str());
+}
+
+/** Host-side chunk writer. Entries of ONE section are appended and split
+    into chunks of at most kNetSnapMaxChunkPayload payload bytes; every
+    section yields at least one chunk (mCount may be 0) so the receiver can
+    tell "the host has none" from "the section never arrived". */
+class cSnapWriter
+{
+public:
+	cSnapWriter(uint8_t alGen, uint8_t alId)
+		: mlGen(alGen), mlId(alId), mlSection(0), mbOpen(false), mlCount(0) {}
+
+	void Begin(uint8_t alSection)
+	{
+		Flush();
+		mlSection = alSection;
+		mbOpen = true;
+		mlCount = 0;
+		mvCur.clear();
+	}
+
+	void Add(const void *apEntry, size_t alSize)
+	{
+		if (!mbOpen || apEntry == NULL || alSize == 0 || alSize > kNetSnapMaxChunkPayload)
+			return;
+		if (mlCount > 0 && mvCur.size() + alSize > (size_t)kNetSnapMaxChunkPayload)
+		{
+			const uint8_t lSection = mlSection;
+			Flush();
+			mlSection = lSection;
+			mbOpen = true;
+		}
+		const unsigned char *p = (const unsigned char *)apEntry;
+		mvCur.insert(mvCur.end(), p, p + alSize);
+		++mlCount;
+	}
+
+	void Flush()
+	{
+		if (!mbOpen)
+			return;
+		cNetSnapshotHdr hdr;
+		hdr.mType = eNetPacketType_WorldSnapshot;
+		hdr.mSection = mlSection;
+		hdr.mMapGen = mlGen;
+		hdr.mSnapId = mlId;
+		hdr.mCount = (uint16_t)mlCount; /* <= 300 per chunk (4 B entries) */
+		std::vector<uint8_t> chunk(sizeof(hdr) + mvCur.size());
+		memcpy(&chunk[0], &hdr, sizeof(hdr));
+		if (!mvCur.empty())
+			memcpy(&chunk[sizeof(hdr)], &mvCur[0], mvCur.size());
+		mvChunks.push_back(chunk);
+		mvCur.clear();
+		mlCount = 0;
+		mbOpen = false;
+	}
+
+	std::vector<std::vector<uint8_t> > mvChunks;
+
+private:
+	uint8_t mlGen, mlId, mlSection;
+	bool mbOpen;
+	size_t mlCount;
+	std::vector<uint8_t> mvCur;
+};
+
+/** Guest side: header + whole entries of one buffered chunk. Returns the
+    entry count actually present (mCount clamped to what the packet holds). */
+static size_t SnapChunkEntries(const std::vector<uint8_t> &avChunk, size_t alEntrySize,
+	cNetSnapshotHdr *apHdr, const unsigned char **appFirst)
+{
+	if (avChunk.size() < sizeof(cNetSnapshotHdr) || alEntrySize == 0)
+		return 0;
+	memcpy(apHdr, &avChunk[0], sizeof(cNetSnapshotHdr));
+	*appFirst = &avChunk[0] + sizeof(cNetSnapshotHdr);
+	size_t lCount = apHdr->mCount;
+	const size_t lWhole = (avChunk.size() - sizeof(cNetSnapshotHdr)) / alEntrySize;
+	if (lCount > lWhole)
+		lCount = lWhole; /* truncated / corrupt length: whole entries only */
+	return lCount;
+}
+
+/** Wire floats are untrusted: NaN/inf must never reach a body or a health. */
+static bool SnapFinite(float afX)
+{
+	return afX == afX && afX <= 3.0e38f && afX >= -3.0e38f;
+}
+
+/** Entity types gameplay DESTROYS (picked items, broken objects): absent on
+    the host = gone for the party. Areas/links/ladders are never destroyed
+    by gameplay, so their absence means a map mismatch, not state. */
+static bool SnapTypeIsDestroyable(eGameEntityType aType)
+{
+	return aType == eGameEntityType_Item || aType == eGameEntityType_Object ||
+		aType == eGameEntityType_SwingDoor || aType == eGameEntityType_Door ||
+		aType == eGameEntityType_DoorPanel || aType == eGameEntityType_Lamp;
+}
+} // namespace
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::ResetSnapshotBuffer()
+{
+	mvSnapChunks.clear();
+	mbSnapBuffering = false;
+	mfSnapAge = 0;
+	mlSnapId = 0;
+	mlSnapGen = 0;
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::SendMapReady()
+{
+	if (mbHosting || !mpImpl || !mpImpl->mpHost || !mpImpl->mpServerPeer ||
+		mpImpl->mpServerPeer->state != ENET_PEER_STATE_CONNECTED)
+		return;
+	if (!mpBodySync->HasCensus() || !mpBodySync->HasRemoteCensus())
+		return; /* paired = both censuses known for OUR current world */
+	if (!mpInit || !mpInit->mpMapHandler)
+		return;
+	const tString sMap = mpInit->mpMapHandler->GetCurrentMapName();
+	if (sMap.empty())
+		return; /* menu: no world to be ready in */
+
+	cNetBodyCensus mine;
+	mpBodySync->BuildCensusPacket(&mine);
+
+	cNetMapReady pkt;
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.mType = eNetPacketType_MapReady;
+	pkt.mMapGen = mpBodySync->GetRemoteMapGen();
+	pkt.mlMapNameHash = SnapMapNameHash(sMap);
+	pkt.mlLocalBodyCount = mine.mlBodyCount;
+	pkt.mlLocalChecksum = mine.mlChecksum;
+	SendStructToPeer(mpImpl->mpServerPeer, &pkt, sizeof(pkt), true);
+	Log(" multiplayer: MapReady sent gen=%u map '%s' (census %u/0x%08X)\n",
+		(unsigned)pkt.mMapGen, sMap.c_str(), (unsigned)mine.mlBodyCount, mine.mlChecksum);
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::HandleMapReady(ENetPeer *apPeer, const void *apData, size_t alLen)
+{
+	if (!mbHosting || !apPeer || !apData || alLen < sizeof(cNetMapReady))
+		return;
+	cNetMapReady mr;
+	memcpy(&mr, apData, sizeof(mr));
+	const unsigned lGuest = (unsigned)PeerGetId(apPeer);
+
+	if (mr.mMapGen != mpBodySync->GetMapGen())
+	{
+		/* paired with a world we already left (our reload/transition): the
+		   census for the new one is on its way; it will ask again */
+		Log(" multiplayer: guest %u ready on STALE gen %u (ours %u) - ignored\n",
+			lGuest, (unsigned)mr.mMapGen, (unsigned)mpBodySync->GetMapGen());
+		return;
+	}
+	if (!mpInit || !mpInit->mpMapHandler || !mpInit->mpGame)
+		return;
+	const tString sMap = mpInit->mpMapHandler->GetCurrentMapName();
+	if (sMap.empty() || mr.mlMapNameHash != SnapMapNameHash(sMap))
+	{
+		/* standing on another map: the beacon already told it where to go;
+		   it sends MapReady again once it has followed */
+		Log(" multiplayer: guest %u ready on another map (hash 0x%08X, ours '%s') - no snapshot\n",
+			lGuest, (unsigned)mr.mlMapNameHash, sMap.c_str());
+		return;
+	}
+	if (mpInit->mpGame->GetScene() == NULL || mpInit->mpGame->GetScene()->GetWorld3D() == NULL ||
+		!mpBodySync->HasCensus())
+		return;
+
+	cNetBodyCensus mine;
+	mpBodySync->BuildCensusPacket(&mine);
+	Log(" multiplayer: guest %u ready on gen %u (census %u/0x%08X vs ours %u/0x%08X)\n",
+		lGuest, (unsigned)mr.mMapGen, (unsigned)mr.mlLocalBodyCount, mr.mlLocalChecksum,
+		(unsigned)mine.mlBodyCount, mine.mlChecksum);
+	SendWorldSnapshot(apPeer);
+}
+
+//-----------------------------------------------------------------------
+
+int cNetworkManager::SendBodySnapshot(ENetPeer *apPeer, size_t *apBytesOut)
+{
+	if (!mbHosting || !apPeer || apPeer->state != ENET_PEER_STATE_CONNECTED)
+		return 0;
+	/* Every replicable body, resting ones flagged Sleeping (the guest pins
+	   those and disables the twin). Read-only for the shared delta
+	   bookkeeping (BodySync m_mapSent): priming it for this one peer used to
+	   swallow the awake->asleep rest pose of the OTHER connected guests.
+	   Reliable ch0: ordered with the snapshot sections around it. */
+	unsigned char aSnapBuf[cBodySync::kMaxBatchBytes];
+	uint32_t lCursor = 0;
+	int lChunks = 0;
+	size_t lLen;
+	while ((lLen = mpBodySync->BuildSnapshotChunk(aSnapBuf, &lCursor)) != 0)
+	{
+		SendStructToPeer(apPeer, aSnapBuf, lLen, true);
+		++lChunks;
+		if (apBytesOut)
+			*apBytesOut += lLen;
+	}
+	return lChunks;
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::SendWorldSnapshot(ENetPeer *apPeer)
+{
+	if (!mbHosting || !apPeer || apPeer->state != ENET_PEER_STATE_CONNECTED)
+		return;
+	if (!mpInit || !mpInit->mpMapHandler || !mpInit->mpGame)
+		return;
+	cScene *pScene = mpInit->mpGame->GetScene();
+	if (pScene == NULL || pScene->GetWorld3D() == NULL)
+		return;
+
+	const uint8_t lGen = mpBodySync->GetMapGen();
+	const uint8_t lId = ++mlSnapIdOut;
+	cSnapWriter w(lGen, lId);
+	int lVarsL = 0, lVarsG = 0, lEnts = 0, lTaken = 0, lParty = 0, lEnemies = 0, lTimers = 0, lSkipped = 0;
+
+	/* a. script vars — local, then global. The scene keys them lowercase;
+	   msName keeps the script's spelling (what CreateLocalVar wants back). */
+	for (int lPass = 0; lPass < 2; ++lPass)
+	{
+		w.Begin(lPass == 0 ? (uint8_t)eNetSnap_LocalVar : (uint8_t)eNetSnap_GlobalVar);
+		tScriptVarMap *pMap = lPass == 0 ? pScene->GetLocalVarMap() : pScene->GetGlobalVarMap();
+		if (pMap == NULL)
+			continue;
+		for (tScriptVarMapIt it = pMap->begin(); it != pMap->end(); ++it)
+		{
+			const tString &sName = it->second.msName.empty() ? it->first : it->second.msName;
+			if (sName.empty())
+				continue;
+			if (sName.size() >= sizeof(cNetSnapVar().msName))
+			{
+				Log(" multiplayer: snapshot: var name '%s' too long - skipped\n", sName.c_str());
+				++lSkipped;
+				continue;
+			}
+			cNetSnapVar e;
+			memset(&e, 0, sizeof(e));
+			strncpy(e.msName, sName.c_str(), sizeof(e.msName) - 1);
+			e.mlVal = (int32_t)it->second.mlVal;
+			w.Add(&e, sizeof(e));
+			if (lPass == 0) ++lVarsL; else ++lVarsG;
+		}
+	}
+
+	/* b/c/g1. every non-enemy game entity: presence, active, lock, lit,
+	   health. Unqualified name hash (the generation scopes the map);
+	   duplicate names (a multimap) keep the first, like the body index. */
+	{
+		w.Begin(eNetSnap_Entity);
+		std::set<uint32_t> setSeen;
+		tGameEntityIterator it = mpInit->mpMapHandler->GetGameEntityIterator();
+		while (it.HasNext())
+		{
+			iGameEntity *pEnt = it.Next();
+			if (pEnt == NULL || pEnt->GetType() == eGameEntityType_Enemy || pEnt->GetName().empty())
+				continue;
+			const uint32_t lHash = NetHashName(pEnt->GetName().c_str());
+			if (!setSeen.insert(lHash).second)
+			{
+				Log(" multiplayer: snapshot: duplicate entity name '%s' - second skipped\n",
+					pEnt->GetName().c_str());
+				++lSkipped;
+				continue;
+			}
+			cNetSnapEntity e;
+			memset(&e, 0, sizeof(e));
+			e.mlNameHash = lHash;
+			e.mType = (uint8_t)pEnt->GetType();
+			e.mFlags = pEnt->IsActive() ? kNetSnapEntityFlag_Active : 0;
+			if (pEnt->GetType() == eGameEntityType_SwingDoor &&
+				static_cast<cGameSwingDoor *>(pEnt)->IsLocked())
+				e.mFlags |= kNetSnapEntityFlag_Locked;
+			if (pEnt->GetType() == eGameEntityType_Lamp &&
+				static_cast<cGameLamp *>(pEnt)->IsLit())
+				e.mFlags |= kNetSnapEntityFlag_Lit;
+			e.mfHealth = pEnt->GetHealth();
+			w.Add(&e, sizeof(e));
+			++lEnts;
+		}
+	}
+
+	/* d. taken items (whole session, qualified map:name hashes — after 5a
+	   our own picks are in here too) and the party inventory (our items +
+	   what the other guests told us they hold). */
+	{
+		w.Begin(eNetSnap_TakenItem);
+		for (std::set<uint32_t>::const_iterator it = m_setTakenItems.begin(); it != m_setTakenItems.end(); ++it)
+		{
+			const uint32_t lHash = *it;
+			w.Add(&lHash, sizeof(lHash));
+			++lTaken;
+		}
+
+		/* v23 shared loot: the host's inventory itself, so a late joiner
+		   starts with the party's items (an empty section when shared_loot=0) */
+		w.Begin(eNetSnap_SharedItem);
+		if (mbSharedLoot && mpInit->mpInventory)
+		{
+			for (tInventoryItemMapIt it = mpInit->mpInventory->m_mapItems.begin();
+				it != mpInit->mpInventory->m_mapItems.end(); ++it)
+			{
+				cInventoryItem *pItem = it->second;
+				if (pItem == NULL)
+					continue;
+				const tString sFile = cString::GetFileName(pItem->GetEntityFile());
+				cNetSnapSharedItem e;
+				memset(&e, 0, sizeof(e));
+				if (pItem->GetName().empty() || pItem->GetName().size() >= sizeof(e.msName) ||
+					sFile.empty() || sFile.size() >= sizeof(e.msFile))
+				{
+					++lSkipped;
+					continue;
+				}
+				strncpy(e.msName, pItem->GetName().c_str(), sizeof(e.msName) - 1);
+				strncpy(e.msFile, sFile.c_str(), sizeof(e.msFile) - 1);
+				e.mlCount = pItem->HasCount() ? pItem->GetCount() : 1;
+				w.Add(&e, sizeof(e));
+			}
+		}
+
+		w.Begin(eNetSnap_PartyItem);
+		std::set<tString> setParty(m_setPartyItems);
+		if (mpInit->mpInventory)
+		{
+			for (tInventoryItemMapIt it = mpInit->mpInventory->m_mapItems.begin();
+				it != mpInit->mpInventory->m_mapItems.end(); ++it)
+			{
+				if (it->second)
+					setParty.insert(it->second->GetName());
+			}
+		}
+		for (std::set<tString>::const_iterator it = setParty.begin(); it != setParty.end(); ++it)
+		{
+			char aName[32];
+			if (it->empty())
+				continue;
+			if (it->size() >= sizeof(aName))
+			{
+				Log(" multiplayer: snapshot: item name '%s' too long - skipped\n", it->c_str());
+				++lSkipped;
+				continue;
+			}
+			memset(aName, 0, sizeof(aName));
+			strncpy(aName, it->c_str(), sizeof(aName) - 1);
+			w.Add(aName, sizeof(aName));
+			++lParty;
+		}
+	}
+
+	/* f. enemy roster: the same entries the stream carries. */
+	{
+		w.Begin(eNetSnap_Enemy);
+		tGameEnemyIterator it = mpInit->mpMapHandler->GetGameEnemyIterator();
+		while (it.HasNext())
+		{
+			cNetEnemyState st;
+			if (!FillEnemyState(it.Next(), &st))
+				continue;
+			w.Add(&st, sizeof(st));
+			++lEnemies;
+		}
+	}
+
+	/* g2. LOCAL timers (global ones outlive the map and are not its state). */
+	{
+		w.Begin(eNetSnap_Timer);
+		for (tGameTimerListIt it = mpInit->mpMapHandler->mlstTimers.begin();
+			it != mpInit->mpMapHandler->mlstTimers.end(); ++it)
+		{
+			cGameTimer *pTimer = *it;
+			if (pTimer == NULL || pTimer->mbGlobal || pTimer->mbDeleteMe)
+				continue;
+			if (pTimer->msName.empty() ||
+				pTimer->msName.size() >= sizeof(cNetSnapTimer().msName) ||
+				pTimer->msCallback.size() >= sizeof(cNetSnapTimer().msCallback))
+			{
+				Log(" multiplayer: snapshot: timer '%s' name/callback too long - skipped\n",
+					pTimer->msName.c_str());
+				++lSkipped;
+				continue;
+			}
+			cNetSnapTimer e;
+			memset(&e, 0, sizeof(e));
+			strncpy(e.msName, pTimer->msName.c_str(), sizeof(e.msName) - 1);
+			strncpy(e.msCallback, pTimer->msCallback.c_str(), sizeof(e.msCallback) - 1);
+			e.mfTime = pTimer->mfTime;
+			e.mbPaused = pTimer->mbPaused ? 1 : 0;
+			w.Add(&e, sizeof(e));
+			++lTimers;
+		}
+		w.Flush();
+	}
+
+	/* Send: Begin, the section chunks, the body poses (ObjectState chunks,
+	   same reliable channel = same order), End. */
+	size_t lBytes = 0;
+	cNetSnapshotHdr hdr;
+	hdr.mType = eNetPacketType_WorldSnapshot;
+	hdr.mSection = eNetSnap_Begin;
+	hdr.mMapGen = lGen;
+	hdr.mSnapId = lId;
+	hdr.mCount = (uint16_t)(w.mvChunks.size() > 65535 ? 65535 : w.mvChunks.size());
+	SendStructToPeer(apPeer, &hdr, sizeof(hdr), true);
+	lBytes += sizeof(hdr);
+
+	for (size_t i = 0; i < w.mvChunks.size(); ++i)
+	{
+		SendStructToPeer(apPeer, &w.mvChunks[i][0], w.mvChunks[i].size(), true);
+		lBytes += w.mvChunks[i].size();
+	}
+
+	const int lBodyChunks = SendBodySnapshot(apPeer, &lBytes);
+
+	hdr.mSection = eNetSnap_End;
+	hdr.mCount = (uint16_t)(lBodyChunks > 65535 ? 65535 : lBodyChunks);
+	SendStructToPeer(apPeer, &hdr, sizeof(hdr), true);
+	lBytes += sizeof(hdr);
+
+	Log(" multiplayer: world snapshot -> peer %u: %u chunks, %u bytes (id=%u gen=%u; vars %d/%d, entities %d, taken %d, party %d, enemies %d, timers %d, bodies %d chunks, skipped %d)\n",
+		(unsigned)PeerGetId(apPeer), (unsigned)(w.mvChunks.size() + (size_t)lBodyChunks + 2),
+		(unsigned)lBytes, (unsigned)lId, (unsigned)lGen, lVarsL, lVarsG, lEnts, lTaken, lParty,
+		lEnemies, lTimers, lBodyChunks, lSkipped);
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::HandleSnapshotChunk(const void *apData, size_t alLen)
+{
+	if (mbHosting || !apData || alLen < sizeof(cNetSnapshotHdr))
+		return;
+	cNetSnapshotHdr hdr;
+	memcpy(&hdr, apData, sizeof(hdr));
+
+	if (!mpBodySync->IsRemoteGen(hdr.mMapGen))
+	{
+		if (hdr.mSection == eNetSnap_Begin)
+			Log(" multiplayer: world snapshot id=%u for gen %u (paired %u) - dropped\n",
+				(unsigned)hdr.mSnapId, (unsigned)hdr.mMapGen, (unsigned)mpBodySync->GetRemoteMapGen());
+		return;
+	}
+
+	if (hdr.mSection == eNetSnap_Begin)
+	{
+		if (mbSnapBuffering)
+			Log(" multiplayer: world snapshot id=%u superseded by id=%u - discarded\n",
+				(unsigned)mlSnapId, (unsigned)hdr.mSnapId);
+		ResetSnapshotBuffer();
+		mlSnapId = hdr.mSnapId;
+		mlSnapGen = hdr.mMapGen;
+		mbSnapBuffering = true;
+		mfSnapAge = 0;
+		Log(" multiplayer: world snapshot begin id=%u gen=%u (%u section chunk(s))\n",
+			(unsigned)hdr.mSnapId, (unsigned)hdr.mMapGen, (unsigned)hdr.mCount);
+		return;
+	}
+	if (!mbSnapBuffering || hdr.mSnapId != mlSnapId)
+		return; /* stray chunk of another snapshot */
+
+	if (hdr.mSection == eNetSnap_End)
+	{
+		Log(" multiplayer: world snapshot end id=%u: %u section chunk(s), %u body chunk(s) - applying\n",
+			(unsigned)hdr.mSnapId, (unsigned)mvSnapChunks.size(), (unsigned)hdr.mCount);
+		ApplyWorldSnapshot();
+		ResetSnapshotBuffer();
+		return;
+	}
+	if (hdr.mSection < eNetSnap_LocalVar || hdr.mSection > eNetSnap_SharedItem) /* v23 */
+		return; /* unknown section */
+	if (mvSnapChunks.size() >= 4096)
+	{
+		Log(" multiplayer: world snapshot id=%u: too many chunks - dropped\n", (unsigned)mlSnapId);
+		ResetSnapshotBuffer();
+		return;
+	}
+	const uint8_t *pRaw = (const uint8_t *)apData;
+	mvSnapChunks.push_back(std::vector<uint8_t>(pRaw, pRaw + alLen));
+}
+
+//-----------------------------------------------------------------------
+
+void cNetworkManager::ApplyWorldSnapshot()
+{
+	if (mbHosting || !mpInit || !mpInit->mpGame || !mpInit->mpMapHandler)
+		return;
+	cScene *pScene = mpInit->mpGame->GetScene();
+	if (pScene == NULL || pScene->GetWorld3D() == NULL)
+	{
+		Log(" multiplayer: world snapshot id=%u: no world - dropped\n", (unsigned)mlSnapId);
+		return;
+	}
+	if (!mpBodySync->IsRemoteGen(mlSnapGen))
+	{
+		Log(" multiplayer: world snapshot id=%u: gen %u no longer paired - dropped\n",
+			(unsigned)mlSnapId, (unsigned)mlSnapGen);
+		return;
+	}
+	if (mbLocalMapChangeArmed)
+	{
+		Log(" multiplayer: world snapshot id=%u: we are leaving this map - dropped\n",
+			(unsigned)mlSnapId);
+		return;
+	}
+
+	cNetApplyScope applyScope; /* nothing below echoes back to the host */
+
+	int lVarsL = 0, lVarsG = 0, lEnts = 0, lActive = 0, lAbsent = 0, lMissing = 0, lDoors = 0,
+		lLamps = 0, lTaken = 0, lParty = 0, lEnemies = 0, lEnemiesDead = 0, lTimers = 0;
+	bool bHaveEntities = false, bHaveParty = false, bHaveTimers = false;
+	cNetSnapshotHdr hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	const unsigned char *pFirst = NULL;
+
+	/* 1. vars first: polled by OnUpdate scripts, so they are final before
+	   anything visible changes. */
+	for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+	{
+		const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(cNetSnapVar), &hdr, &pFirst);
+		if (hdr.mSection != eNetSnap_LocalVar && hdr.mSection != eNetSnap_GlobalVar)
+			continue;
+		for (size_t i = 0; i < lCount; ++i)
+		{
+			cNetSnapVar v;
+			memcpy(&v, pFirst + i * sizeof(v), sizeof(v));
+			v.msName[sizeof(v.msName) - 1] = 0; /* untrusted wire string */
+			if (v.msName[0] == 0)
+				continue;
+			if (hdr.mSection == eNetSnap_LocalVar)
+			{
+				pScene->CreateLocalVar(tString(v.msName))->mlVal = (int)v.mlVal;
+				++lVarsL;
+			}
+			else
+			{
+				pScene->CreateGlobalVar(tString(v.msName))->mlVal = (int)v.mlVal;
+				++lVarsG;
+			}
+		}
+	}
+
+	/* 2. entities: one hash -> entity index, then the host's entries, then
+	   the "present here, absent on the host" sweep. */
+	{
+		std::map<uint32_t, iGameEntity *> mapEnts;
+		{
+			tGameEntityIterator it = mpInit->mpMapHandler->GetGameEntityIterator();
+			while (it.HasNext())
+			{
+				iGameEntity *pEnt = it.Next();
+				if (pEnt == NULL || pEnt->GetType() == eGameEntityType_Enemy || pEnt->GetName().empty())
+					continue;
+				mapEnts.insert(std::make_pair(NetHashName(pEnt->GetName().c_str()), pEnt));
+			}
+		}
+		std::set<uint32_t> setSeen;
+
+		for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+		{
+			const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(cNetSnapEntity), &hdr, &pFirst);
+			if (hdr.mSection != eNetSnap_Entity)
+				continue;
+			bHaveEntities = true;
+			for (size_t i = 0; i < lCount; ++i)
+			{
+				cNetSnapEntity e;
+				memcpy(&e, pFirst + i * sizeof(e), sizeof(e));
+				++lEnts;
+				setSeen.insert(e.mlNameHash);
+
+				std::map<uint32_t, iGameEntity *>::iterator ei = mapEnts.find(e.mlNameHash);
+				if (ei == mapEnts.end())
+				{
+					/* host-only entity (ReplaceEntity result, a drop twin that
+					   failed to spawn here): never CREATE — log and skip */
+					Log(" multiplayer: snapshot: host entity 0x%08X (type %u) does not exist here - skipped\n",
+						(unsigned)e.mlNameHash, (unsigned)e.mType);
+					++lMissing;
+					continue;
+				}
+				iGameEntity *pEnt = ei->second;
+				if ((uint8_t)pEnt->GetType() != e.mType)
+					continue; /* same name, different kind: not the same thing */
+
+				const bool bActive = (e.mFlags & kNetSnapEntityFlag_Active) != 0;
+				if (pEnt->IsActive() != bActive)
+				{
+					if (!bActive)
+					{
+						/* our player may be holding one of its bodies */
+						for (int b = 0; b < pEnt->GetBodyNum(); ++b)
+						{
+							uint32_t lBodyHash;
+							if (pEnt->GetBody(b) && mpBodySync->GetHashForBody(pEnt->GetBody(b), &lBodyHash))
+								ForceReleaseIfHolding(lBodyHash);
+						}
+					}
+					pEnt->SetActive(bActive);
+					++lActive;
+				}
+				if (pEnt->GetType() == eGameEntityType_SwingDoor)
+				{
+					/* after the body pose (already pinned on arrival), so the
+					   +-1 degree hinge clamp lands on the host's door pose */
+					cGameSwingDoor *pDoor = static_cast<cGameSwingDoor *>(pEnt);
+					const bool bLocked = (e.mFlags & kNetSnapEntityFlag_Locked) != 0;
+					if (pDoor->IsLocked() != bLocked)
+					{
+						pDoor->SetLocked(bLocked);
+						++lDoors;
+					}
+				}
+				else if (pEnt->GetType() == eGameEntityType_Lamp)
+				{
+					cGameLamp *pLamp = static_cast<cGameLamp *>(pEnt);
+					const bool bLit = (e.mFlags & kNetSnapEntityFlag_Lit) != 0;
+					if (pLamp->IsLit() != bLit)
+					{
+						/* silence the lit-change script: the host ran it */
+						const tString sCallback = pLamp->GetLitChangeCallback();
+						pLamp->SetLitChangeCallback("");
+						pLamp->SetLit(bLit, false);
+						pLamp->SetLitChangeCallback(sCallback);
+						++lLamps;
+					}
+				}
+				/* alive breakables: plain assign (SetHealth's > 0 branch);
+				   a host-side death is carried by ABSENCE, not by health */
+				if (SnapFinite(e.mfHealth) && e.mfHealth > 0 && pEnt->GetHealth() > 0 &&
+					e.mfHealth != pEnt->GetHealth())
+					pEnt->SetHealth(e.mfHealth);
+			}
+		}
+
+		if (bHaveEntities)
+		{
+			for (std::map<uint32_t, iGameEntity *>::iterator mi = mapEnts.begin(); mi != mapEnts.end(); ++mi)
+			{
+				if (setSeen.count(mi->first))
+					continue;
+				iGameEntity *pEnt = mi->second;
+				if (!SnapTypeIsDestroyable(pEnt->GetType()))
+				{
+					Log(" multiplayer: snapshot: '%s' exists here but not on the host (map mismatch?)\n",
+						pEnt->GetName().c_str());
+					continue;
+				}
+				if (!pEnt->IsActive())
+					continue;
+				for (int b = 0; b < pEnt->GetBodyNum(); ++b)
+				{
+					uint32_t lBodyHash;
+					if (pEnt->GetBody(b) && mpBodySync->GetHashForBody(pEnt->GetBody(b), &lBodyHash))
+						ForceReleaseIfHolding(lBodyHash);
+				}
+				pEnt->SetActive(false);
+				++lAbsent;
+				Log(" multiplayer: snapshot: '%s' is gone on the host (picked up / broken) - deactivated\n",
+					pEnt->GetName().c_str());
+			}
+		}
+	}
+
+	/* 3. enemies — after the entity actives so nothing undoes SetActive. */
+	{
+		std::map<uint32_t, iGameEnemy *> mapEnemies;
+		{
+			tGameEnemyIterator it = mpInit->mpMapHandler->GetGameEnemyIterator();
+			while (it.HasNext())
+			{
+				iGameEnemy *pE = it.Next();
+				if (pE)
+					mapEnemies.insert(std::make_pair(NetHashName(pE->GetName().c_str()), pE));
+			}
+		}
+		for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+		{
+			const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(cNetEnemyState), &hdr, &pFirst);
+			if (hdr.mSection != eNetSnap_Enemy)
+				continue;
+			for (size_t i = 0; i < lCount; ++i)
+			{
+				cNetEnemyState st;
+				memcpy(&st, pFirst + i * sizeof(st), sizeof(st));
+				std::map<uint32_t, iGameEnemy *>::iterator ei = mapEnemies.find(st.mlNameHash);
+				if (ei == mapEnemies.end())
+					continue;
+				iGameEnemy *pEnemy = ei->second;
+				if (!SnapFinite(st.mfPosX) || !SnapFinite(st.mfPosY) || !SnapFinite(st.mfPosZ) ||
+					!SnapFinite(st.mfYaw) || !SnapFinite(st.mfHealth))
+					continue; /* garbage entry */
+				const cVector3f vFeet(st.mfPosX, st.mfPosY, st.mfPosZ);
+
+				if (st.mfHealth <= 0)
+				{
+					if (pEnemy->GetHealth() > 0)
+					{
+						/* dead on the host: ragdoll at the host's spot, and
+						   NEVER its death script (the host ran it) */
+						pEnemy->SetOnDeathCallback("");
+						if (pEnemy->GetMover() && pEnemy->GetMover()->GetCharBody())
+						{
+							pEnemy->GetMover()->GetCharBody()->SetFeetPosition(vFeet);
+							pEnemy->GetMover()->GetCharBody()->SetYaw(st.mfYaw);
+						}
+						pEnemy->SetNetPuppet(false);
+						pEnemy->Damage(100000.0f, 100);
+						++lEnemiesDead;
+					}
+					continue;
+				}
+				if (pEnemy->GetHealth() <= 0)
+					continue; /* dead here, alive there: the ragdoll owns it */
+
+				pEnemy->SetNetPuppet(true);
+				const bool bActive = (st.mFlags & 2) != 0;
+				if (pEnemy->IsActive() != bActive)
+					pEnemy->SetActive(bActive);
+				pEnemy->NetSetTarget(vFeet, st.mfYaw); /* snaps at > 3 m */
+				if (st.mfHealth != pEnemy->GetHealth())
+					pEnemy->SetHealth(st.mfHealth); /* > 0 here: plain assign */
+				++lEnemies;
+			}
+		}
+	}
+
+	/* 4. body poses were pinned on arrival (ObjectState chunks). */
+
+	/* 5. taken items (insert + sweep) and the party inventory (replace —
+	   JoinGame cleared it; our OWN inventory is never touched). */
+	for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+	{
+		const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(uint32_t), &hdr, &pFirst);
+		if (hdr.mSection != eNetSnap_TakenItem)
+			continue;
+		for (size_t i = 0; i < lCount; ++i)
+		{
+			uint32_t lHash;
+			memcpy(&lHash, pFirst + i * sizeof(lHash), sizeof(lHash));
+			m_setTakenItems.insert(lHash);
+			++lTaken;
+		}
+	}
+	if (lTaken > 0)
+		ApplyTakenItems();
+	for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+	{
+		const size_t lCount = SnapChunkEntries(mvSnapChunks[c], 32, &hdr, &pFirst);
+		if (hdr.mSection != eNetSnap_PartyItem)
+			continue;
+		if (!bHaveParty)
+		{
+			bHaveParty = true;
+			m_setPartyItems.clear();
+		}
+		for (size_t i = 0; i < lCount; ++i)
+		{
+			char aName[32];
+			memcpy(aName, pFirst + i * sizeof(aName), sizeof(aName));
+			aName[sizeof(aName) - 1] = 0;
+			if (aName[0] == 0)
+				continue;
+			m_setPartyItems.insert(tString(aName));
+			++lParty;
+		}
+	}
+
+	/* 5c. v23 shared loot: the host's inventory — a late joiner (or a
+	   reconnect) gets what the party already carries. Items we hold are
+	   skipped (counted ones take the host's amount). */
+	int lShared = 0;
+	for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+	{
+		const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(cNetSnapSharedItem), &hdr, &pFirst);
+		if (hdr.mSection != eNetSnap_SharedItem)
+			continue;
+		for (size_t i = 0; i < lCount; ++i)
+		{
+			cNetSnapSharedItem e;
+			memcpy(&e, pFirst + i * sizeof(e), sizeof(e));
+			e.msName[sizeof(e.msName) - 1] = 0;
+			e.msFile[sizeof(e.msFile) - 1] = 0;
+			if (e.msName[0] == 0 || !NetBareFileNameOk(e.msFile, sizeof(e.msFile), "ent"))
+				continue;
+			GiveSharedItem(tString(e.msName), tString(e.msFile),
+				(e.mlCount > 0 && e.mlCount < 1000) ? (int)e.mlCount : -1);
+			++lShared;
+		}
+	}
+	if (lShared > 0)
+		Log(" multiplayer: world snapshot: %d shared item(s) from the host's inventory\n", lShared);
+
+	/* 6. local timers: ours (created by our own OnStart) are replaced by
+	   the host's — theirs fire later on both machines alike. */
+	for (size_t c = 0; c < mvSnapChunks.size(); ++c)
+	{
+		const size_t lCount = SnapChunkEntries(mvSnapChunks[c], sizeof(cNetSnapTimer), &hdr, &pFirst);
+		if (hdr.mSection != eNetSnap_Timer)
+			continue;
+		if (!bHaveTimers)
+		{
+			bHaveTimers = true;
+			mpInit->mpMapHandler->RemoveLocalTimers();
+		}
+		for (size_t i = 0; i < lCount; ++i)
+		{
+			cNetSnapTimer t;
+			memcpy(&t, pFirst + i * sizeof(t), sizeof(t));
+			t.msName[sizeof(t.msName) - 1] = 0;
+			t.msCallback[sizeof(t.msCallback) - 1] = 0;
+			if (t.msName[0] == 0 || !SnapFinite(t.mfTime))
+				continue;
+			cGameTimer *pTimer = mpInit->mpMapHandler->CreateTimer(tString(t.msName), t.mfTime,
+				tString(t.msCallback), false);
+			if (pTimer)
+				pTimer->mbPaused = t.mbPaused != 0;
+			++lTimers;
+		}
+	}
+
+	/* 6b. Presentation hand-back. Our own OnStart ran before this snapshot
+	   and may have started an intro: FadeOut(0), player frozen, widescreen,
+	   a scripted look-at, depth of field — each undone later by one of OUR
+	   timers. Step 6 just replaced those timers with the host's, and the
+	   host fired its intro timers long ago, so nothing would ever undo it:
+	   a permanent black screen (the boat cabin on a new game). The host is
+	   mid-game, so hand the guest a playable view. */
+	if (bHaveTimers && mpInit->mpFadeHandler && mpInit->mpPlayer)
+	{
+		mpInit->mpFadeHandler->FadeIn(1.0f);
+		mpInit->mpFadeHandler->SetWideScreenActive(false);
+		if (mpInit->mpPlayer->GetLookAt())
+			mpInit->mpPlayer->GetLookAt()->SetActive(false);
+		if (mpInit->mpEffectHandler && mpInit->mpEffectHandler->GetDepthOfField())
+			mpInit->mpEffectHandler->GetDepthOfField()->SetActive(false, 1.0f);
+		if (mpInit->mpPlayer->GetHealth() > 0 && !mpInit->mpPlayer->IsActive())
+			mpInit->mpPlayer->SetActive(true);
+		Log(" multiplayer: world snapshot replaced our intro timers - faded in and unfroze the player\n");
+	}
+
+	/* 7. done: the enemy stream restarts from whatever seq comes next. */
+	mbEnemySeqInKnown = false;
+	Log(" multiplayer: world snapshot id=%u applied: vars %d/%d, entities %d (%d active changed, %d deactivated: absent on host, %d unknown here), doors %d, lamps %d, taken %d, party %d, enemies %d (+%d dead), timers %d\n",
+		(unsigned)mlSnapId, lVarsL, lVarsG, lEnts, lActive, lAbsent, lMissing, lDoors, lLamps,
+		lTaken, lParty, lEnemies, lEnemiesDead, lTimers);
+}
+
+#endif /* PENUMBRA_MULTIPLAYER */
+
+//======================================================================
+// v13: player names + party event feed — APPENDED, shared by the real and
+// the stub build (see the NetworkManager.h tail). Only SendNameTable /
+// SendLocalName touch ENet and live under PENUMBRA_MULTIPLAYER.
+//======================================================================
+
+const float cNetworkManager::kPartyEventLifeSeconds = 6.0f;
+const float cNetworkManager::kPartyJoinGraceSeconds = 2.0f;
+
+hpl::tString cNetworkManager::SanitizePlayerName(const hpl::tString &asName)
+{
+	hpl::tString sOut;
+	sOut.reserve(asName.size() < kNetPlayerNameMaxChars ? asName.size() : kNetPlayerNameMaxChars);
+	for (size_t i = 0; i < asName.size(); ++i)
+	{
+		const unsigned char c = (unsigned char)asName[i];
+		if (c < 32 || c > 126)
+			continue; /* control chars, DEL, anything non-ASCII */
+		if (c == ' ' && sOut.empty())
+			continue; /* leading blanks */
+		if (sOut.size() >= kNetPlayerNameMaxChars)
+			break;
+		sOut += (char)c;
+	}
+	while (!sOut.empty() && sOut[sOut.size() - 1] == ' ')
+		sOut.erase(sOut.size() - 1); /* trailing blanks (also after truncation) */
+	return sOut;
+}
+
+/* One key of the plain key=value file, other lines untouched. The file is
+   small (a few dozen lines) so it is read whole, patched in memory and
+   written back through a temp file + rename. */
+bool cNetworkManager::UpdateMultiplayerCfgKey(const char *asKey, const hpl::tString &asValue)
+{
+	if (!asKey || !asKey[0])
+		return false;
+	const size_t lKeyLen = strlen(asKey);
+
+	std::vector<hpl::tString> vLines;
+	{
+		FILE *fp = fopen(gsMultiplayerCfg.c_str(), "r");
+		if (fp)
+		{
+			char buf[1024];
+			while (fgets(buf, sizeof(buf), fp))
+				vLines.push_back(hpl::tString(buf));
+			fclose(fp);
+		}
+	}
+
+	bool bReplaced = false;
+	for (size_t i = 0; i < vLines.size() && !bReplaced; ++i)
+	{
+		const hpl::tString &sLine = vLines[i];
+		size_t p = 0;
+		while (p < sLine.size() && (sLine[p] == ' ' || sLine[p] == '\t'))
+			++p;
+		if (sLine.compare(p, lKeyLen, asKey) != 0)
+			continue; /* different key, comment ("# key=") or blank line */
+		p += lKeyLen;
+		while (p < sLine.size() && (sLine[p] == ' ' || sLine[p] == '\t'))
+			++p;
+		if (p >= sLine.size() || sLine[p] != '=')
+			continue; /* "player_name_x=" or no '=' at all: not our key */
+		const bool bCrLf = sLine.size() >= 2 && sLine[sLine.size() - 2] == '\r';
+		vLines[i] = hpl::tString(asKey) + "=" + asValue + (bCrLf ? "\r\n" : "\n");
+		bReplaced = true;
+	}
+	if (!bReplaced)
+	{
+		if (!vLines.empty())
+		{
+			hpl::tString &sLast = vLines[vLines.size() - 1];
+			if (sLast.empty() || sLast[sLast.size() - 1] != '\n')
+				sLast += "\n"; /* a file that ends mid-line */
+		}
+		vLines.push_back(hpl::tString(asKey) + "=" + asValue + "\n");
+	}
+
+	const tString sTmp = gsMultiplayerCfg + ".tmp";
+	const char *szTmp = sTmp.c_str();
+	FILE *fo = fopen(szTmp, "w");
+	if (!fo)
+	{
+		Log(" multiplayer: cannot write %s\n", szTmp);
+		return false;
+	}
+	bool bOk = true;
+	for (size_t i = 0; i < vLines.size() && bOk; ++i)
+		bOk = fwrite(vLines[i].data(), 1, vLines[i].size(), fo) == vLines[i].size();
+	if (fclose(fo) != 0)
+		bOk = false;
+	if (!bOk)
+	{
+		Log(" multiplayer: writing %s failed - multiplayer.cfg left untouched\n", szTmp);
+		remove(szTmp);
+		return false;
+	}
+	remove(gsMultiplayerCfg.c_str()); /* Windows rename() refuses to overwrite */
+	if (rename(szTmp, gsMultiplayerCfg.c_str()) != 0)
+	{
+		Log(" multiplayer: rename %s -> multiplayer.cfg failed\n", szTmp);
+		return false;
+	}
+	Log(" multiplayer: multiplayer.cfg %s=%s\n", asKey, asValue.c_str());
+	return true;
+}
+
+void cNetworkManager::SetLocalPlayerName(const hpl::tString &asName)
+{
+	msPlayerName = SanitizePlayerName(asName);
+	UpdateMultiplayerCfgKey("player_name", msPlayerName);
+#ifdef PENUMBRA_MULTIPLAYER
+	if (mbHosting)
+		SendNameTable(NULL); /* guests see "<old> is now <new>" */
+	else if (mbClientConnected && mbHadJoinPacket)
+		SendLocalName();
+#endif
+}
+
+hpl::tString cNetworkManager::GetPlayerName(uint8_t alId) const
+{
+	if (alId != 0 && alId == mlLocalPlayerId && !msPlayerName.empty())
+		return msPlayerName;
+	std::map<uint8_t, hpl::tString>::const_iterator it = m_mapPlayerNames.find(alId);
+	if (it != m_mapPlayerNames.end() && !it->second.empty())
+		return it->second;
+	return "Player " + hpl::cString::ToString((int)alId);
+}
+
+void cNetworkManager::AddPartyEvent(const hpl::tString &asText)
+{
+	if (asText.empty())
+		return;
+	while (mvPartyEvents.size() >= kPartyEventMax)
+		mvPartyEvents.erase(mvPartyEvents.begin()); /* oldest first */
+	cNetPartyEvent ev;
+	ev.msText = asText;
+	ev.mfAge = 0.0f;
+	mvPartyEvents.push_back(ev);
+	Log(" multiplayer: party: %s\n", asText.c_str());
+}
+
+void cNetworkManager::UpdatePartyEvents(float afTimeStep)
+{
+	if (afTimeStep < 0.0f)
+		afTimeStep = 0.0f;
+	if (mfSinceJoinSeconds < 1000.0f)
+		mfSinceJoinSeconds += afTimeStep; /* saturates: only "< grace" matters */
+	for (size_t i = 0; i < mvPartyEvents.size(); ++i)
+		mvPartyEvents[i].mfAge += afTimeStep;
+	/* appended in time order, so the expired ones are always at the front */
+	while (!mvPartyEvents.empty() && mvPartyEvents[0].mfAge >= kPartyEventLifeSeconds)
+		mvPartyEvents.erase(mvPartyEvents.begin());
+}
+
+void cNetworkManager::OnPlayerNameReceived(uint8_t alId, const char *apName, size_t alLen)
+{
+	if (alId == 0 || alId == mlLocalPlayerId || alId == kPreviewGhostId || !apName)
+		return; /* unknown / our own / the preview: ignored */
+	/* bounded scan — the wire field need not be NUL-terminated */
+	size_t n = 0;
+	while (n < alLen && n < kNetPlayerNameMaxChars && apName[n] != '\0')
+		++n;
+	const hpl::tString sNew = SanitizePlayerName(hpl::tString(apName, n));
+
+	const bool bAnnounced = m_setJoinAnnounced.find(alId) != m_setJoinAnnounced.end();
+	const hpl::tString sOld = GetPlayerName(alId);
+
+	if (sNew.empty())
+		m_mapPlayerNames.erase(alId); /* shows as "Player <id>" */
+	else
+		m_mapPlayerNames[alId] = sNew;
+
+	if (!bAnnounced)
+	{
+		m_setJoinAnnounced.insert(alId);
+		/* A guest gets the whole existing party right after its own join:
+		   those are listed silently; anything later really joined. The host
+		   only ever hears a name from a peer that just connected. */
+		const bool bExisting = !mbHosting && mfSinceJoinSeconds < kPartyJoinGraceSeconds;
+		if (!bExisting)
+			AddPartyEvent(GetPlayerName(alId) + " joined");
+	}
+	else if (!sNew.empty() && sNew != sOld)
+		AddPartyEvent(sOld + " is now " + sNew);
+}
+
+void cNetworkManager::NotePartyHealth(uint8_t alId, uint8_t alNewHealth)
+{
+	if (alId == 0 || alId == mlLocalPlayerId || alId == kPreviewGhostId)
+		return;
+	std::map<uint8_t, uint8_t>::const_iterator it = m_mapGhostHealth.find(alId);
+	if (it == m_mapGhostHealth.end())
+		return; /* first value we hear: no transition to report */
+	if (it->second > 0 && alNewHealth == 0)
+		AddPartyEvent(GetPlayerName(alId) + " died");
+	else if (it->second == 0 && alNewHealth > 0)
+		AddPartyEvent(GetPlayerName(alId) + " respawned");
+}
+
+void cNetworkManager::ForgetPlayerName(uint8_t alId)
+{
+	const hpl::tString sName = GetPlayerName(alId); /* before the erase */
+	m_mapPlayerNames.erase(alId);
+	if (m_setJoinAnnounced.erase(alId) > 0)
+		AddPartyEvent(sName + " left");
+}
+
+//----------------------------------------------------------------------
+// v17: host-assigned characters (both builds; the stub never has a slot).
+// The host owns the slot table (id 1 = slot 0, guests the lowest free
+// slot), the name table carries it, every machine draws slot mod N of its
+// own sorted character list.
+
+uint8_t cNetworkManager::GetCharacterCount() const
+{
+	size_t n = mvGhostMeshPaths.size();
+	if (n < 1)
+		n = 1;
+	if (n > kNetMaxCharacterSlots)
+		n = kNetMaxCharacterSlots;
+	return (uint8_t)n;
+}
+
+uint8_t cNetworkManager::GetMaxPlayers() const
+{
+	const uint8_t lChars = GetCharacterCount();
+	return mlMaxPlayers < lChars ? mlMaxPlayers : lChars;
+}
+
+size_t cNetworkManager::GhostMeshIndexFor(uint8_t alId) const
+{
+	std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.find(alId);
+	if (it != m_mapPlayerSlots.end())
+		return it->second;
+	return alId > 0 ? (size_t)(alId - 1) : 0; /* pre-v17 guess until the slot arrives */
+}
+
+hpl::tString cNetworkManager::GetPlayerCharacterName(uint8_t alId) const
+{
+	std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.find(alId);
+	if (it == m_mapPlayerSlots.end() || mvGhostMeshPaths.empty())
+		return "";
+	return GetCharacterBaseName(it->second % mvGhostMeshPaths.size());
+}
+
+uint8_t cNetworkManager::AllocCharacterSlot() const
+{
+	const uint8_t lCount = GetCharacterCount();
+	for (uint8_t lSlot = 1; lSlot < lCount; ++lSlot) /* 0 is the host's */
+	{
+		bool bUsed = false;
+		for (std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.begin();
+			it != m_mapPlayerSlots.end() && !bUsed; ++it)
+			bUsed = (it->second == lSlot);
+		if (!bUsed)
+			return lSlot;
+	}
+	return kNetCharacterUnknown;
+}
+
+void cNetworkManager::OnPlayerSlotReceived(uint8_t alId, uint8_t alSlot, const hpl::tString &asCharacter)
+{
+	if (alId == 0 || alId == kPreviewGhostId || mbHosting)
+		return; /* the host's table is its own; never from the wire */
+	const size_t lCount = mvGhostMeshPaths.size();
+	const size_t lOldIdx = GhostMeshIndexFor(alId);
+
+	std::map<uint8_t, uint8_t>::iterator it = m_mapPlayerSlots.find(alId);
+	if (alSlot == kNetCharacterUnknown || alSlot >= kNetMaxCharacterSlots)
+	{
+		if (it != m_mapPlayerSlots.end())
+			m_mapPlayerSlots.erase(it);
+	}
+	else
+	{
+		/* v19: the host's NAME wins over its index — our list may be in
+		   another order (or lack characters), and an index into it would
+		   show the host as whoever sits at that position here */
+		bool bByName = false;
+		if (!asCharacter.empty())
+		{
+			const int lMine = FindCharacterIndex(asCharacter);
+			if (lMine >= 0 && lMine < (int)kNetMaxCharacterSlots)
+			{
+				alSlot = (uint8_t)lMine;
+				bByName = true;
+			}
+			else if ((mlSlotWarned & 0x80000000u) == 0)
+			{
+				mlSlotWarned |= 0x80000000u;
+				Log(" multiplayer: WARNING the host's character '%s' is not in our multiplayer/models - "
+					"copy the host's characters to this machine (showing slot %u instead)\n",
+					asCharacter.c_str(), (unsigned)alSlot);
+			}
+		}
+		const bool bHadSlot = (it != m_mapPlayerSlots.end());
+		const bool bChanged = (!bHadSlot || it->second != alSlot);
+		m_mapPlayerSlots[alId] = alSlot;
+		if (bChanged)
+			Log(" multiplayer: player %u is character slot %u (%s)\n",
+				(unsigned)alId, (unsigned)alSlot, GetPlayerCharacterName(alId).c_str());
+		/* v18: a live swap (the host moved somebody after a character
+		   request) is a feed line; the first slot we learn is not */
+		if (bHadSlot && bChanged && lCount > 0 &&
+			(alId == mlLocalPlayerId || m_setJoinAnnounced.find(alId) != m_setJoinAnnounced.end()))
+			AddPartyEvent(GetPlayerName(alId) + " now plays " +
+				GetCharacterDisplayName(GetPlayerCharacterName(alId)));
+		if (!bByName && lCount > 0 && alSlot >= lCount && (mlSlotWarned & (1u << alSlot)) == 0)
+		{
+			/* the host has more characters than we do: the lists differ,
+			   so this player shares a look with somebody here */
+			mlSlotWarned |= (1u << alSlot);
+			Log(" multiplayer: WARNING host assigned character slot %u but we only have %u character(s) - "
+				"using %s; copy the host's multiplayer/models characters to this machine\n",
+				(unsigned)alSlot, (unsigned)lCount, GetPlayerCharacterName(alId).c_str());
+		}
+	}
+
+	RebuildGhostIfMeshChanged(alId, lOldIdx);
+}
+
+void cNetworkManager::RebuildGhostIfMeshChanged(uint8_t alId, size_t alOldIdx)
+{
+	/* A ghost built from the (id-1) guess (or an older slot) with the wrong
+	   mesh: delete it here — Service runs after Update's world check, so it
+	   lives in the current world and a plain hplDelete is the right
+	   teardown (as in DropRemotePlayer). The next state packet re-creates
+	   it through EnsureGhost with the slot's mesh; seq/health/move state
+	   live outside the ghost, the interpolation buffer refills. v18: also
+	   the host's own ghost of a guest it just moved. */
+	const size_t lCount = mvGhostMeshPaths.size();
+	if (alId == 0 || alId == mlLocalPlayerId || alId == kPreviewGhostId)
+		return; /* never a ghost of ourselves; the preview keeps its model */
+	if (lCount == 0 || (alOldIdx % lCount) == (GhostMeshIndexFor(alId) % lCount))
+		return;
+	tGhostMap::iterator gi = m_mapGhosts.find(alId);
+	if (gi == m_mapGhosts.end())
+		return;
+	if (gi->second)
+		hplDelete(gi->second);
+	m_mapGhosts.erase(gi);
+	Log(" multiplayer: ghost %u rebuilt as %s (host-assigned character)\n",
+		(unsigned)alId, GetPlayerCharacterName(alId).c_str());
+}
+
+#ifdef PENUMBRA_MULTIPLAYER
+
+void cNetworkManager::SendNameTable(ENetPeer *apOnlyTo)
+{
+	if (!mbHosting || !mpImpl || !mpImpl->mpHost)
+		return;
+	/* our own entry first (id 1, may be empty = "Player 1"), then every
+	   guest. v17: every id with a character slot (= every accepted guest)
+	   is listed even without a name, so each machine learns everybody's
+	   character; ids ascend, so id 1 still goes first. At most 1 + 30
+	   guests (enet_host_create's 31 peers) packets of 27 B. */
+	std::set<uint8_t> setIds;
+	setIds.insert(mlLocalPlayerId);
+	for (std::map<uint8_t, hpl::tString>::const_iterator it = m_mapPlayerNames.begin();
+		it != m_mapPlayerNames.end(); ++it)
+		setIds.insert(it->first);
+	for (std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.begin();
+		it != m_mapPlayerSlots.end(); ++it)
+		setIds.insert(it->first);
+
+	for (std::set<uint8_t>::const_iterator id = setIds.begin(); id != setIds.end(); ++id)
+	{
+		if (*id == 0)
+			continue;
+		cNetPlayerName pkt;
+		memset(&pkt, 0, sizeof(pkt)); /* NUL padding; a full name has no NUL */
+		pkt.mType = eNetPacketType_PlayerName;
+		pkt.mPlayerID = *id;
+		hpl::tString sName;
+		if (*id == mlLocalPlayerId)
+			sName = msPlayerName;
+		else
+		{
+			std::map<uint8_t, hpl::tString>::const_iterator ni = m_mapPlayerNames.find(*id);
+			if (ni != m_mapPlayerNames.end())
+				sName = ni->second;
+		}
+		const size_t n = sName.size() < sizeof(pkt.msName) ? sName.size() : sizeof(pkt.msName);
+		if (n > 0)
+			memcpy(pkt.msName, sName.data(), n);
+		std::map<uint8_t, uint8_t>::const_iterator si = m_mapPlayerSlots.find(*id);
+		pkt.mCharacter = (si != m_mapPlayerSlots.end() && si->second < kNetMaxCharacterSlots) ?
+			si->second : kNetCharacterUnknown; /* v17 */
+		if (pkt.mCharacter != kNetCharacterUnknown && !mvGhostMeshPaths.empty())
+		{
+			/* v19: the name too — the receiver maps it into its own list */
+			const hpl::tString sChar = GetCharacterBaseName(pkt.mCharacter % mvGhostMeshPaths.size());
+			const size_t lc = sChar.size() < sizeof(pkt.msCharacter) ? sChar.size() : sizeof(pkt.msCharacter);
+			if (lc > 0)
+				memcpy(pkt.msCharacter, sChar.data(), lc);
+		}
+		if (apOnlyTo)
+			SendStructToPeer(apOnlyTo, &pkt, sizeof(pkt), true);
+		else
+			SendReliableEvent(&pkt, sizeof(pkt));
+	}
+}
+
+void cNetworkManager::SendLocalName()
+{
+	if (mbHosting)
+		return;
+	/* Sent even when empty: the host announces the join on THIS packet
+	   ("Player <id> joined" when we have no name) */
+	cNetPlayerName pkt;
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.mType = eNetPacketType_PlayerName;
+	pkt.mPlayerID = mlLocalPlayerId; /* the host uses the peer id anyway */
+	const size_t n = msPlayerName.size() < sizeof(pkt.msName) ? msPlayerName.size() : sizeof(pkt.msName);
+	if (n > 0)
+		memcpy(pkt.msName, msPlayerName.data(), n);
+	pkt.mCharacter = kNetCharacterUnknown; /* v17: the host assigns, it never reads this */
+	SendReliableEvent(&pkt, sizeof(pkt)); /* no-op until connected + joined */
+}
+
+#endif /* PENUMBRA_MULTIPLAYER */
+
+//======================================================================
+// v15: internet hardening — APPENDED. Shared part first (both builds):
+// passwords, the role table, string/file-name checks, guest id pool.
+// The ENet-touching part (auth state machine, validation with clamps,
+// strikes, rate limits, discovery limiter) is under PENUMBRA_MULTIPLAYER.
+// README.md "Security" describes the flow.
+//======================================================================
+
+hpl::tString cNetworkManager::SanitizePassword(const hpl::tString &asPassword)
+{
+	hpl::tString sOut;
+	for (size_t i = 0; i < asPassword.size(); ++i)
+	{
+		const unsigned char c = (unsigned char)asPassword[i];
+		if (c < 32 || c > 126)
+			continue; /* control chars, DEL, non-ASCII */
+		if (c == ' ' && sOut.empty())
+			continue; /* leading blanks */
+		if (sOut.size() >= kNetPasswordMaxChars)
+			break;
+		sOut += (char)c;
+	}
+	while (!sOut.empty() && sOut[sOut.size() - 1] == ' ')
+		sOut.erase(sOut.size() - 1);
+	return sOut;
+}
+
+void cNetworkManager::SetJoinPassword(const hpl::tString &asPassword)
+{
+	msJoinPassword = SanitizePassword(asPassword);
+}
+
+void cNetworkManager::SetServerPassword(const hpl::tString &asPassword)
+{
+	msServerPassword = SanitizePassword(asPassword);
+}
+
+/* THE role table. Both directions share the event types the host relays;
+   everything else is one-way. Keep in step with eNetPacketType — an
+   unlisted type is dropped from EITHER side (the voice type 29 of v16
+   must be added here by whoever adds it). */
+bool cNetworkManager::IsAllowedFrom(uint8_t alType, bool abFromHost)
+{
+	switch (alType)
+	{
+	/* either direction (guest -> host, host relays / host -> guests) */
+	case eNetPacketType_PlayerState:
+	case eNetPacketType_MapChange:
+	case eNetPacketType_ItemPickup:
+	case eNetPacketType_ItemDrop:
+	case eNetPacketType_ScriptEvent:
+	case eNetPacketType_EntityDamage:
+	case eNetPacketType_PlayerName:
+	case eNetPacketType_Voice: /* v16: guest -> host, host relays / host -> guests */
+	case eNetPacketType_PlayerHit: /* v22: guest -> host, host routes to the victim */
+		return true;
+	/* host -> guest only */
+	case eNetPacketType_PlayerJoin:
+	case eNetPacketType_PlayerLeave:
+	case eNetPacketType_VersionAck:
+	case eNetPacketType_ObjectState:
+	case eNetPacketType_BodyCensus:
+	case eNetPacketType_BodyGrabDeny:
+	case eNetPacketType_EnemyState:
+	case eNetPacketType_EnemyEvent:
+	case eNetPacketType_PlayerDamage:
+	case eNetPacketType_WorldSnapshot:
+	case eNetPacketType_Challenge:
+		return abFromHost;
+	/* guest -> host only */
+	case eNetPacketType_BodyGrabBegin:
+	case eNetPacketType_BodyGrabTarget:
+	case eNetPacketType_BodyGrabEnd:
+	case eNetPacketType_BodyPush:
+	case eNetPacketType_EnemyDamage:
+	case eNetPacketType_MapReady:
+	case eNetPacketType_Auth:
+	case eNetPacketType_CharacterRequest: /* v18 */
+		return !abFromHost;
+	/* ChatMessage (4, reserved), discovery 5/6 (never over ENet), unknown */
+	default:
+		return false;
+	}
+}
+
+bool cNetworkManager::NetStringOk(const char *apStr, size_t alCap, bool abAllowEmpty)
+{
+	if (!apStr)
+		return false;
+	size_t n = 0;
+	while (n < alCap && apStr[n] != '\0')
+	{
+		const unsigned char c = (unsigned char)apStr[n];
+		if (c < 32 || c > 126)
+			return false;
+		++n;
+	}
+	return n > 0 || abAllowEmpty;
+}
+
+bool cNetworkManager::NetBareFileNameOk(const char *apStr, size_t alCap, const char *asExt)
+{
+	if (!NetStringOk(apStr, alCap, false) || !asExt)
+		return false;
+	size_t n = 0;
+	while (n < alCap && apStr[n] != '\0')
+		++n;
+	const size_t lExt = strlen(asExt);
+	if (n < lExt + 2) /* at least "x." + ext */
+		return false;
+	if (apStr[0] == '.' || apStr[0] == ' ' || apStr[n - 1] == ' ')
+		return false;
+	for (size_t i = 0; i < n; ++i)
+	{
+		const char c = apStr[i];
+		if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+			c == '"' || c == '<' || c == '>' || c == '|')
+			return false;
+		if (c == '.' && i + 1 < n && apStr[i + 1] == '.')
+			return false; /* ".." anywhere */
+	}
+	if (apStr[n - lExt - 1] != '.')
+		return false;
+	for (size_t i = 0; i < lExt; ++i)
+	{
+		char a = apStr[n - lExt + i], b = asExt[i];
+		if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+		if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+		if (a != b)
+			return false;
+	}
+	return true;
+}
+
+uint8_t cNetworkManager::AllocGuestId()
+{
+	if (!mvFreeGuestIds.empty())
+	{
+		const uint8_t id = mvFreeGuestIds.back();
+		mvFreeGuestIds.pop_back();
+		return id;
+	}
+	if (mlNextGuestId < 2 || mlNextGuestId >= kPreviewGhostId)
+		return 0; /* the counter never reaches the preview id / wraps */
+	return mlNextGuestId++;
+}
+
+void cNetworkManager::FreeGuestId(uint8_t alId)
+{
+	if (alId < 2 || alId >= kPreviewGhostId)
+		return;
+	for (size_t i = 0; i < mvFreeGuestIds.size(); ++i)
+		if (mvFreeGuestIds[i] == alId)
+			return;
+	mvFreeGuestIds.push_back(alId);
+}
+
+#ifdef PENUMBRA_MULTIPLAYER
+
+namespace
+{
+/* Validation bounds. Penumbra levels are a few hundred metres across;
+   a guest reaches ~3 m, its throws are capped by the grab tuning anyway. */
+const float kNetMaxCoord = 20000.0f;     /* any world position component */
+const float kNetMaxAngle = 100.0f;       /* radians (pitch/yaw are < 2 pi) */
+const float kNetMaxReach = 50.0f;        /* grab target / push point from the guest */
+const float kNetMaxRelPick = 10.0f;      /* pick offset from a body's centre */
+const float kNetMaxDropImpulse = 15.0f;  /* ItemDrop toss */
+const float kNetMaxThrowImpulse = 30.0f; /* GrabEnd throw (BodySync clamps again) */
+const float kNetMaxPushImpulse = 50.0f;  /* one tick of move/push force */
+const float kNetMaxDamage = 200.0f;      /* enemy / entity / player damage per hit */
+const float kNetStrikeDecaySeconds = 5.0f;
+const float kNetCharRequestCooldown = 0.25f; /* v18: one applied character request per peer per this */
+
+static bool NetFinite(float afX)
+{
+	return afX == afX && afX <= 3.0e38f && afX >= -3.0e38f;
+}
+
+static bool NetFiniteBounded(float afX, float afMaxAbs)
+{
+	return NetFinite(afX) && afX <= afMaxAbs && afX >= -afMaxAbs;
+}
+
+/** All three finite; |v| scaled down to afMaxLen when longer. false = NaN/inf. */
+static bool NetClampVec(float &x, float &y, float &z, float afMaxLen)
+{
+	if (!NetFinite(x) || !NetFinite(y) || !NetFinite(z))
+		return false;
+	const float fSq = x * x + y * y + z * z;
+	if (fSq > afMaxLen * afMaxLen && fSq > 0)
+	{
+		const float fScale = afMaxLen / sqrtf(fSq);
+		x *= fScale; y *= fScale; z *= fScale;
+	}
+	return true;
+}
+
+static bool NetClampDamage(float &afDamage)
+{
+	if (!NetFinite(afDamage))
+		return false;
+	if (afDamage < 0)
+		afDamage = 0;
+	else if (afDamage > kNetMaxDamage)
+		afDamage = kNetMaxDamage;
+	return true;
+}
+
+static bool NetPointNear(const hpl::cVector3f &avFrom, float x, float y, float z, float afMax)
+{
+	const float dx = x - avFrom.x, dy = y - avFrom.y, dz = z - avFrom.z;
+	return dx * dx + dy * dy + dz * dz <= afMax * afMax;
+}
+} // namespace
+
+bool cNetworkManager::PeerLive(const ENetPeer *apPeer)
+{
+	return apPeer && apPeer->state == ENET_PEER_STATE_CONNECTED && PeerGetId(apPeer) >= 2;
+}
+
+int cNetworkManager::CountConnectedPeers(bool abAcceptedOnly) const
+{
+	if (!mpImpl || !mpImpl->mpHost)
+		return 0;
+	int n = 0;
+	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+	{
+		const ENetPeer *pd = &mpImpl->mpHost->peers[i];
+		if (pd->state != ENET_PEER_STATE_CONNECTED)
+			continue;
+		if (abAcceptedOnly && PeerGetId(pd) < 2)
+			continue;
+		++n;
+	}
+	return n;
+}
+
+void cNetworkManager::ResetPeerGuards()
+{
+	if (!mpImpl)
+		return;
+	mpImpl->m_mapGuards.clear();
+	memset(mpImpl->mPong, 0, sizeof(mpImpl->mPong));
+	mpImpl->mfPongGlobalWindow = 0;
+	mpImpl->mlPongGlobalCount = 0;
+}
+
+/* Not a CSPRNG — the nonce only has to differ per connection so a captured
+   answer cannot be replayed: clock, ENet clock, the peer's address and
+   connect id, a counter and rand(), folded through the digest itself. */
+void cNetworkManager::MakeNonce(const ENetPeer *apPeer, uint8_t aOut[16])
+{
+	uint32_t aSeed[8];
+	aSeed[0] = (uint32_t)time(NULL);
+	aSeed[1] = enet_time_get();
+	aSeed[2] = apPeer ? apPeer->address.host : 0u;
+	aSeed[3] = apPeer ? ((uint32_t)apPeer->address.port | ((uint32_t)apPeer->connectID << 16)) : 0u;
+	aSeed[4] = ++mpImpl->mlNonceCounter;
+	aSeed[5] = (uint32_t)rand();
+	aSeed[6] = (uint32_t)(uintptr_t)apPeer;
+	aSeed[7] = (uint32_t)(uintptr_t)this ^ 0x5A17E5EDu;
+	uint8_t aPrev[16];
+	memcpy(aPrev, aOut, sizeof(aPrev)); /* whatever was there (zeros) adds nothing but hurts nothing */
+	NetAuthDigest((const char *)aSeed, sizeof(aSeed), aPrev, (uint16_t)(aSeed[4] & 0xFFFFu), aOut);
+}
+
+void cNetworkManager::HostForgetGuest(ENetPeer *apPeer, uint8_t alId)
+{
+	if (!mbHosting || !mpImpl || !mpImpl->mpHost || alId < 2)
+		return;
+	BlastLeaves(mpImpl->mpHost, alId, apPeer);
+	DropRemotePlayer(alId); /* v17: also frees its character slot */
+	SendNameTable(NULL);    /* v13: table without the leaver */
+	/* rung 3: a vanished guest drops whatever it held */
+	int lFreed = mpBodySync->ReleaseAllHeldBy(alId);
+	if (lFreed > 0)
+		Log(" multiplayer: guest %u left holding %d object(s) — released\n",
+			(unsigned)alId, lFreed);
+	FreeGuestId(alId); /* v15: the id goes back to the pool */
+}
+
+void cNetworkManager::HostAcceptPeer(ENetPeer *apPeer, const cNetAuth &aAuth)
+{
+	if (!mbHosting || !mpImpl || !mpImpl->mpHost || !apPeer)
+		return;
+	std::map<const ENetPeer *, Impl::cPeerGuard>::iterator gi = mpImpl->m_mapGuards.find(apPeer);
+	if (gi == mpImpl->m_mapGuards.end())
+		return;
+	Impl::cPeerGuard &guard = gi->second;
+	if (guard.mbAuthed || guard.mbRefused)
+		return;
+	char sWho[64];
+	FormatPeerAddr(apPeer, sWho, sizeof(sWho));
+
+	uint8_t aExpect[16];
+	NetAuthDigest(msServerPassword.c_str(), msServerPassword.size(), guard.mNonce,
+		kNetProtocolVersion, aExpect);
+	/* An open server (no password) accepts any digest: a guest with a stale
+	   join_password must not be locked out of servers that never asked. */
+	const bool bDigestOk = msServerPassword.empty() ||
+		memcmp(aExpect, aAuth.mDigest, sizeof(aExpect)) == 0;
+	if (aAuth.mlVersion != kNetProtocolVersion || !bDigestOk)
+	{
+		guard.mbRefused = true;
+		Log(" multiplayer: REFUSED peer %s - bad auth (version %u, %s)\n", sWho,
+			(unsigned)aAuth.mlVersion, msServerPassword.empty() ? "open server" : "wrong password");
+		enet_peer_disconnect(apPeer, kNetDisconnectBadAuth);
+		return;
+	}
+
+	const uint8_t aid = AllocGuestId();
+	if (aid == 0)
+	{
+		guard.mbRefused = true;
+		Log(" multiplayer: REFUSED peer %s - no guest id left\n", sWho);
+		enet_peer_disconnect(apPeer, kNetDisconnectFull);
+		return;
+	}
+	/* v17: one character each. CONNECT already caps the peers at the
+	   character count, so this only fires if the list and the cap disagree
+	   — refused as "full" rather than sharing a character. */
+	const uint8_t lSlot = AllocCharacterSlot();
+	if (lSlot == kNetCharacterUnknown)
+	{
+		FreeGuestId(aid);
+		guard.mbRefused = true;
+		Log(" multiplayer: REFUSED peer %s - every character is taken (%u)\n",
+			sWho, (unsigned)GetCharacterCount());
+		enet_peer_disconnect(apPeer, kNetDisconnectFull);
+		return;
+	}
+	m_mapPlayerSlots[aid] = lSlot; /* erased in DropRemotePlayer (HostForgetGuest) */
+	guard.mbAuthed = true;
+	guard.mlStrikes = 0;
+	PeerSetId(apPeer, aid);
+	{
+		/* FIRST game packet: proves we speak their protocol (their
+		   join-handler refuses old hosts that skip this) */
+		cNetVersionAck ack;
+		ack.mType = eNetPacketType_VersionAck;
+		ack.mlVersion = kNetProtocolVersion;
+		SendStructToPeer(apPeer, &ack, sizeof(ack), true);
+	}
+	SendPlayerJoin(apPeer, aid);
+	SendCensus(apPeer);    /* late joiner gets the map-load census now */
+	SendMapBeacon(apPeer); /* ...and where the party is, so a guest sitting
+	                          in the menu launches straight into our map */
+	/* v14: NO world/body snapshot here — the guest has no world yet (or a
+	   stale one). It asks with MapReady once its census is paired with
+	   ours, and SendWorldSnapshot answers. */
+	if (aAuth.msName[0] != '\0')
+		OnPlayerNameReceived(aid, aAuth.msName, sizeof(aAuth.msName)); /* sanitised inside */
+	SendNameTable(NULL); /* v13: who is here — the newcomer lists it silently */
+	Log(" multiplayer: peer %s accepted as id=%u, character slot %u (%s)%s\n", sWho, (unsigned)aid,
+		(unsigned)lSlot, GetPlayerCharacterName(aid).c_str(),
+		msServerPassword.empty() ? "" : " (password ok)");
+}
+
+void cNetworkManager::SendAuthResponse(const cNetChallenge &aChallenge)
+{
+	if (mbHosting || !mpImpl || !mpImpl->mpServerPeer)
+		return;
+	if (mbAuthSent)
+	{
+		Log(" multiplayer: second challenge from the host ignored\n");
+		return;
+	}
+	cNetAuth auth;
+	memset(&auth, 0, sizeof(auth));
+	auth.mType = eNetPacketType_Auth;
+	auth.mlVersion = kNetProtocolVersion;
+	NetAuthDigest(msJoinPassword.c_str(), msJoinPassword.size(), aChallenge.mNonce,
+		kNetProtocolVersion, auth.mDigest);
+	const size_t n = msPlayerName.size() < sizeof(auth.msName) ? msPlayerName.size() : sizeof(auth.msName);
+	if (n > 0)
+		memcpy(auth.msName, msPlayerName.data(), n);
+	SendStructToPeer(mpImpl->mpServerPeer, &auth, sizeof(auth), true);
+	mbAuthSent = true;
+	Log(" multiplayer: challenge answered (%s)\n", msJoinPassword.empty() ? "no password" : "with password");
+}
+
+void cNetworkManager::NoteViolation(ENetPeer *apPeer, uint8_t alType, const char *asWhy)
+{
+	if (!mpImpl || !apPeer)
+		return;
+	std::map<const ENetPeer *, Impl::cPeerGuard>::iterator gi = mpImpl->m_mapGuards.find(apPeer);
+	if (gi == mpImpl->m_mapGuards.end())
+		return;
+	Impl::cPeerGuard &guard = gi->second;
+	const unsigned lBit = alType < 64 ? alType : 63;
+	if ((guard.mlLoggedTypes & (1ull << lBit)) == 0)
+	{
+		guard.mlLoggedTypes |= (1ull << lBit);
+		char sWho[64];
+		FormatPeerAddr(apPeer, sWho, sizeof(sWho));
+		Log(" multiplayer: guest %u (%s): dropped packet type %u - %s (logged once per type)\n",
+			(unsigned)PeerGetId(apPeer), sWho, (unsigned)alType, asWhy ? asWhy : "");
+	}
+	++guard.mlStrikes;
+	guard.mfStrikeDecay = 0;
+	if (guard.mlStrikes >= kNetMaxStrikes && !guard.mbRefused)
+	{
+		guard.mbRefused = true; /* everything else from it is dropped until the slot dies */
+		char sWho[64];
+		FormatPeerAddr(apPeer, sWho, sizeof(sWho));
+		Log(" multiplayer: guest %u (%s) KICKED - %u protocol violations\n",
+			(unsigned)PeerGetId(apPeer), sWho, guard.mlStrikes);
+		enet_peer_disconnect(apPeer, kNetDisconnectKicked);
+	}
+}
+
+/* Shape + bounds of every packet either role applies, clamping in place.
+   Host->guest STREAMS (ObjectState, EnemyState, WorldSnapshot, census,
+   join/leave/ack/deny/event) keep their own length/generation checks in
+   the handlers; only the event payloads with strings/floats are looked at
+   here. A short packet of a known type is malformed: a real build never
+   sends one. */
+bool cNetworkManager::ValidateEventPacket(unsigned char *apData, size_t alLen, bool abFromHost)
+{
+	if (!apData || alLen < 1)
+		return false;
+	const uint8_t t = apData[0];
+	switch (t)
+	{
+	case eNetPacketType_PlayerState:
+	{
+		if (alLen < sizeof(cNetPlayerState))
+			return false;
+		cNetPlayerState st;
+		memcpy(&st, apData, sizeof(st));
+		if (!NetFiniteBounded(st.mfPosX, kNetMaxCoord) || !NetFiniteBounded(st.mfPosY, kNetMaxCoord) ||
+			!NetFiniteBounded(st.mfPosZ, kNetMaxCoord))
+			return false;
+		if (!NetFiniteBounded(st.mfPitch, kNetMaxAngle) || !NetFiniteBounded(st.mfYaw, kNetMaxAngle))
+		{
+			/* an unwrapped angle from an older build is not an attack: wrap it
+			   in place (NaN/inf still fail NetFiniteBounded's finite part) */
+			if (st.mfPitch != st.mfPitch || st.mfYaw != st.mfYaw ||
+				fabsf(st.mfPitch) > 1e9f || fabsf(st.mfYaw) > 1e9f)
+				return false;
+			st.mfPitch = cMath::Wrap(st.mfPitch, -kPif, kPif);
+			st.mfYaw = cMath::Wrap(st.mfYaw, -kPif, kPif);
+			memcpy(apData, &st, sizeof(st));
+		}
+		/* v21: held items are closed ids; a new item means a protocol bump */
+		if (st.mHeldLeft >= eNetHeldItem_Count || st.mHeldRight >= eNetHeldItem_Count)
+			return false;
+		return true; /* velocities are int8, health is clamped on apply */
+	}
+	case eNetPacketType_MapChange:
+	{
+		if (alLen < sizeof(cNetMapChange))
+			return false;
+		const cNetMapChange *mc = (const cNetMapChange *)apData;
+		/* the start name may be empty (the beacon sends none) */
+		return NetBareFileNameOk(mc->msMap, sizeof(mc->msMap), "dae") &&
+			NetStringOk(mc->msPos, sizeof(mc->msPos), true);
+	}
+	case eNetPacketType_ItemPickup:
+	{
+		if (alLen < sizeof(cNetItemPickup))
+			return false;
+		const cNetItemPickup *ip = (const cNetItemPickup *)apData;
+		if (!NetStringOk(ip->msItemName, sizeof(ip->msItemName), true))
+			return false;
+		/* v23: "" = unknown file (no give), else a bare .ent that resolves */
+		if (!NetStringOk(ip->msFile, sizeof(ip->msFile), true))
+			return false;
+		return ip->msFile[0] == 0 || NetBareFileNameOk(ip->msFile, sizeof(ip->msFile), "ent");
+	}
+	case eNetPacketType_ItemDrop:
+	{
+		if (alLen < sizeof(cNetItemDrop))
+			return false;
+		cNetItemDrop drop;
+		memcpy(&drop, apData, sizeof(drop));
+		if (!NetStringOk(drop.msName, sizeof(drop.msName), false) ||
+			!NetBareFileNameOk(drop.msFile, sizeof(drop.msFile), "ent"))
+			return false;
+		if (!NetFiniteBounded(drop.mfPosX, kNetMaxCoord) || !NetFiniteBounded(drop.mfPosY, kNetMaxCoord) ||
+			!NetFiniteBounded(drop.mfPosZ, kNetMaxCoord))
+			return false;
+		if (!NetClampVec(drop.mfImpX, drop.mfImpY, drop.mfImpZ, kNetMaxDropImpulse))
+			return false;
+		memcpy(apData, &drop, sizeof(drop));
+		return true;
+	}
+	case eNetPacketType_ScriptEvent:
+	{
+		if (alLen < sizeof(cNetScriptEvent))
+			return false;
+		const cNetScriptEvent *se = (const cNetScriptEvent *)apData;
+		switch (se->mOp)
+		{
+		case eNetScriptOp_LocalVarSet: case eNetScriptOp_LocalVarAdd:
+		case eNetScriptOp_GlobalVarSet: case eNetScriptOp_GlobalVarAdd:
+		case eNetScriptOp_EntityActive: case eNetScriptOp_DoorLocked:
+		case eNetScriptOp_RemoveItem: case eNetScriptOp_LampLit:
+			break;
+		default:
+			return false;
+		}
+		return NetStringOk(se->msName, sizeof(se->msName), false);
+	}
+	case eNetPacketType_EntityDamage:
+	{
+		if (alLen < sizeof(cNetEntityDamage))
+			return false;
+		cNetEntityDamage ed;
+		memcpy(&ed, apData, sizeof(ed));
+		if (!NetClampDamage(ed.mfDamage))
+			return false;
+		memcpy(apData, &ed, sizeof(ed));
+		return true;
+	}
+	case eNetPacketType_EnemyDamage:
+	{
+		if (alLen < sizeof(cNetEnemyDamage))
+			return false;
+		cNetEnemyDamage dmg;
+		memcpy(&dmg, apData, sizeof(dmg));
+		if (!NetClampDamage(dmg.mfDamage))
+			return false;
+		memcpy(apData, &dmg, sizeof(dmg));
+		return true;
+	}
+	case eNetPacketType_PlayerHit:
+	{
+		if (alLen < sizeof(cNetPlayerHit))
+			return false;
+		cNetPlayerHit hit;
+		memcpy(&hit, apData, sizeof(hit));
+		if (hit.mTargetID == 0 || !NetClampDamage(hit.mfDamage))
+			return false;
+		if (!NetFiniteBounded(hit.mfFromX, kNetMaxCoord) || !NetFiniteBounded(hit.mfFromY, kNetMaxCoord) ||
+			!NetFiniteBounded(hit.mfFromZ, kNetMaxCoord))
+			return false;
+		memcpy(apData, &hit, sizeof(hit));
+		return true;
+	}
+	case eNetPacketType_PlayerDamage:
+	{
+		if (alLen < sizeof(cNetPlayerDamage))
+			return false;
+		cNetPlayerDamage pd;
+		memcpy(&pd, apData, sizeof(pd));
+		if (!NetClampDamage(pd.mfDamage))
+			return false;
+		memcpy(apData, &pd, sizeof(pd));
+		return true;
+	}
+	case eNetPacketType_BodyGrabBegin:
+	{
+		if (alLen < sizeof(cNetBodyGrabBegin))
+			return false;
+		cNetBodyGrabBegin gb;
+		memcpy(&gb, apData, sizeof(gb));
+		if (!NetFiniteBounded(gb.mfRelX, kNetMaxRelPick) || !NetFiniteBounded(gb.mfRelY, kNetMaxRelPick) ||
+			!NetFiniteBounded(gb.mfRelZ, kNetMaxRelPick) || !NetFinite(gb.mfMassMul))
+			return false;
+		gb.mfMassMul = gb.mfMassMul < 0.1f ? 0.1f : (gb.mfMassMul > 20.0f ? 20.0f : gb.mfMassMul);
+		memcpy(apData, &gb, sizeof(gb));
+		return true;
+	}
+	case eNetPacketType_BodyGrabTarget:
+	{
+		if (alLen < sizeof(cNetBodyGrabTarget))
+			return false;
+		const cNetBodyGrabTarget *gt = (const cNetBodyGrabTarget *)apData;
+		return NetFiniteBounded(gt->mfX, kNetMaxCoord) && NetFiniteBounded(gt->mfY, kNetMaxCoord) &&
+			NetFiniteBounded(gt->mfZ, kNetMaxCoord);
+	}
+	case eNetPacketType_BodyGrabEnd:
+	{
+		if (alLen < sizeof(cNetBodyGrabEnd))
+			return false;
+		cNetBodyGrabEnd ge;
+		memcpy(&ge, apData, sizeof(ge));
+		if (!NetClampVec(ge.mfImpX, ge.mfImpY, ge.mfImpZ, kNetMaxThrowImpulse))
+			return false;
+		memcpy(apData, &ge, sizeof(ge));
+		return true;
+	}
+	case eNetPacketType_BodyPush:
+	{
+		if (alLen < sizeof(cNetBodyPush))
+			return false;
+		cNetBodyPush push;
+		memcpy(&push, apData, sizeof(push));
+		if (!NetFiniteBounded(push.mfPtX, kNetMaxCoord) || !NetFiniteBounded(push.mfPtY, kNetMaxCoord) ||
+			!NetFiniteBounded(push.mfPtZ, kNetMaxCoord))
+			return false;
+		if (!NetClampVec(push.mfImpX, push.mfImpY, push.mfImpZ, kNetMaxPushImpulse))
+			return false;
+		memcpy(apData, &push, sizeof(push));
+		return true;
+	}
+	case eNetPacketType_PlayerName:
+	{
+		/* SanitizePlayerName on apply; v17: the slot is a real one or
+		   "unknown" (a guest sends unknown; the host ignores it anyway) */
+		if (alLen < sizeof(cNetPlayerName))
+			return false;
+		cNetPlayerName pn;
+		memcpy(&pn, apData, sizeof(pn));
+		return pn.mCharacter < kNetMaxCharacterSlots || pn.mCharacter == kNetCharacterUnknown;
+	}
+	case eNetPacketType_Voice:
+	{
+		/* v16: header + 1..2 length-prefixed Opus frames, payload bounded
+		   (kNetVoiceMaxPayload); the frame table must add up EXACTLY to the
+		   packet — trailing bytes are as malformed as missing ones. The
+		   author byte is not checked here: the host restamps it from the
+		   peer (RelayVoice), the guest trusts the host's stamp. */
+		if (alLen < sizeof(cNetVoice) || alLen > sizeof(cNetVoice) + kNetVoiceMaxPayload)
+			return false;
+		cNetVoice vh;
+		memcpy(&vh, apData, sizeof(vh));
+		if (vh.mFrames == 0 || vh.mFrames > kNetVoiceMaxFramesPerPacket)
+			return false;
+		size_t at = sizeof(cNetVoice);
+		for (int f = 0; f < (int)vh.mFrames; ++f)
+		{
+			if (alLen - at < 2)
+				return false;
+			uint16_t l = 0;
+			memcpy(&l, apData + at, 2);
+			at += 2;
+			if (alLen - at < (size_t)l)
+				return false;
+			at += l;
+		}
+		return at == alLen;
+	}
+	case eNetPacketType_CharacterRequest:
+	{
+		/* v18: exact size, a non-empty printable-ASCII name up to its first
+		   NUL (a full 24-char field needs none); anything else = strike */
+		if (alLen != sizeof(cNetCharacterRequest))
+			return false;
+		const cNetCharacterRequest *cr = (const cNetCharacterRequest *)apData;
+		return NetStringOk(cr->msCharacter, sizeof(cr->msCharacter), false);
+	}
+	case eNetPacketType_MapReady:
+		return alLen >= sizeof(cNetMapReady);
+	case eNetPacketType_Auth:
+		return alLen >= sizeof(cNetAuth);
+	case eNetPacketType_Challenge:
+		return alLen >= sizeof(cNetChallenge);
+	case eNetPacketType_PlayerJoin:
+	case eNetPacketType_PlayerLeave:
+		return alLen >= sizeof(cNetPlayerJoin);
+	case eNetPacketType_VersionAck:
+		return alLen >= sizeof(cNetVersionAck);
+	case eNetPacketType_BodyGrabDeny:
+		return alLen >= sizeof(cNetBodyGrabDeny);
+	case eNetPacketType_EnemyEvent:
+		return alLen >= sizeof(cNetEnemyEvent);
+	case eNetPacketType_BodyCensus:
+		return alLen >= sizeof(cNetBodyCensus);
+	case eNetPacketType_ObjectState:
+	case eNetPacketType_EnemyState:
+	case eNetPacketType_WorldSnapshot:
+		return abFromHost; /* host streams; the handlers check header + count */
+	default:
+		return false;
+	}
+}
+
+/* Host extras on top of ValidateEventPacket: file names must resolve
+   through the engine's file searcher (the same lookup the loaders use), and
+   physics intent must be within reach of where the guest last said it was
+   (a guest that never sent a state cannot push anything). */
+bool cNetworkManager::ValidateGuestPacket(ENetPeer *apPeer, unsigned char *apData, size_t alLen)
+{
+	if (!ValidateEventPacket(apData, alLen, false))
+		return false;
+	if (!mpImpl || !apPeer)
+		return false;
+	std::map<const ENetPeer *, Impl::cPeerGuard>::iterator gi = mpImpl->m_mapGuards.find(apPeer);
+	if (gi == mpImpl->m_mapGuards.end())
+		return false;
+	Impl::cPeerGuard &guard = gi->second;
+	hpl::cFileSearcher *pSearcher = (mpInit && mpInit->mpGame && mpInit->mpGame->GetResources()) ?
+		mpInit->mpGame->GetResources()->GetFileSearcher() : NULL;
+
+	const uint8_t t = apData[0];
+	switch (t)
+	{
+	case eNetPacketType_PlayerState:
+	{
+		const cNetPlayerState *st = (const cNetPlayerState *)apData;
+		guard.mvLastPos = cVector3f(st->mfPosX, st->mfPosY, st->mfPosZ);
+		guard.mbHavePos = true;
+		return true;
+	}
+	case eNetPacketType_ItemDrop:
+	{
+		const cNetItemDrop *drop = (const cNetItemDrop *)apData;
+		char sFile[sizeof(drop->msFile) + 1];
+		memcpy(sFile, drop->msFile, sizeof(drop->msFile));
+		sFile[sizeof(drop->msFile)] = '\0';
+		if (pSearcher == NULL || pSearcher->GetFilePath(tString(sFile)).empty())
+		{
+			Log(" multiplayer: guest %u drop of '%s' refused - no such entity file here\n",
+				(unsigned)PeerGetId(apPeer), sFile);
+			return false;
+		}
+		return true;
+	}
+	case eNetPacketType_MapChange:
+	{
+		const cNetMapChange *mc = (const cNetMapChange *)apData;
+		char sMap[sizeof(mc->msMap) + 1];
+		memcpy(sMap, mc->msMap, sizeof(mc->msMap));
+		sMap[sizeof(mc->msMap)] = '\0';
+		if (pSearcher == NULL || pSearcher->GetFilePath(tString(sMap)).empty())
+		{
+			Log(" multiplayer: guest %u map change to '%s' refused - no such map here\n",
+				(unsigned)PeerGetId(apPeer), sMap);
+			return false;
+		}
+		return true;
+	}
+	case eNetPacketType_BodyGrabTarget:
+	{
+		const cNetBodyGrabTarget *gt = (const cNetBodyGrabTarget *)apData;
+		return guard.mbHavePos && NetPointNear(guard.mvLastPos, gt->mfX, gt->mfY, gt->mfZ, kNetMaxReach);
+	}
+	case eNetPacketType_BodyPush:
+	{
+		const cNetBodyPush *push = (const cNetBodyPush *)apData;
+		return guard.mbHavePos && NetPointNear(guard.mvLastPos, push->mfPtX, push->mfPtY, push->mfPtZ, kNetMaxReach);
+	}
+	case eNetPacketType_BodyGrabBegin:
+	case eNetPacketType_BodyGrabEnd:
+		return guard.mbHavePos; /* a guest that never stood anywhere holds nothing */
+	default:
+		return true;
+	}
+}
+
+void cNetworkManager::UpdatePeerGuards(float afTimeStep)
+{
+	if (!mbHosting || !mpImpl || !mpImpl->mpHost)
+		return;
+	std::map<const ENetPeer *, Impl::cPeerGuard>::iterator it = mpImpl->m_mapGuards.begin();
+	while (it != mpImpl->m_mapGuards.end())
+	{
+		const ENetPeer *pPeer = it->first;
+		Impl::cPeerGuard &guard = it->second;
+		/* the slot died without us seeing the event (never for a normal
+		   enet_peer_disconnect, which reports one) — drop the record */
+		if (pPeer->state == ENET_PEER_STATE_DISCONNECTED || pPeer->state == ENET_PEER_STATE_ZOMBIE)
+		{
+			/* v17: an accepted guest that vanishes this way still frees its
+			   id + character slot (else the slot is lost until a restart) */
+			ENetPeer *pDead = const_cast<ENetPeer *>(pPeer);
+			const uint8_t lGone = PeerGetId(pDead);
+			std::map<const ENetPeer *, Impl::cPeerGuard>::iterator dead = it++;
+			mpImpl->m_mapGuards.erase(dead);
+			if (lGone)
+			{
+				PeerSetId(pDead, 0); /* a late DISCONNECT event is then "unaccepted" */
+				Log(" multiplayer: guest %u's slot died without a disconnect event - dropped\n",
+					(unsigned)lGone);
+				HostForgetGuest(pDead, lGone);
+			}
+			continue;
+		}
+		guard.mfAge += afTimeStep;
+		if (!guard.mbAuthed && !guard.mbRefused && guard.mfAge > kNetAuthTimeoutSeconds)
+		{
+			guard.mbRefused = true;
+			char sWho[64];
+			FormatPeerAddr(pPeer, sWho, sizeof(sWho));
+			Log(" multiplayer: peer %s never answered the challenge (%.1f s) - dropped\n",
+				sWho, guard.mfAge);
+			enet_peer_disconnect(const_cast<ENetPeer *>(pPeer), kNetDisconnectBadAuth);
+		}
+		guard.mfRateWindow += afTimeStep;
+		if (guard.mfRateWindow >= 1.0f)
+		{
+			guard.mfRateWindow = 0;
+			guard.mlReliableInWindow = 0;
+			guard.mbRateStruck = false;
+		}
+		if (guard.mlStrikes > 0)
+		{
+			guard.mfStrikeDecay += afTimeStep;
+			if (guard.mfStrikeDecay >= kNetStrikeDecaySeconds)
+			{
+				guard.mfStrikeDecay = 0;
+				--guard.mlStrikes; /* a flaky-but-honest client never accumulates */
+			}
+		}
+		if (guard.mfCharCooldown > 0)
+		{
+			guard.mfCharCooldown -= afTimeStep;
+			if (guard.mfCharCooldown < 0)
+				guard.mfCharCooldown = 0;
+		}
+		if (guard.mbCharPending && guard.mfCharCooldown <= 0)
+		{
+			/* v18: the newest request that arrived inside the cooldown */
+			guard.mbCharPending = false;
+			const uint8_t lAuthor = PeerGetId(pPeer);
+			if (guard.mbAuthed && !guard.mbRefused && lAuthor >= 2)
+			{
+				const char *szWhy = HostApplyCharacterRequest(lAuthor, guard.msCharPending);
+				if (szWhy && !guard.mbCharRefusedLogged)
+				{
+					guard.mbCharRefusedLogged = true;
+					Log(" multiplayer: guest %u asked for character '%s' - ignored: %s (logged once)\n",
+						(unsigned)lAuthor, guard.msCharPending.c_str(), szWhy);
+				}
+				guard.mfCharCooldown = kNetCharRequestCooldown;
+			}
+			guard.msCharPending = "";
+		}
+		++it;
+	}
+}
+
+/* Windows are aged once per frame in PollDiscovery. A source keeps its
+   bucket for the 1 s window; a new source takes an expired bucket, else the
+   one closest to expiry (a flood from 17+ spoofed sources is then capped by
+   the global limit alone, which is the point of having one). */
+bool cNetworkManager::DiscoveryPongAllowed(uint32_t alAddr)
+{
+	if (!mpImpl)
+		return false;
+	if (mpImpl->mlPongGlobalCount >= (unsigned)Impl::kMaxPongPerSecond)
+		return false;
+	int lFree = -1;
+	float fOldest = 2.0f;
+	for (int b = 0; b < Impl::kPongBuckets; ++b)
+	{
+		Impl::cPongBucket &bk = mpImpl->mPong[b];
+		if (bk.mfWindowLeft > 0 && bk.mlAddr == alAddr)
+		{
+			if (bk.mlCount >= (unsigned)Impl::kMaxPongPerSource)
+				return false;
+			++bk.mlCount;
+			++mpImpl->mlPongGlobalCount;
+			return true;
+		}
+		if (bk.mfWindowLeft < fOldest)
+		{
+			fOldest = bk.mfWindowLeft;
+			lFree = b;
+		}
+	}
+	if (lFree < 0)
+		return false;
+	Impl::cPongBucket &bk = mpImpl->mPong[lFree];
+	bk.mlAddr = alAddr;
+	bk.mfWindowLeft = 1.0f;
+	bk.mlCount = 1;
+	++mpImpl->mlPongGlobalCount;
+	return true;
+}
+
+#endif /* PENUMBRA_MULTIPLAYER */
+
+//======================================================================
+// v16: proximity voice chat — APPENDED (see the NetworkManager.h tail).
+// The HUD accessors are shared by both builds; the transport half lives
+// under PENUMBRA_MULTIPLAYER. The codec/AL work is all in cVoiceChat.
+//======================================================================
+
+bool cNetworkManager::IsPlayerTalking(uint8_t alId) const
+{
+	if (!mpVoice || alId == 0)
+		return false;
+	return mpVoice->IsTalking(alId);
+}
+
+bool cNetworkManager::IsMicOpen() const
+{
+	return mpVoice ? mpVoice->IsMicOpen() : false;
+}
+
+const char *cNetworkManager::GetVoiceStatusHint() const
+{
+	return mpVoice ? mpVoice->GetStatusHint() : NULL;
+}
+
+bool cNetworkManager::IsVoiceAvailable() const
+{
+	return mpVoice != NULL;
+}
+
+#ifdef PENUMBRA_MULTIPLAYER
+
+namespace
+{
+/** Ghost render feet -> mouth: the shipped meshes stand ~1.75 m, the
+    sender's camera sits ~1.6 m up (game.cfg Player Height). */
+const float kVoiceHeadHeight = 1.6f;
+}
+
+void cNetworkManager::SendUnreliableEvent(const void *apData, size_t alLen)
+{
+	if (!mpImpl || !mpImpl->mpHost || !apData || alLen == 0)
+		return;
+	if (mbHosting)
+	{
+		for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+		{
+			ENetPeer *pd = &mpImpl->mpHost->peers[i];
+			if (PeerLive(pd)) /* v15: accepted peers only */
+				SendStructToPeer(pd, apData, alLen, false);
+		}
+	}
+	else if (mbClientConnected && mbHadJoinPacket && mpImpl->mpServerPeer &&
+		mpImpl->mpServerPeer->state == ENET_PEER_STATE_CONNECTED)
+	{
+		SendStructToPeer(mpImpl->mpServerPeer, apData, alLen, false);
+	}
+}
+
+void cNetworkManager::RelayVoice(ENetPeer *apFrom, uint8_t alAuthor, const void *apData, size_t alLen)
+{
+	if (!mpImpl || !mpImpl->mpHost || !apData || alAuthor < 2)
+		return;
+	if (alLen < sizeof(cNetVoice) || alLen > sizeof(cNetVoice) + kNetVoiceMaxPayload)
+		return; /* oversized = not ours; a guest cannot make us forward garbage */
+	uint8_t buf[sizeof(cNetVoice) + kNetVoiceMaxPayload];
+	memcpy(buf, apData, alLen);
+	cNetVoice hdr;
+	memcpy(&hdr, buf, sizeof(hdr));
+	hdr.mPlayerID = alAuthor; /* the peer is the truth, never the byte it sent */
+	memcpy(buf, &hdr, sizeof(hdr));
+	for (size_t i = 0; i < mpImpl->mpHost->peerCount; ++i)
+	{
+		ENetPeer *dst = &mpImpl->mpHost->peers[i];
+		if (dst == apFrom || !PeerLive(dst)) /* v15: accepted peers only */
+			continue;
+		SendStructToPeer(dst, buf, alLen, false);
+	}
+	DispatchIncoming(buf, alLen); /* and we hear it too */
+}
+
+void cNetworkManager::GetMicrophoneNames(std::vector<hpl::tString> &avOut) const
+{
+	avOut.clear();
+	if (mpVoice)
+		cVoiceChat::GetCaptureDeviceNames(avOut);
+}
+
+void cNetworkManager::SetMicrophone(const hpl::tString &asName)
+{
+	if (asName != msVoiceCaptureDevice)
+	{
+		msVoiceCaptureDevice = asName;
+		UpdateMultiplayerCfgKey("voice_capture_device", msVoiceCaptureDevice); /* every other line kept */
+	}
+	if (mpVoice)
+		mpVoice->SetCaptureDevice(msVoiceCaptureDevice);
+}
+
+float cNetworkManager::GetMicTestLevel() const
+{
+	return mpVoice ? mpVoice->GetMicTestLevel() : 0.0f;
+}
+
+int cNetworkManager::GetMicTestState() const
+{
+	return mpVoice ? mpVoice->GetMicTestState() : 0;
+}
+
+hpl::tString cNetworkManager::GetMicTestDeviceName() const
+{
+	return mpVoice ? mpVoice->GetMicTestDeviceName() : hpl::tString("");
+}
+
+void cNetworkManager::UpdateVoice(float afTimeStep)
+{
+	if (!mpVoice)
+		return;
+
+	/* menu microphone test: runs while the picker keeps it alive, session
+	   or not */
+	mfMicTestKeepAlive -= afTimeStep;
+	mpVoice->UpdateMicTest(afTimeStep, mfMicTestKeepAlive > 0.0f);
+
+	/* Opus/AL live exactly as long as a session: nothing in single-player,
+	   nothing while hosting an empty lobby is fine too (cheap), torn down
+	   by Disconnect. */
+	const bool bLive = mbHosting || (mbClientConnected && mbHadJoinPacket);
+	if (!bLive)
+	{
+		if (mpVoice->IsInitialized())
+			mpVoice->Shutdown();
+		return;
+	}
+	if (!mpVoice->IsInitialized() && !mpVoice->Init())
+		return; /* failed: logged once, retried after the next Disconnect */
+
+	mpVoice->SetLocalPlayerId(mlLocalPlayerId);
+
+	/* every drawn ghost's mouth this frame (interpolated render pose) */
+	for (tGhostMap::const_iterator it = m_mapGhosts.begin(); it != m_mapGhosts.end(); ++it)
+	{
+		if (!it->second)
+			continue;
+		cVector3f vFeet;
+		if (it->second->GetRenderFeetPos(&vFeet))
+			mpVoice->SetRemoteHeadPos(it->first, vFeet + cVector3f(0, kVoiceHeadHeight, 0), true);
+	}
+
+	/* push-to-talk (ignored by the open-mic gate inside) */
+	bool bTalk = false;
+	hpl::cInput *inp = (mpInit && mpInit->mpGame) ? mpInit->mpGame->GetInput() : NULL;
+	if (inp)
+		bTalk = inp->IsTriggerd("VoiceTalk");
+	/* never transmit while a menu is up (typing a 'v' in a text field) */
+	if (mpInit && mpInit->mpMainMenu && mpInit->mpMainMenu->IsActive())
+		bTalk = false;
+
+	mpVoice->Update(afTimeStep, bTalk);
+
+	/* outbox -> wire (host: every guest; guest: the host, which relays) */
+	const size_t n = mpVoice->GetOutgoingCount();
+	for (size_t i = 0; i < n; ++i)
+	{
+		const std::vector<uint8_t> &pkt = mpVoice->GetOutgoing(i);
+		if (!pkt.empty())
+			SendUnreliableEvent(&pkt[0], pkt.size());
+	}
+	if (n > 0)
+		mpVoice->ClearOutgoing();
+}
+
+#endif /* PENUMBRA_MULTIPLAYER */
+
+//======================================================================
+// v18: character picker — APPENDED (see the NetworkManager.h tail).
+// Shared part first (both builds: display names, the list helpers, the
+// preference); the request itself (send / host apply) needs ENet and lives
+// under PENUMBRA_MULTIPLAYER. README.md "Characters".
+//======================================================================
+
+namespace
+{
+/** ASCII lower-case copy: character names match case-insensitively (the
+    discovery sort already collapses case-only duplicates). */
+hpl::tString CharNameLowerAscii(const hpl::tString &asName)
+{
+	hpl::tString s = asName;
+	for (size_t i = 0; i < s.size(); ++i)
+		if (s[i] >= 'A' && s[i] <= 'Z')
+			s[i] = (char)(s[i] - 'A' + 'a');
+	return s;
+}
+
+/** File base name -> the name players read. Anything not listed shows its
+    base name with the first letter capitalised. */
+struct cCharacterDisplayName
+{
+	const char *mpBase;    /**< lower case */
+	const char *mpDisplay;
+};
+const cCharacterDisplayName kCharacterDisplayNames[] = {
+	{ "phillip", "Philip" },
+	{ "fisherman", "The Fisherman" },
+	{ "red", "Red" },
+	{ "malik", "Malik" },
+};
+} // namespace
+
+hpl::tString cNetworkManager::GetCharacterDisplayName(const hpl::tString &asBase)
+{
+	if (asBase.empty())
+		return "";
+	const hpl::tString sLower = CharNameLowerAscii(asBase);
+	for (size_t i = 0; i < sizeof(kCharacterDisplayNames) / sizeof(kCharacterDisplayNames[0]); ++i)
+		if (sLower == kCharacterDisplayNames[i].mpBase)
+			return kCharacterDisplayNames[i].mpDisplay;
+	hpl::tString sOut = asBase;
+	if (sOut[0] >= 'a' && sOut[0] <= 'z')
+		sOut[0] = (char)(sOut[0] - 'a' + 'A');
+	return sOut;
+}
+
+hpl::tString cNetworkManager::SanitizeCharacterName(const hpl::tString &asName)
+{
+	hpl::tString sOut;
+	for (size_t i = 0; i < asName.size(); ++i)
+	{
+		const unsigned char c = (unsigned char)asName[i];
+		if (c < 32 || c > 126)
+			continue; /* control chars, DEL, non-ASCII */
+		if (c == ' ' && sOut.empty())
+			continue; /* leading blanks */
+		if (sOut.size() >= kNetCharacterNameMaxChars)
+			break;
+		sOut += (char)c;
+	}
+	while (!sOut.empty() && sOut[sOut.size() - 1] == ' ')
+		sOut.erase(sOut.size() - 1);
+	return sOut;
+}
+
+hpl::tString cNetworkManager::GetCharacterBaseName(size_t alIdx) const
+{
+	if (alIdx >= mvGhostMeshPaths.size())
+		return "";
+	const hpl::tString &sPath = mvGhostMeshPaths[alIdx];
+	size_t lStart = 0;
+	for (size_t i = 0; i < sPath.size(); ++i)
+		if (sPath[i] == '/' || sPath[i] == '\\')
+			lStart = i + 1;
+	hpl::tString sName = sPath.substr(lStart);
+	const size_t lDot = sName.rfind('.');
+	if (lDot != hpl::tString::npos && lDot > 0)
+		sName = sName.substr(0, lDot); /* "fisherman.dae" -> "fisherman" */
+	return sName;
+}
+
+int cNetworkManager::FindCharacterIndex(const hpl::tString &asBase) const
+{
+	if (asBase.empty())
+		return -1;
+	const hpl::tString sWant = CharNameLowerAscii(asBase);
+	for (size_t i = 0; i < mvGhostMeshPaths.size(); ++i)
+		if (CharNameLowerAscii(GetCharacterBaseName(i)) == sWant)
+			return (int)i;
+	return -1;
+}
+
+void cNetworkManager::SetCharacterPreference(const hpl::tString &asBase)
+{
+	const hpl::tString sNew = SanitizeCharacterName(asBase);
+	if (sNew != msCharacterPref)
+	{
+		msCharacterPref = sNew;
+		UpdateMultiplayerCfgKey("character", msCharacterPref); /* every other line kept */
+	}
+#ifdef PENUMBRA_MULTIPLAYER
+	SendCharacterRequest(); /* connected guest only; the host picks nothing */
+#endif
+}
+
+bool cNetworkManager::IsCharacterTakenByOther(const hpl::tString &asBase) const
+{
+	if (asBase.empty() || mvGhostMeshPaths.empty())
+		return false;
+	if (!mbHosting && !(mbClientConnected && mbHadJoinPacket))
+		return false; /* offline: nobody holds anything */
+	const hpl::tString sWant = CharNameLowerAscii(asBase);
+	const size_t lCount = mvGhostMeshPaths.size();
+	for (std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.begin();
+		it != m_mapPlayerSlots.end(); ++it)
+	{
+		if (it->first == mlLocalPlayerId || it->first == 0)
+			continue;
+		if (CharNameLowerAscii(GetCharacterBaseName(it->second % lCount)) == sWant)
+			return true;
+	}
+	return false;
+}
+
+bool cNetworkManager::IsCharacterSelectable(size_t alIdx) const
+{
+	if (alIdx >= mvGhostMeshPaths.size() || alIdx >= kNetMaxCharacterSlots)
+		return false; /* beyond the slot range never exists */
+	/* Philip is the host's (slot 0 on the host). v19: by NAME — every list
+	   puts phillip first, but a machine without him has somebody else at
+	   0 who is a perfectly good guest character */
+	const hpl::tString sBase = GetCharacterBaseName(alIdx);
+	if (CharNameLowerAscii(sBase) == "phillip") /* kGhostCharacterOrder[0] (real build only) */
+		return false;
+	return !IsCharacterTakenByOther(sBase);
+}
+
+hpl::tString cNetworkManager::GetNextSelectableCharacter(const hpl::tString &asCurrent) const
+{
+	const size_t n = mvGhostMeshPaths.size();
+	if (n == 0)
+		return "";
+	const int lCur = FindCharacterIndex(asCurrent);
+	/* unknown / empty: start "before" entry 0 so the first step lands on 0 */
+	const size_t lStart = lCur >= 0 ? (size_t)lCur : n - 1;
+	for (size_t lStep = 1; lStep <= n; ++lStep)
+	{
+		const size_t i = (lStart + lStep) % n;
+		if (IsCharacterSelectable(i))
+			return GetCharacterBaseName(i); /* lStep == n: the current one, the only choice */
+	}
+	return "";
+}
+
+hpl::tString cNetworkManager::GetLocalCharacterName() const
+{
+	if (mlLocalPlayerId == 0)
+		return "";
+	return GetPlayerCharacterName(mlLocalPlayerId);
+}
+
+#ifdef PENUMBRA_MULTIPLAYER
+
+void cNetworkManager::SendCharacterRequest()
+{
+	if (mbHosting || !mbClientConnected || !mbHadJoinPacket || msCharacterPref.empty())
+		return; /* the host is slot 0; a guest asks only once it has an id */
+	cNetCharacterRequest pkt;
+	memset(&pkt, 0, sizeof(pkt)); /* NUL padding; a 24-char name has none */
+	pkt.mType = eNetPacketType_CharacterRequest;
+	const size_t n = msCharacterPref.size() < sizeof(pkt.msCharacter) ?
+		msCharacterPref.size() : sizeof(pkt.msCharacter);
+	if (n > 0)
+		memcpy(pkt.msCharacter, msCharacterPref.data(), n);
+	SendReliableEvent(&pkt, sizeof(pkt));
+	Log(" multiplayer: asked the host for character '%s'\n", msCharacterPref.c_str());
+}
+
+void cNetworkManager::HostHandleCharacterRequest(ENetPeer *apPeer, uint8_t alAuthor,
+	const void *apData, size_t alLen)
+{
+	if (!mbHosting || !mpImpl || !apPeer || !apData || alAuthor < 2 ||
+		alLen < sizeof(cNetCharacterRequest))
+		return;
+	std::map<const ENetPeer *, Impl::cPeerGuard>::iterator gi = mpImpl->m_mapGuards.find(apPeer);
+	if (gi == mpImpl->m_mapGuards.end())
+		return;
+	Impl::cPeerGuard &guard = gi->second;
+	if (!guard.mbAuthed || guard.mbRefused)
+		return; /* not an accepted peer: never moves anybody */
+	cNetCharacterRequest req;
+	memcpy(&req, apData, sizeof(req));
+	size_t n = 0; /* bounded: the field need not be NUL-terminated */
+	while (n < sizeof(req.msCharacter) && req.msCharacter[n] != '\0')
+		++n;
+	const hpl::tString sName = SanitizeCharacterName(hpl::tString(req.msCharacter, n));
+	if (sName.empty())
+		return;
+	if (guard.mfCharCooldown > 0)
+	{
+		guard.mbCharPending = true; /* newest wins; UpdatePeerGuards applies it */
+		guard.msCharPending = sName;
+		return;
+	}
+	guard.mbCharPending = false;
+	guard.msCharPending = "";
+	const char *szWhy = HostApplyCharacterRequest(alAuthor, sName);
+	if (szWhy && !guard.mbCharRefusedLogged)
+	{
+		guard.mbCharRefusedLogged = true;
+		Log(" multiplayer: guest %u asked for character '%s' - ignored: %s (logged once)\n",
+			(unsigned)alAuthor, sName.c_str(), szWhy);
+	}
+	guard.mfCharCooldown = kNetCharRequestCooldown;
+}
+
+const char *cNetworkManager::HostApplyCharacterRequest(uint8_t alAuthor, const hpl::tString &asBase)
+{
+	if (!mbHosting)
+		return "not hosting";
+	std::map<uint8_t, uint8_t>::iterator mine = m_mapPlayerSlots.find(alAuthor);
+	if (alAuthor < 2 || alAuthor == mlLocalPlayerId || mine == m_mapPlayerSlots.end())
+		return "not an accepted player";
+	const int lIdx = FindCharacterIndex(asBase);
+	if (lIdx < 0)
+		return "the host has no such character";
+	if (lIdx == 0)
+		return "slot 0 is the host's character";
+	if (lIdx >= (int)GetCharacterCount())
+		return "beyond the character slot range";
+	const uint8_t lSlot = (uint8_t)lIdx;
+	if (mine->second == lSlot)
+		return NULL; /* already that character: nothing to re-send */
+	for (std::map<uint8_t, uint8_t>::const_iterator it = m_mapPlayerSlots.begin();
+		it != m_mapPlayerSlots.end(); ++it)
+		if (it->first != alAuthor && it->second == lSlot)
+			return "taken by another player"; /* first come, first served */
+
+	const size_t lOldIdx = GhostMeshIndexFor(alAuthor);
+	const uint8_t lOldSlot = mine->second;
+	mine->second = lSlot; /* the old slot is free again: nobody else holds it */
+	Log(" multiplayer: guest %u moved from character slot %u to %u (%s) on request\n",
+		(unsigned)alAuthor, (unsigned)lOldSlot, (unsigned)lSlot, GetPlayerCharacterName(alAuthor).c_str());
+	RebuildGhostIfMeshChanged(alAuthor, lOldIdx); /* our own ghost of it */
+	if (m_setJoinAnnounced.find(alAuthor) != m_setJoinAnnounced.end())
+		AddPartyEvent(GetPlayerName(alAuthor) + " now plays " +
+			GetCharacterDisplayName(GetPlayerCharacterName(alAuthor)));
+	SendNameTable(NULL); /* every guest: OnPlayerSlotReceived rebuilds its ghost */
+	return NULL;
 }
 
 #endif /* PENUMBRA_MULTIPLAYER */

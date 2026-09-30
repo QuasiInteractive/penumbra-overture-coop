@@ -68,6 +68,10 @@ public:
 	void Update(float afTimeStep);
 
 	void SetLitChangeCallback(const tString& asCallback){ msLitChangeCallback = asCallback;}
+	/* co-op world snapshot: read the state, and save/clear/restore the
+	   callback around a replicated SetLit so no script runs as a side effect */
+	const tString& GetLitChangeCallback() const { return msLitChangeCallback;}
+	bool IsLit() const { return mbLit;}
 
 	void SetLit(bool abX, bool abFade);
 

@@ -20,6 +20,7 @@
 #include "GameLamp.h"
 
 #include "Init.h"
+#include "GameScripts.h" /* co-op: cNetScriptPlayerScope */
 #include "MapHandler.h"
 #include "Player.h"
 #include "EffectHandler.h"
@@ -473,6 +474,7 @@ void cGameLamp::SetLit(bool abX, bool abFade)
 	{
 		tString sBool = mbLit ? "true" : "false";
 		tString sCommand = msLitChangeCallback + "("+sBool+")";
+		cNetScriptPlayerScope netScope; /* co-op: player-driven script */
 		mpInit->RunScriptCommand(sCommand);
 	}
 }

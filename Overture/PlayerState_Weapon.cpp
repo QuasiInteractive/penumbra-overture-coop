@@ -285,6 +285,7 @@ cPlayerState_WeaponMelee::cPlayerState_WeaponMelee(cInit *apInit,cPlayer *apPlay
 {
 	mfLastForward = 1.0f;
 	mfLastSideways = 1.0f;
+	mpHudWeapon = NULL; /* co-op: GetHudWeapon() may be read before the first equip */
 }
 
 //-----------------------------------------------------------------------
