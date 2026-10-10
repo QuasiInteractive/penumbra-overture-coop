@@ -5,7 +5,7 @@
 One of you hosts, the others join, and you play the campaign together in one
 shared world: shared physics, shared items, party level transitions, loot
 handovers — you can even hand your friend the pickaxe.
-Only way to join each other currently is via Hamachi or RadminVPN. or any type of virtual lan server.
+Joining over the internet currently needs a virtual LAN such as Hamachi or Radmin VPN.
 
 **[Download the ready-to-play zip from Releases →](../../releases)** — extract it
 into your game's `redist` folder and the Multiplayer entry appears in the main
