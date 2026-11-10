@@ -129,6 +129,12 @@ public:
 	    other machines deactivate their copy (one-of-each items). */
 	void NetOnItemPicked(const hpl::tString &asEntityName);
 
+	/** v24. A script gave this machine an item (GiveItem: a combine result
+	    such as the filled lighter). One-of-a-kind items go to the party the
+	    same way a pickup does; stacking items stay with each machine's own
+	    scripts. No-op while applying a replication and offline. */
+	void NetOnScriptItemGiven(const hpl::tString &asName);
+
 	/** v22 friendly fire. The melee swing asks for every other player's
 	    solid body (ghost colliders, incl. the offline preview ghost) ... */
 	void GetGhostHitBodies(std::vector<std::pair<uint8_t, hpl::iPhysicsBody *> > &avOut);

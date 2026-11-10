@@ -107,8 +107,17 @@ static const uint32_t kNetProtocolMagic = 0x504E4D50u;
         The HOST decides (multiplayer.cfg shared_loot, default on) and
         re-stamps mbGive on guests' pickups it relays. New world-snapshot
         section eNetSnap_SharedItem: the host's inventory (name, .ent,
-        count), so a late joiner starts with the party's items. */
-static const uint16_t kNetProtocolVersion = 23;
+        count), so a late joiner starts with the party's items.
+    v24: items a SCRIPT gives (combine results: the filled lighter
+        "zippofire", the soaked cotton string, the padlock ...) travel as an
+        ItemPickup like a pickup, so the party gets them - only one-of-a-kind
+        items (stacking ones such as flares come from each machine's own
+        scripts). New script ops AddUseCallback / RemoveUseCallback: a use
+        registered by a script on one machine (the shafts barrel's "light the
+        fuse", added by whoever placed the fuse) reaches everyone on that map.
+        Before, the lighter left everyone's inventory on a combine and only
+        the combiner got it back, and only the fuse-placer could light it. */
+static const uint16_t kNetProtocolVersion = 24;
 
 
 /** v13: cNetPlayerName::msName capacity. A name is at most this many
@@ -263,6 +272,9 @@ enum eNetScriptOp : uint8_t
 	eNetScriptOp_RemoveItem = 8,   /* an item was CONSUMED (key used etc.) */
 	eNetScriptOp_LampLit = 9,      /* v14: SetLampLit — mlVal bit0 = lit,
 	                                  bit1 = fade */
+	eNetScriptOp_AddUseCallback = 10,    /* v24: msName "item|object|function",
+	                                        mlVal = FNV-1a of the lowercased map name */
+	eNetScriptOp_RemoveUseCallback = 11, /* v24: msName = function, mlVal = map hash */
 };
 
 /** v14: eNetPacketType_WorldSnapshot section ids (cNetSnapshotHdr::mSection).

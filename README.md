@@ -8,8 +8,17 @@ handovers — you can even hand your friend the pickaxe.
 Joining over the internet currently needs a virtual LAN such as Hamachi or Radmin VPN.
 
 **[Download the ready-to-play zip from Releases →](../../releases)** — extract it
-into your game's `redist` folder and the Multiplayer entry appears in the main
+into your game's `redist` folder and start **`overture.exe`** from there (Steam's
+Play button starts the plain game); the Multiplayer entry appears in the main
 menu. You need to own Penumbra: Overture (Steam).
+
+## New in v0.12
+
+- **Filling the lighter no longer takes it from everyone** — the full lighter
+  (and every other combine result) goes to the whole party
+- **Anyone holding the lighter can light the barrel's fuse** in the mine
+  shafts, whoever placed the fuse
+- Everyone needs v0.12 (network version 24)
 
 ## New in v0.11
 

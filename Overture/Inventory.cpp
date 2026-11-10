@@ -1899,6 +1899,16 @@ void cInventory::AddUseCallback(const tString &asItem, const tString &asObject, 
 	m_mapUseCallbacks.insert(tInventoryUseCallbackMap::value_type(asItem,pCallback));
 }
 
+bool cInventory::HasUseCallback(const tString &asItem, const tString &asObject, const tString &asFunction)
+{
+	tInventoryUseCallbackMapIt it = m_mapUseCallbacks.find(asItem);
+	for(; it != m_mapUseCallbacks.end() && it->first == asItem; ++it)
+	{
+		if(it->second->msObject == asObject && it->second->msFunction == asFunction) return true;
+	}
+	return false;
+}
+
 //-----------------------------------------------------------------------
 
 void cInventory::AddCombineCallback(const tString &asItem1,const tString &asItem2, const tString &asFunction)

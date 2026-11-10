@@ -531,6 +531,7 @@ void cNetworkManager::SendPlayerDamage(uint8_t, float) {}
 void cNetworkManager::NetOnEnemyDamaged(const hpl::tString &, float, int) {}
 bool cNetworkManager::PartyHasItem(const hpl::tString &) const { return false; }
 void cNetworkManager::NetOnScriptEvent(int, const hpl::tString &, int) {}
+void cNetworkManager::NetOnScriptItemGiven(const hpl::tString &) {}
 void cNetworkManager::NetOnEntityDamaged(const hpl::tString &, float, int) {}
 /* v12 party health: nobody is ever connected in the stub build. */
 bool cNetworkManager::GetGhostHealth(uint8_t, float *) const { return false; }
@@ -3272,6 +3273,31 @@ void cNetworkManager::NetOnItemDropped(const hpl::tString &asName, const hpl::tS
 	m_setTakenItems.erase(QualifiedItemHash(asName));
 }
 
+void cNetworkManager::NetOnScriptItemGiven(const hpl::tString &asName)
+{
+	if (gbNetScriptApplying)
+		return; /* a replication (or a pick-up callback run by one): no echo */
+	if (!mpImpl || !mpImpl->mpHost || !mpInit || !mpInit->mpInventory)
+		return;
+	cInventoryItem *pItem = mpInit->mpInventory->GetItem(asName);
+	/* a stacking item (flares, dynamite, painkillers) comes from every
+	   machine's own script; sharing it would double the count */
+	if (pItem == NULL || pItem->HasCount())
+		return;
+	const tString sFile = cString::GetFileName(pItem->GetEntityFile());
+	cNetItemPickup pkt;
+	memset(&pkt, 0, sizeof(pkt));
+	if (asName.empty() || asName.size() >= sizeof(pkt.msItemName) || sFile.empty() || sFile.size() >= sizeof(pkt.msFile))
+		return;
+	pkt.mType = eNetPacketType_ItemPickup;
+	pkt.mlQualHash = QualifiedItemHash(asName);
+	strncpy(pkt.msItemName, asName.c_str(), sizeof(pkt.msItemName) - 1);
+	strncpy(pkt.msFile, sFile.c_str(), sizeof(pkt.msFile) - 1);
+	pkt.mbGive = (mbHosting && mbSharedLoot) ? 1 : 0; /* a guest's: the host re-stamps it */
+	SendReliableEvent(&pkt, sizeof(pkt));
+	Log(" multiplayer: script gave us '%s' (%s) - shared with the party\n", asName.c_str(), sFile.c_str());
+}
+
 void cNetworkManager::ApplyRemoteDrop(const cNetItemDrop &aDrop)
 {
 	if (!mpInit || !mpInit->mpMapHandler || !mpInit->mpGame)
@@ -3579,6 +3605,43 @@ void cNetworkManager::Update(float afTimeStep)
 		return;
 
 	UpdatePartyEvents(afTimeStep); /* v13: feed line ages + join grace timer */
+
+	/* Dev aid (off unless set): HPL_AUTOSCRIPT="<sec>:<script line>|..." runs
+	   timed script lines through cInit::RunScriptCommand once a level is up,
+	   the way HPL_AUTOINPUT feeds keys - for two-copy tests of script sync. */
+	{
+		static bool bRead = false;
+		static std::vector<std::pair<float, tString> > vSteps;
+		static float fClock = 0;
+		if (!bRead)
+		{
+			bRead = true;
+			const char *pEnv = getenv("HPL_AUTOSCRIPT");
+			const tString sAll = pEnv ? pEnv : "";
+			size_t lStart = 0;
+			while (lStart < sAll.size())
+			{
+				size_t lEnd = sAll.find('|', lStart);
+				if (lEnd == tString::npos) lEnd = sAll.size();
+				const tString sPart = sAll.substr(lStart, lEnd - lStart);
+				const size_t lColon = sPart.find(':');
+				if (lColon != tString::npos)
+					vSteps.push_back(std::make_pair((float)atof(sPart.substr(0, lColon).c_str()), sPart.substr(lColon + 1)));
+				lStart = lEnd + 1;
+			}
+		}
+		if (!vSteps.empty() && mpInit->mpMapHandler && !mpInit->mpMapHandler->GetCurrentMapName().empty())
+		{
+			fClock += afTimeStep;
+			while (!vSteps.empty() && vSteps.front().first <= fClock)
+			{
+				const tString sLine = vSteps.front().second;
+				vSteps.erase(vSteps.begin());
+				Log(" multiplayer: dev script '%s'\n", sLine.c_str());
+				mpInit->RunScriptCommand(sLine);
+			}
+		}
+	}
 
 	/* Track the CURRENT world only — never a stale one. Keeping the old
 	   pointer across a map change/unload meant EnsureGhost built ghosts in a
@@ -6560,6 +6623,7 @@ bool cNetworkManager::ValidateEventPacket(unsigned char *apData, size_t alLen, b
 		case eNetScriptOp_GlobalVarSet: case eNetScriptOp_GlobalVarAdd:
 		case eNetScriptOp_EntityActive: case eNetScriptOp_DoorLocked:
 		case eNetScriptOp_RemoveItem: case eNetScriptOp_LampLit:
+		case eNetScriptOp_AddUseCallback: case eNetScriptOp_RemoveUseCallback: /* v24 */
 			break;
 		default:
 			return false;

@@ -327,6 +327,10 @@ bool cInit::Init(tString asCommandLine)
 
 	// LOG FILE SETUP /////////////////////
 	SetLogFile(sPersonalDir + tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME + _W("hpl.log"));
+	/* Dev aid (off unless set): HPL_LOGFILE=<path> - two copies on one PC
+	   share the Documents folder, so each test copy can keep its own log */
+	if(const wchar_t *pLogEnv = _wgetenv(L"HPL_LOGFILE"))
+		if(pLogEnv[0]) SetLogFile(tWString(pLogEnv));
 	SetUpdateLogFile(sPersonalDir + tWString(PERSONAL_RELATIVEROOT) + PERSONAL_RELATIVEGAME + _W("hpl_update.log"));
 
 	// TECH DEMO CO-OP INSTALL /////////////////////

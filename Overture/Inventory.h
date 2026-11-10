@@ -363,6 +363,8 @@ public:
 
 	void AddPickupCallback(const tString &asItem, const tString &asFunction);
 	void AddUseCallback(const tString &asItem, const tString &asObject, const tString &asFunction);
+	/** co-op v24: this exact item + object -> function use is registered */
+	bool HasUseCallback(const tString &asItem, const tString &asObject, const tString &asFunction);
 	void AddCombineCallback(const tString &asItem1,const tString &asItem2, const tString &asFunction);
 	
 	void RemovePickupCallback(const tString &asFunction);

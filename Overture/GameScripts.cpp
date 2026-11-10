@@ -740,9 +740,30 @@ static void __stdcall AddPickupCallback(std::string asItem, std::string asFuncti
 }
 SCRIPT_DEFINE_FUNC_2(void,AddPickupCallback,string,string)
 
+/* co-op v24: which level a shared use callback belongs to (FNV-1a of the
+   lowercased current map name; 0 = none) */
+static int NetCurrentMapHash()
+{
+	if(gpInit==NULL || gpInit->mpMapHandler==NULL) return 0;
+	const tString sMap = cString::ToLowerCase(gpInit->mpMapHandler->GetCurrentMapName());
+	if(sMap.empty()) return 0;
+	unsigned int h = 2166136261u;
+	for(size_t i=0; i<sMap.size(); ++i) h = (h ^ (unsigned char)sMap[i]) * 16777619u;
+	return (int)h;
+}
+
 static void __stdcall AddUseCallback(std::string asItem, std::string asEntity, std::string asFunction)
 {
 	gpInit->mpInventory->AddUseCallback(asItem,asEntity,asFunction);
+
+	/* co-op v24: a use a script registered HERE (the shafts barrel's "light
+	   the fuse", added by whoever placed the fuse) exists for everyone on
+	   this map; a machine that already has it keeps its own */
+	if(!gbNetScriptApplying && gpInit->mpNetworkManager)
+	{
+		const tString sPacked = tString(asItem.c_str()) + "|" + asEntity.c_str() + "|" + asFunction.c_str();
+		gpInit->mpNetworkManager->NetOnScriptEvent(10, sPacked, NetCurrentMapHash());
+	}
 }
 SCRIPT_DEFINE_FUNC_3(void,AddUseCallback,string,string,string)
 
@@ -763,6 +784,10 @@ SCRIPT_DEFINE_FUNC_1(void,RemovePickupCallback,string)
 static void __stdcall RemoveUseCallback(std::string asFunction)
 {
 	gpInit->mpInventory->RemoveUseCallback(asFunction);
+
+	/* co-op v24: the use is gone for everyone on this map too */
+	if(!gbNetScriptApplying && gpInit->mpNetworkManager)
+		gpInit->mpNetworkManager->NetOnScriptEvent(11, asFunction.c_str(), NetCurrentMapHash());
 }
 SCRIPT_DEFINE_FUNC_1(void,RemoveUseCallback,string)
 
@@ -815,6 +840,12 @@ SCRIPT_DEFINE_FUNC_1(void,RemoveItem,string)
 static void __stdcall GiveItem(std::string asName,std::string asEntityFile,int alSlotIndex)
 {
 	gpInit->mpInventory->AddItemFromFile(asName,asEntityFile, alSlotIndex);
+
+	/* co-op v24: a combine result (the filled lighter) belongs to the party,
+	   the same way a picked-up item does - the combine's RemoveItem already
+	   took the parts from everyone */
+	if(!gbNetScriptApplying && gpInit->mpNetworkManager)
+		gpInit->mpNetworkManager->NetOnScriptItemGiven(asName.c_str());
 }
 SCRIPT_DEFINE_FUNC_3(void,GiveItem,string,string,int)
 
@@ -2011,6 +2042,24 @@ void NetApplyScriptEvent(int alOp, const hpl::tString &asName, int alVal)
 	case 7: SetDoorLocked(std::string(asName.c_str()), alVal != 0); break;
 	case 8: RemoveItem(std::string(asName.c_str())); break;
 	case 9: SetLampLit(std::string(asName.c_str()), (alVal & 1) != 0, (alVal & 2) != 0); break; /* v14 */
+	case 10: /* v24: AddUseCallback "item|object|function" - only on the same map */
+	{
+		if(alVal == 0 || alVal != NetCurrentMapHash()) break;
+		const size_t a = asName.find('|');
+		const size_t b = a == tString::npos ? tString::npos : asName.find('|', a + 1);
+		if(b == tString::npos) break;
+		const tString sItem = asName.substr(0, a), sObject = asName.substr(a + 1, b - a - 1), sFunc = asName.substr(b + 1);
+		if(sItem.empty() || sFunc.empty()) break;
+		/* already registered here (the same level script ran on this machine): keep ours */
+		if(gpInit->mpInventory->HasUseCallback(sItem, sObject, sFunc)) break;
+		gpInit->mpInventory->AddUseCallback(sItem, sObject, sFunc);
+		Log(" multiplayer: use callback '%s' on '%s' -> %s (from another player)\n", sItem.c_str(), sObject.c_str(), sFunc.c_str());
+		break;
+	}
+	case 11: /* v24: RemoveUseCallback - only on the same map */
+		if(alVal != 0 && alVal == NetCurrentMapHash())
+			gpInit->mpInventory->RemoveUseCallback(asName);
+		break;
 	default: break;
 	}
 	gbNetScriptApplying = false;
